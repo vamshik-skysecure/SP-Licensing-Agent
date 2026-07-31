@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class MatchedTenantLicense(BaseModel):
@@ -77,6 +77,10 @@ class FinalQuote(BaseModel):
     billing_plan: str
 
     promo_percentage: Decimal = Field(ge=0, le=100)
+    promo_code: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("promo_code", "promotion_code"),
+    )
     source_row_number: int = Field(ge=1)
 
     target_quantity: int = Field(ge=0)

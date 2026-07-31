@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     whatsapp_phone_number_id: str
     whatsapp_uri: str = "https://graph.facebook.com"
     whatsapp_uri_version: str = "v25.0"
+    whatsapp_connect_retries: int = 3
     whatsapp_webhook_verify_token: str
     whatsapp_app_secret: str
 

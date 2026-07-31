@@ -1,5 +1,9 @@
 import json
+import secrets
+from asyncio import get_running_loop
 from collections import deque
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
@@ -9,7 +13,17 @@ from app.core.agent.main import PricingAgentAPIError, PricingAgentClient
 from app.core.whatsapp import WhatsAppAPIError, WhatsAppClient
 from app.schema.whatsapp import (
     IncomingWhatsAppDocument,
+    InteractiveButton,
+    InteractiveButtonAction,
+    InteractiveButtons,
+    InteractiveList,
+    InteractiveListAction,
+    InteractiveReply,
+    InteractiveRow,
+    InteractiveSection,
+    InteractiveText,
     TextContent,
+    WhatsAppInteractiveMessage,
     WhatsAppTextMessage,
     WhatsAppWebhookPayload,
 )
@@ -50,6 +64,21 @@ COMMAND_ALIASES = {
 }
 
 
+@dataclass(frozen=True)
+class QuoteResults:
+    filename: str
+    product_count: int
+    final_quotes: list[dict[str, Any]]
+    failures: list[str]
+
+
+@dataclass(frozen=True)
+class QuoteSession:
+    sender: str
+    results: QuoteResults
+    expires_at: datetime
+
+
 class WhatsAppWebhookService:
     """Processes inbound WhatsApp text messages through the pricing agent."""
 
@@ -62,6 +91,7 @@ class WhatsAppWebhookService:
         self._pricing_agent_client = pricing_agent_client
         self._processed_message_ids: set[str] = set()
         self._message_id_order: deque[str] = deque(maxlen=1000)
+        self._quote_sessions: dict[str, QuoteSession] = {}
 
     async def handle(self, webhook: WhatsAppWebhookPayload) -> None:
         message_count = sum(
@@ -85,6 +115,13 @@ class WhatsAppWebhookService:
                         await self._handle_text_message(message.sender, message.text.body)
                     elif message.type == "document" and message.document is not None:
                         await self._handle_document_message(message.sender, message.document)
+                    elif message.type == "interactive" and message.interactive is not None:
+                        reply = (
+                            message.interactive.list_reply
+                            or message.interactive.button_reply
+                        )
+                        if reply is not None:
+                            await self._handle_interactive_reply(message.sender, reply.id)
                     else:
                         logger.info("Unsupported message ignored type=%s", message.type)
         logger.info("Message processing completed count=%d", message_count)
@@ -152,14 +189,29 @@ class WhatsAppWebhookService:
                 filename=document.filename,
                 content_type=document.mime_type,
             )
-        except WhatsAppAPIError:
-            logger.exception("Unable to download WhatsApp document %s", document.id)
-            await self._send_text(sender, "I could not download that document. Please try again.")
+        except WhatsAppAPIError as error:
+            logger.error(
+                "Unable to download WhatsApp document media_id=%s status=%s "
+                "network_error=%s response=%s cause=%r",
+                document.id,
+                error.status_code,
+                error.network_error,
+                error.response_body,
+                error.__cause__,
+            )
+            if not error.network_error:
+                await self._send_text(
+                    sender, "I could not download that document. Please try again."
+                )
+            else:
+                logger.error(
+                    "WhatsApp failure notification skipped because Meta is unreachable"
+                )
             return
         logger.info("Document downloaded filename=%s bytes=%d", media.filename, len(media.content))
 
         try:
-            response_body = await self._document_quote_text(
+            results = await self._document_quote_results(
                 file=media.content,
                 filename=media.filename,
                 content_type=media.content_type,
@@ -169,11 +221,40 @@ class WhatsAppWebhookService:
             response_body = self._quote_selection_text(error) or (
                 "I could not process that document right now. Please try again."
             )
+            await self._send_text(sender, response_body)
+            return
 
-        await self._send_text_chunks(sender, response_body)
+        if results.final_quotes:
+            session_id = self._create_quote_session(sender, results)
+            if not await self._send_product_list(sender, session_id, 0):
+                await self._send_text_chunks(
+                    sender,
+                    self._final_quotes_text(
+                        filename=results.filename,
+                        product_count=results.product_count,
+                        final_quotes=results.final_quotes,
+                        failures=results.failures,
+                    ),
+                )
+        else:
+            await self._send_text_chunks(
+                sender,
+                self._final_quotes_text(
+                    filename=results.filename,
+                    product_count=results.product_count,
+                    final_quotes=results.final_quotes,
+                    failures=results.failures,
+                ),
+            )
         logger.info("Document processing completed filename=%s", media.filename)
 
     async def _send_text(self, sender: str, body: str) -> None:
+        if not getattr(self._whatsapp_client, "credentials_valid", True):
+            logger.error(
+                "WhatsApp send skipped because authentication is invalid; "
+                "replace WHATSAPP_ACCESS_TOKEN and restart"
+            )
+            return
         logger.info("Sending WhatsApp text characters=%d", len(body))
         try:
             await self._whatsapp_client.send_message(
@@ -183,8 +264,13 @@ class WhatsAppWebhookService:
                 )
             )
             logger.info("WhatsApp text sent")
-        except WhatsAppAPIError:
-            logger.exception("Unable to send WhatsApp response to %s", sender)
+        except WhatsAppAPIError as error:
+            logger.error(
+                "Unable to send WhatsApp response status=%s response=%s cause=%r",
+                error.status_code,
+                error.response_body,
+                error.__cause__,
+            )
 
     async def _send_text_chunks(self, sender: str, body: str) -> None:
         chunks = self._text_chunks(body)
@@ -199,6 +285,20 @@ class WhatsAppWebhookService:
         filename: str,
         content_type: str,
     ) -> str:
+        results = await self._document_quote_results(file, filename, content_type)
+        return self._final_quotes_text(
+            filename=results.filename,
+            product_count=results.product_count,
+            final_quotes=results.final_quotes,
+            failures=results.failures,
+        )
+
+    async def _document_quote_results(
+        self,
+        file: bytes,
+        filename: str,
+        content_type: str,
+    ) -> QuoteResults:
         logger.info("Tenant analysis started filename=%s", filename)
         tenant_analysis = await self._pricing_agent_client.analyze_tenant_file(
             file=file,
@@ -296,12 +396,424 @@ class WhatsAppWebhookService:
             len(final_quotes),
             len(failures),
         )
-        return self._final_quotes_text(
+        return QuoteResults(
             filename=filename,
             product_count=len(tenant_analysis["licenses"]),
             final_quotes=final_quotes,
             failures=failures,
         )
+
+    def _create_quote_session(self, sender: str, results: QuoteResults) -> str:
+        self._remove_expired_sessions()
+        session_id = secrets.token_urlsafe(8)
+        self._quote_sessions[session_id] = QuoteSession(
+            sender=sender,
+            results=results,
+            expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        )
+        get_running_loop().call_later(30 * 60, self._expire_quote_session, session_id)
+        logger.info(
+            "Quote session created session_id=%s products=%d quotes=%d",
+            session_id,
+            results.product_count,
+            len(results.final_quotes),
+        )
+        return session_id
+
+    def _expire_quote_session(self, session_id: str) -> None:
+        if self._quote_sessions.pop(session_id, None) is not None:
+            logger.info("Quote session expired session_id=%s", session_id)
+
+    def _get_quote_session(self, sender: str, session_id: str) -> QuoteSession | None:
+        self._remove_expired_sessions()
+        session = self._quote_sessions.get(session_id)
+        if session is None or session.sender != sender:
+            return None
+        return session
+
+    def _remove_expired_sessions(self) -> None:
+        now = datetime.now(UTC)
+        expired = [
+            session_id
+            for session_id, session in self._quote_sessions.items()
+            if session.expires_at <= now
+        ]
+        for session_id in expired:
+            del self._quote_sessions[session_id]
+        if expired:
+            logger.info("Expired quote sessions removed count=%d", len(expired))
+
+    async def _handle_interactive_reply(self, sender: str, reply_id: str) -> None:
+        logger.info("Interactive reply received reply_id=%s", reply_id)
+        parts = reply_id.split("|")
+        if len(parts) < 4 or parts[0] != "quote":
+            await self._send_text(sender, "That selection is not recognized. Please try again.")
+            return
+
+        session_id, action = parts[1], parts[2]
+        session = self._get_quote_session(sender, session_id)
+        if session is None:
+            await self._send_text(
+                sender,
+                "This quote selection has expired. Please upload the tenant document again.",
+            )
+            return
+
+        try:
+            indexes = [int(value) for value in parts[3:]]
+            sent = False
+            if action == "products" and len(indexes) == 1:
+                sent = await self._send_product_list(sender, session_id, indexes[0])
+            elif action == "product" and len(indexes) == 1:
+                sent = await self._send_variant_list(sender, session_id, indexes[0], 0)
+            elif action == "variants" and len(indexes) == 2:
+                sent = await self._send_variant_list(
+                    sender, session_id, indexes[0], indexes[1]
+                )
+            elif action == "variant" and len(indexes) == 2:
+                sent = await self._send_option_list(
+                    sender, session_id, indexes[0], indexes[1], 0
+                )
+            elif action == "options" and len(indexes) == 3:
+                sent = await self._send_option_list(
+                    sender, session_id, indexes[0], indexes[1], indexes[2]
+                )
+            elif action == "option" and len(indexes) == 3:
+                sent = await self._send_quote_detail(
+                    sender, session_id, indexes[0], indexes[1], indexes[2]
+                )
+            else:
+                raise ValueError("unsupported quote action")
+            if not sent:
+                await self._send_text(
+                    sender, "I could not display that quote selection. Please try again."
+                )
+        except (IndexError, ValueError):
+            logger.warning("Invalid interactive quote selection reply_id=%s", reply_id)
+            await self._send_text(sender, "That quote option is no longer available.")
+
+    @staticmethod
+    def _grouped_quotes(
+        results: QuoteResults,
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for quote in results.final_quotes:
+            product = quote.get("_requested_product")
+            if not isinstance(product, str):
+                product = str(quote.get("sku_title", "Product"))
+            groups.setdefault(product, []).append(quote)
+        return list(groups.items())
+
+    @staticmethod
+    def _variant_groups(
+        quotes: list[dict[str, Any]],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
+        variants: dict[str, list[dict[str, Any]]] = {}
+        for quote in quotes:
+            title = str(quote.get("sku_title", "Pricing option"))
+            variants.setdefault(title, []).append(quote)
+        return list(variants.items())
+
+    async def _send_product_list(
+        self, sender: str, session_id: str, page: int
+    ) -> bool:
+        session = self._get_quote_session(sender, session_id)
+        if session is None:
+            return False
+        products = self._grouped_quotes(session.results)
+        rows = self._paged_rows(
+            items=products,
+            page=page,
+            row_factory=lambda index, item: InteractiveRow(
+                id=f"quote|{session_id}|product|{index}",
+                title=self._short_text(item[0], 24),
+                description=self._short_text(
+                    f"{item[1][0]['target_quantity']} requested, "
+                    f"{item[1][0]['existing_quantity']} existing, {len(item[1])} options",
+                    72,
+                ),
+            ),
+            previous_id=f"quote|{session_id}|products|{page - 1}",
+            next_id=f"quote|{session_id}|products|{page + 1}",
+        )
+        body = (
+            f"Quote ready for {session.results.filename}\n"
+            f"{session.results.product_count} products and "
+            f"{len(session.results.final_quotes)} pricing options.\n\n"
+            "Select a product to review."
+        )
+        return await self._send_interactive_list(sender, body, "View products", rows)
+
+    async def _send_variant_list(
+        self, sender: str, session_id: str, product_index: int, page: int
+    ) -> bool:
+        session = self._get_quote_session(sender, session_id)
+        if session is None:
+            return False
+        product, quotes = self._grouped_quotes(session.results)[product_index]
+        variants = self._variant_groups(quotes)
+        variant_titles = self._edition_row_titles(
+            product, [variant[0] for variant in variants]
+        )
+        rows = self._paged_rows(
+            items=variants,
+            page=page,
+            row_factory=lambda index, item: InteractiveRow(
+                id=f"quote|{session_id}|variant|{product_index}|{index}",
+                title=variant_titles[index],
+                description=self._short_text(item[0], 72),
+            ),
+            previous_id=f"quote|{session_id}|variants|{product_index}|{page - 1}",
+            next_id=f"quote|{session_id}|variants|{product_index}|{page + 1}",
+        )
+        body = (
+            f"{product}\n"
+            f"{quotes[0]['target_quantity']} requested | "
+            f"{quotes[0]['existing_quantity']} existing\n\n"
+            "Select a license edition."
+        )
+        return await self._send_interactive_list(sender, body, "View editions", rows)
+
+    async def _send_option_list(
+        self,
+        sender: str,
+        session_id: str,
+        product_index: int,
+        variant_index: int,
+        page: int,
+    ) -> bool:
+        session = self._get_quote_session(sender, session_id)
+        if session is None:
+            return False
+        _, product_quotes = self._grouped_quotes(session.results)[product_index]
+        variant, quotes = self._variant_groups(product_quotes)[variant_index]
+        term_labels = {"P1M": "1 month", "P1Y": "1 year", "P3Y": "3 years"}
+
+        def option_row(index: int, quote: dict[str, Any]) -> InteractiveRow:
+            term = term_labels.get(
+                str(quote["term_duration"]), str(quote["term_duration"])
+            )
+            billing = str(quote["billing_plan"])
+            title = f"{term} - {billing}"
+            description = f"INR {self._formatted_amount(quote['total_quote_amount'])} total"
+            promo = self._promo_text(quote, compact=True)
+            if promo:
+                description += f" | {promo}"
+            return InteractiveRow(
+                id=f"quote|{session_id}|option|{product_index}|{variant_index}|{index}",
+                title=self._short_text(title, 24),
+                description=self._short_text(description, 72),
+            )
+
+        rows = self._paged_rows(
+            items=quotes,
+            page=page,
+            row_factory=option_row,
+            previous_id=(
+                f"quote|{session_id}|options|{product_index}|{variant_index}|{page - 1}"
+            ),
+            next_id=(
+                f"quote|{session_id}|options|{product_index}|{variant_index}|{page + 1}"
+            ),
+        )
+        return await self._send_interactive_list(
+            sender,
+            f"{variant}\n\nSelect a term and billing plan.",
+            "View pricing",
+            rows,
+        )
+
+    async def _send_quote_detail(
+        self,
+        sender: str,
+        session_id: str,
+        product_index: int,
+        variant_index: int,
+        quote_index: int,
+    ) -> bool:
+        session = self._get_quote_session(sender, session_id)
+        if session is None:
+            return False
+        _, product_quotes = self._grouped_quotes(session.results)[product_index]
+        variant, quotes = self._variant_groups(product_quotes)[variant_index]
+        quote = quotes[quote_index]
+        term_labels = {"P1M": "1 month", "P1Y": "1 year", "P3Y": "3 years"}
+        term = term_labels.get(str(quote["term_duration"]), str(quote["term_duration"]))
+        regular_unit_price = quote.get(
+            "initial_quote_without_promo", quote["total_quote_amount"]
+        )
+        body = (
+            f"*{variant}*\n\n"
+            f"Quantity: {quote['target_quantity']}\n"
+            f"Existing licenses: {quote['existing_quantity']}\n"
+            f"Term: {term}\n"
+            f"Billing: {quote['billing_plan']}\n"
+            f"Regular unit price: INR {self._formatted_amount(regular_unit_price)}"
+        )
+        promo_unit_price = quote.get("initial_quote_with_promo")
+        if promo_unit_price is not None:
+            body += (
+                f"\nPromo unit price: INR {self._formatted_amount(promo_unit_price)}"
+            )
+        else:
+            body += "\nPromo unit price: Not available"
+        if self._promo_is_applied(quote):
+            try:
+                savings = (
+                    Decimal(str(regular_unit_price))
+                    * Decimal(str(quote["target_quantity"]))
+                    - Decimal(str(quote["total_quote_amount"]))
+                )
+            except (InvalidOperation, ValueError):
+                savings = Decimal(0)
+            if savings > 0:
+                body += f"\nTotal savings: INR {self._formatted_amount(savings)}"
+            promo_quantity = quote.get("promo_quantity")
+            if isinstance(promo_quantity, int) and promo_quantity > 0:
+                body += f"\nPromo applied to: {promo_quantity} licenses"
+        body += f"\nFinal total: *INR {self._formatted_amount(quote['total_quote_amount'])}*"
+        promo = self._promo_text(quote)
+        if promo:
+            body += f"\n{promo}"
+        buttons = [
+            InteractiveButton(
+                reply=InteractiveReply(
+                    id=f"quote|{session_id}|variant|{product_index}|{variant_index}",
+                    title="Other prices",
+                )
+            ),
+            InteractiveButton(
+                reply=InteractiveReply(
+                    id=f"quote|{session_id}|products|0",
+                    title="Other products",
+                )
+            ),
+        ]
+        return await self._send_interactive_buttons(sender, body, buttons)
+
+    async def _send_interactive_list(
+        self, sender: str, body: str, button: str, rows: list[InteractiveRow]
+    ) -> bool:
+        message = WhatsAppInteractiveMessage(
+            to=sender,
+            interactive=InteractiveList(
+                body=InteractiveText(text=self._short_text(body, 1024)),
+                footer=InteractiveText(text="Selections expire after 30 minutes"),
+                action=InteractiveListAction(
+                    button=button,
+                    sections=[InteractiveSection(rows=rows)],
+                ),
+            ),
+        )
+        return await self._send_interactive(message)
+
+    async def _send_interactive_buttons(
+        self, sender: str, body: str, buttons: list[InteractiveButton]
+    ) -> bool:
+        message = WhatsAppInteractiveMessage(
+            to=sender,
+            interactive=InteractiveButtons(
+                body=InteractiveText(text=self._short_text(body, 1024)),
+                footer=InteractiveText(text="Prices shown in INR"),
+                action=InteractiveButtonAction(buttons=buttons),
+            ),
+        )
+        return await self._send_interactive(message)
+
+    async def _send_interactive(self, message: WhatsAppInteractiveMessage) -> bool:
+        if not getattr(self._whatsapp_client, "credentials_valid", True):
+            logger.error(
+                "WhatsApp interactive send skipped because authentication is invalid; "
+                "replace WHATSAPP_ACCESS_TOKEN and restart"
+            )
+            return False
+        try:
+            await self._whatsapp_client.send_message(message)
+            logger.info("WhatsApp interactive message sent type=%s", message.interactive.type)
+            return True
+        except WhatsAppAPIError as error:
+            logger.error(
+                "Unable to send WhatsApp interactive response status=%s response=%s cause=%r",
+                error.status_code,
+                error.response_body,
+                error.__cause__,
+            )
+            return False
+
+    @staticmethod
+    def _paged_rows(
+        items: list[Any],
+        page: int,
+        row_factory: Any,
+        previous_id: str,
+        next_id: str,
+    ) -> list[InteractiveRow]:
+        page_size = 8
+        start = page * page_size
+        if page < 0 or start >= len(items):
+            raise IndexError("page out of range")
+        rows = [
+            row_factory(index, item)
+            for index, item in enumerate(
+                items[start : start + page_size], start=start
+            )
+        ]
+        if page > 0:
+            rows.append(InteractiveRow(id=previous_id, title="Previous page"))
+        if start + page_size < len(items):
+            rows.append(InteractiveRow(id=next_id, title="Next page"))
+        return rows
+
+    @staticmethod
+    def _short_text(value: object, limit: int) -> str:
+        text = str(value)
+        return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+    @staticmethod
+    def _distinct_row_titles(names: list[str]) -> list[str]:
+        titles = [WhatsAppWebhookService._short_text(name, 24) for name in names]
+        collisions = {title for title in titles if titles.count(title) > 1}
+        if not collisions:
+            return titles
+
+        for index, (name, title) in enumerate(zip(names, titles, strict=True)):
+            if title not in collisions:
+                continue
+            suffix = name[-24:] if len(name) > 24 else name
+            titles[index] = suffix.lstrip(" -")
+
+        # A numeric prefix guarantees uniqueness when the meaningful suffixes also match.
+        for title in set(titles):
+            duplicate_indexes = [
+                index for index, candidate in enumerate(titles) if candidate == title
+            ]
+            if len(duplicate_indexes) > 1:
+                for sequence, index in enumerate(duplicate_indexes, start=1):
+                    titles[index] = f"{sequence}. {title}"[:24]
+        return titles
+
+    @staticmethod
+    def _edition_row_titles(product: str, editions: list[str]) -> list[str]:
+        labels: list[str] = []
+        normalized_product = product.strip().casefold()
+        for edition in editions:
+            normalized_edition = edition.strip().casefold()
+            if normalized_edition == normalized_product:
+                labels.append("Standard")
+                continue
+
+            if normalized_edition.startswith(normalized_product):
+                suffix = edition.strip()[len(product.strip()) :].strip(" -():")
+                if suffix:
+                    suffix = suffix[0].upper() + suffix[1:]
+                    labels.append(WhatsAppWebhookService._short_text(suffix, 24))
+                    continue
+
+            labels.append(WhatsAppWebhookService._short_text(edition, 24))
+
+        if len(set(labels)) == len(labels):
+            return labels
+        return WhatsAppWebhookService._distinct_row_titles(editions)
 
     @staticmethod
     def _command_type(body: str) -> CommandType | None:
@@ -451,11 +963,25 @@ class WhatsAppWebhookService:
                 billing_label = (
                     "billing unavailable" if billing.lower() == "none" else billing.lower()
                 )
-                amount = WhatsAppWebhookService._formatted_amount(
-                    quote["total_quote_amount"]
-                )
+                if WhatsAppWebhookService._promo_is_applied(quote):
+                    promo_amount = WhatsAppWebhookService._formatted_amount(
+                        quote.get("initial_quote_with_promo", quote["total_quote_amount"])
+                    )
+                    regular_amount = WhatsAppWebhookService._formatted_amount(
+                        quote.get(
+                            "initial_quote_without_promo", quote["total_quote_amount"]
+                        )
+                    )
+                    price_text = f"INR {promo_amount} (regular INR {regular_amount})"
+                else:
+                    price_text = (
+                        f"INR {WhatsAppWebhookService._formatted_amount(quote['total_quote_amount'])}"
+                    )
+                promo = WhatsAppWebhookService._promo_text(quote, compact=True)
+                promo_suffix = f" | {promo}" if promo else ""
                 lines.append(
-                    f"{index}. {quote['sku_title']} - {term}, {billing_label} - {amount}"
+                    f"{index}. {quote['sku_title']} - {term}, {billing_label} - "
+                    f"{price_text}{promo_suffix}"
                 )
 
         if failures:
@@ -471,6 +997,103 @@ class WhatsAppWebhookService:
             return f"{Decimal(str(value)):,.2f}"
         except (InvalidOperation, ValueError):
             return str(value)
+
+    @staticmethod
+    def _promo_text(quote: dict[str, Any], compact: bool = False) -> str | None:
+        percentage = WhatsAppWebhookService._promo_percentage(quote)
+        if percentage <= 0:
+            return None
+
+        percentage_text = format(percentage.normalize(), "f")
+        applied = WhatsAppWebhookService._promo_is_applied(quote)
+        if applied:
+            formatted_percentage = f"{percentage_text}% promo"
+        else:
+            existing_quantity = quote.get("existing_quantity")
+            formatted_percentage = (
+                f"{percentage_text}% promo unavailable ({existing_quantity} existing)"
+                if isinstance(existing_quantity, int) and existing_quantity > 0
+                else f"{percentage_text}% promo unavailable"
+            )
+        promo_code = quote.get("promo_code") or quote.get("promotion_code")
+        if isinstance(promo_code, str) and promo_code.strip():
+            return (
+                f"{formatted_percentage} - code {promo_code.strip()}"
+                if compact
+                else (
+                    f"Promotion: {percentage_text}% off"
+                    + (
+                        " (applied)"
+                        if applied
+                        else WhatsAppWebhookService._promo_unavailable_reason(quote)
+                    )
+                    + f"\nPromo code: *{promo_code.strip()}*"
+                )
+            )
+        return (
+            f"{formatted_percentage} - automatic"
+            if compact and applied
+            else (
+                formatted_percentage
+                if compact
+                else (
+                    f"Promotion: {percentage_text}% off (applied automatically)"
+                    if applied
+                    else (
+                        f"Promotion available: {percentage_text}% off\n"
+                        f"Promo status: Not applied"
+                        f"{WhatsAppWebhookService._promo_unavailable_reason(quote)}"
+                    )
+                )
+            )
+        )
+
+    @staticmethod
+    def _promo_unavailable_reason(quote: dict[str, Any]) -> str:
+        existing_quantity = quote.get("existing_quantity")
+        promo_quantity = quote.get("promo_quantity")
+        if (
+            isinstance(existing_quantity, int)
+            and existing_quantity > 0
+            and promo_quantity == 0
+        ):
+            return (
+                f" - API returned 0 promo-eligible licenses "
+                f"({existing_quantity} existing licenses)"
+            )
+        return " - API returned 0 promo-eligible licenses"
+
+    @staticmethod
+    def _promo_percentage(quote: dict[str, Any]) -> Decimal:
+        regular_price = quote.get("initial_quote_without_promo")
+        promo_price = quote.get("initial_quote_with_promo")
+        try:
+            regular = Decimal(str(regular_price))
+            promo = Decimal(str(promo_price))
+            if regular > 0 and 0 <= promo < regular:
+                return ((regular - promo) / regular * 100).quantize(Decimal("0.01"))
+        except (InvalidOperation, ValueError):
+            pass
+
+        try:
+            percentage = Decimal(str(quote.get("promo_percentage", 0)))
+        except (InvalidOperation, ValueError):
+            return Decimal(0)
+        return percentage * 100 if 0 < percentage < 1 else percentage
+
+    @staticmethod
+    def _has_promo_offer(quote: dict[str, Any]) -> bool:
+        return WhatsAppWebhookService._promo_percentage(quote) > 0
+
+    @staticmethod
+    def _promo_is_applied(quote: dict[str, Any]) -> bool:
+        promo_quantity = quote.get("promo_quantity")
+        if isinstance(promo_quantity, int):
+            return promo_quantity > 0
+        try:
+            return Decimal(str(quote.get("promo_amount", 0))) > 0
+        except (InvalidOperation, ValueError):
+            return False
 
     @staticmethod
     def _text_chunks(body: str, limit: int = 4096) -> list[str]:

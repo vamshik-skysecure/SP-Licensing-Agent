@@ -1,3 +1,4 @@
+import json
 from time import perf_counter
 from typing import Any, BinaryIO
 
@@ -219,4 +220,9 @@ class PricingAgentClient:
                 response_body=response.text,
             )
 
+        logger.info(
+            "Pricing agent API response path=%s payload=%s",
+            path,
+            json.dumps(payload, ensure_ascii=True, default=str),
+        )
         return payload

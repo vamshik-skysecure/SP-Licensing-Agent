@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -7,7 +8,7 @@ from fastapi import FastAPI, Request
 from app.api.whatsapp.service import WhatsAppWebhookService
 from app.config import Settings, configure_logging, get_logger
 from app.core.agent.main import PricingAgentClient
-from app.core.whatsapp import WhatsAppClient
+from app.core.whatsapp import WhatsAppAPIError, WhatsAppClient
 
 logger = get_logger(__name__)
 
@@ -17,7 +18,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = Settings()
     configure_logging(settings.log_level)
     logger.info("Application startup started")
-    whatsapp_http_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+    whatsapp_http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0),
+        transport=httpx.AsyncHTTPTransport(retries=settings.whatsapp_connect_retries),
+    )
     pricing_http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(settings.pricing_agent_timeout_seconds)
     )
@@ -30,6 +34,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         base_url=settings.whatsapp_uri,
         api_version=settings.whatsapp_uri_version,
     )
+    logger.info(
+        "WhatsApp endpoint configured host=%s api_version=%s connect_retries=%d",
+        urlsplit(settings.whatsapp_uri).hostname,
+        settings.whatsapp_uri_version,
+        settings.whatsapp_connect_retries,
+    )
+    try:
+        await app.state.whatsapp_client.validate_credentials()
+    except WhatsAppAPIError as error:
+        if error.status_code is not None:
+            logger.critical(
+                "WhatsApp credentials are invalid: status=%s response=%s. "
+                "Replace WHATSAPP_ACCESS_TOKEN and restart the application.",
+                error.status_code,
+                error.response_body,
+            )
+        else:
+            logger.error("WhatsApp credential validation could not reach Meta: %r", error.__cause__)
     app.state.pricing_agent_client = PricingAgentClient(
         http_client=pricing_http_client,
         base_url=settings.pricing_agent_base_url,

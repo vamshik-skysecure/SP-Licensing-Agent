@@ -5,7 +5,7 @@ from typing import Any
 from httpx import AsyncClient, HTTPStatusError, RequestError
 
 from app.config import get_logger
-from app.schema.whatsapp import WhatsAppTextMessage
+from app.schema.whatsapp import WhatsAppInteractiveMessage, WhatsAppTextMessage
 
 logger = get_logger(__name__)
 
@@ -19,10 +19,12 @@ class WhatsAppAPIError(Exception):
         *,
         status_code: int | None = None,
         response_body: str | None = None,
+        network_error: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+        self.network_error = network_error
 
 
 @dataclass(frozen=True)
@@ -45,14 +47,47 @@ class WhatsAppClient:
     ) -> None:
         self._http_client = http_client
         self._access_token = access_token
+        self._phone_number_id = phone_number_id
+        self._credentials_valid = True
         self._api_url = (
             f"{base_url.rstrip('/')}/{api_version.strip('/')}/"
         )
         self._messages_url = f"{self._api_url}{phone_number_id}/messages"
 
-    async def send_message(self, message: WhatsAppTextMessage) -> dict[str, Any]:
+    @property
+    def credentials_valid(self) -> bool:
+        return self._credentials_valid
+
+    async def validate_credentials(self) -> None:
+        """Validate that the access token can read the configured phone asset."""
+        logger.info("WhatsApp credential validation started")
+        try:
+            response = await self._http_client.get(
+                f"{self._api_url}{self._phone_number_id}",
+                params={"fields": "id"},
+                headers=self._headers,
+            )
+            response.raise_for_status()
+        except HTTPStatusError as error:
+            self._credentials_valid = False
+            raise WhatsAppAPIError(
+                "WhatsApp credential validation failed.",
+                status_code=error.response.status_code,
+                response_body=error.response.text,
+            ) from error
+        except RequestError as error:
+            raise WhatsAppAPIError(
+                "Unable to validate WhatsApp credentials.", network_error=True
+            ) from error
+
+        self._credentials_valid = True
+        logger.info("WhatsApp credential validation completed")
+
+    async def send_message(
+        self, message: WhatsAppTextMessage | WhatsAppInteractiveMessage
+    ) -> dict[str, Any]:
         started_at = perf_counter()
-        logger.info("WhatsApp API send request started characters=%d", len(message.text.body))
+        logger.info("WhatsApp API send request started type=%s", message.type)
         try:
             response = await self._http_client.post(
                 self._messages_url,
@@ -61,6 +96,8 @@ class WhatsAppClient:
             )
             response.raise_for_status()
         except HTTPStatusError as error:
+            if self._is_auth_error(error.response):
+                self._credentials_valid = False
             logger.warning(
                 "WhatsApp API send request rejected status=%d duration_ms=%.1f response=%s",
                 error.response.status_code,
@@ -79,7 +116,7 @@ class WhatsAppClient:
                 error,
             )
             raise WhatsAppAPIError(
-                "Unable to reach the WhatsApp Cloud API."
+                "Unable to reach the WhatsApp Cloud API.", network_error=True
             ) from error
 
         logger.info(
@@ -152,7 +189,8 @@ class WhatsAppClient:
                 error,
             )
             raise WhatsAppAPIError(
-                "Unable to download media from the WhatsApp Cloud API."
+                "Unable to download media from the WhatsApp Cloud API.",
+                network_error=True,
             ) from error
         except ValueError as error:
             logger.error("WhatsApp media metadata was invalid media_id=%s", media_id)
@@ -183,3 +221,14 @@ class WhatsAppClient:
     @property
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._access_token}"}
+
+    @staticmethod
+    def _is_auth_error(response: Any) -> bool:
+        if response.status_code == 401:
+            return True
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        error = payload.get("error") if isinstance(payload, dict) else None
+        return isinstance(error, dict) and error.get("code") == 190

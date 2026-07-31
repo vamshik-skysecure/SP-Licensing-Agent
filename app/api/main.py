@@ -33,7 +33,7 @@ async def privacy_policy() -> str:
     <h2>Sharing</h2>
     <p>Messages are handled through Meta's WhatsApp Cloud API. Documents and quote requests are sent to the pricing service needed to generate your requested analysis or quote.</p>
     <h2>Retention</h2>
-    <p>The bot processes request data in memory and does not persist submitted documents or generated quotes after the request is completed.</p>
+    <p>Submitted documents are processed in memory and discarded after analysis. Generated quote results are retained in memory for up to 30 minutes so you can navigate interactive pricing options, then automatically deleted.</p>
     <h2>Your Choices</h2>
     <p>You may stop using the bot at any time. To request deletion of data associated with a request, contact the business that provided this bot.</p>
     <h2>Changes</h2>
