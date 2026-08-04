@@ -16,6 +16,20 @@ class WhatsAppTextMessage(BaseModel):
     text: TextContent
 
 
+class DocumentContent(BaseModel):
+    id: str
+    filename: str
+    caption: str | None = None
+
+
+class WhatsAppDocumentMessage(BaseModel):
+    messaging_product: Literal["whatsapp"] = "whatsapp"
+    recipient_type: Literal["individual"] = "individual"
+    to: str
+    type: Literal["document"] = "document"
+    document: DocumentContent
+
+
 class InteractiveText(BaseModel):
     text: str
 

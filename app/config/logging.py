@@ -1,6 +1,6 @@
 import logging
 
-_LOGGER_NAME = "pricing_agent_whatsapp_bot"
+_LOGGER_NAME = "ssp_licensing_agent"
 _configured = False
 
 

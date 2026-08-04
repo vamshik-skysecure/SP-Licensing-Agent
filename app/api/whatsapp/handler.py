@@ -14,9 +14,9 @@ from fastapi import (
 )
 from pydantic import ValidationError
 
-from app.api.dependencies import get_settings, get_whatsapp_webhook_service
-from app.api.whatsapp.service import WhatsAppWebhookService
+from app.api.dependencies import get_settings, get_webhook_dispatcher
 from app.config import Settings, get_logger
+from app.core.dispatch import WebhookDispatcher
 from app.schema.whatsapp import WhatsAppWebhookPayload
 
 router = APIRouter()
@@ -50,7 +50,7 @@ async def receive_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     settings: Annotated[Settings, Depends(get_settings)],
-    service: Annotated[WhatsAppWebhookService, Depends(get_whatsapp_webhook_service)],
+    dispatcher: Annotated[WebhookDispatcher, Depends(get_webhook_dispatcher)],
 ) -> dict[str, str]:
     logger.info("Webhook request received")
     raw_body = await request.body()
@@ -71,8 +71,8 @@ async def receive_webhook(
         return {"status": "ignored"}
 
     logger.info("Webhook payload accepted entries=%d", len(webhook.entry))
-    background_tasks.add_task(service.handle, webhook)
-    logger.info("Webhook processing queued")
+    await dispatcher.dispatch(raw_body, webhook, background_tasks)
+    logger.info("Webhook processing dispatched")
     return {"status": "ok"}
 
 

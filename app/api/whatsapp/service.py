@@ -1,18 +1,31 @@
-import json
-import secrets
-from asyncio import get_running_loop
-from collections import deque
+from __future__ import annotations
+
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from enum import StrEnum
-from typing import Any
 
 from app.config import get_logger
-from app.core.agent.main import PricingAgentAPIError, PricingAgentClient
+from app.core.licensing.analysis import LicenseAnalysisError
+from app.core.licensing.agent import (
+    AgentIntent,
+    IntentInterpretationError,
+    IntentInterpreter,
+)
+from app.core.licensing.models import MigrationDisposition, ScenarioType
+from app.core.licensing.orchestrator import LicensingOrchestrator
+from app.core.licensing.renderer import (
+    format_comparison,
+    format_estate,
+    format_pending_matches,
+    format_scenario,
+    render_comparison_pdf,
+    render_estate_pdf,
+)
+from app.core.licensing.scenarios import ScenarioError
+from app.core.licensing.store import WorkflowConflictError
 from app.core.whatsapp import WhatsAppAPIError, WhatsAppClient
 from app.schema.whatsapp import (
     IncomingWhatsAppDocument,
+    IncomingWhatsAppMessage,
     InteractiveButton,
     InteractiveButtonAction,
     InteractiveButtons,
@@ -30,1070 +43,642 @@ from app.schema.whatsapp import (
 
 logger = get_logger(__name__)
 
-HELP_TEXT = """Pricing Agent Bot commands:
 
-/help or /start - Show this command list.
-/about - Learn what this bot can do.
-/quote product query | target quantity | existing quantity [| product id | sku id | term duration | billing plan] - Create a final quote.
-/analyze - Upload a tenant document to generate quotes for every detected license.
+HELP_TEXT = """*SP/SSP Licensing Agent*
 
-You can also send a normal message to chat with the pricing agent."""
+1. Upload the customer's .csv or .xlsx licence file.
+2. Select Renew As-Is, ME3 + Copilot, ME5 + Copilot, or ME7.
+3. Review and edit the proposed configuration.
+4. Use /compare for the commercial comparison and PDF.
 
-ABOUT_TEXT = (
-    "Pricing Agent Bot helps analyze Microsoft tenant documents, create pricing quotes, "
-    "and answer Microsoft licensing questions. Send /help to see available commands."
-)
+Commands:
+/scenario renew|me3|me5|me7 [| base qty | Copilot qty]
+/set LINE QTY
+/retain LINE, /remove LINE, /migrate LINE, /included LINE
+/add PRODUCT TITLE | QTY
+/replace LINE | PRODUCT TITLE | QTY
+/copilot QTY
+/promo on|off
+/discount PERCENT
+/adjust AMOUNT
+/term TERM
+/billing PLAN
+/segment SEGMENT
+/currency CODE
+/comment TEXT
+/finalize
+/compare
+/help"""
 
 
-class CommandType(StrEnum):
-    HELP = "help"
-    ABOUT = "about"
-    ANALYZE = "analyze"
-    ANALYZE_AND_QUOTE = "analyze-and-quote"
-    QUOTE = "quote"
-
-
-COMMAND_ALIASES = {
-    "/help": CommandType.HELP,
-    "/start": CommandType.HELP,
-    "/commands": CommandType.HELP,
-    "/about": CommandType.ABOUT,
-    "/analyze": CommandType.ANALYZE,
-    "/analyze-and-quote": CommandType.ANALYZE_AND_QUOTE,
-    "/quote": CommandType.QUOTE,
+SCENARIO_ALIASES = {
+    "renew": ScenarioType.RENEW_AS_IS,
+    "renew_as_is": ScenarioType.RENEW_AS_IS,
+    "me3": ScenarioType.ME3_COPILOT,
+    "me3_copilot": ScenarioType.ME3_COPILOT,
+    "me5": ScenarioType.ME5_COPILOT,
+    "me5_copilot": ScenarioType.ME5_COPILOT,
+    "me7": ScenarioType.ME7,
 }
 
 
 @dataclass(frozen=True)
-class QuoteResults:
-    filename: str
-    product_count: int
-    final_quotes: list[dict[str, Any]]
-    failures: list[str]
-
-
-@dataclass(frozen=True)
-class QuoteSession:
-    sender: str
-    results: QuoteResults
-    expires_at: datetime
+class ServiceConfiguration:
+    seller_allowlist: frozenset[str]
+    max_document_bytes: int
+    currency: str = "INR"
 
 
 class WhatsAppWebhookService:
-    """Processes inbound WhatsApp text messages through the pricing agent."""
-
     def __init__(
         self,
         whatsapp_client: WhatsAppClient,
-        pricing_agent_client: PricingAgentClient,
+        orchestrator: LicensingOrchestrator,
+        configuration: ServiceConfiguration,
+        *,
+        intent_interpreter: IntentInterpreter | None = None,
     ) -> None:
         self._whatsapp_client = whatsapp_client
-        self._pricing_agent_client = pricing_agent_client
-        self._processed_message_ids: set[str] = set()
-        self._message_id_order: deque[str] = deque(maxlen=1000)
-        self._quote_sessions: dict[str, QuoteSession] = {}
+        self._orchestrator = orchestrator
+        self._configuration = configuration
+        self._intent_interpreter = intent_interpreter
 
     async def handle(self, webhook: WhatsAppWebhookPayload) -> None:
-        message_count = sum(
-            len(change.value.messages)
-            for entry in webhook.entry
-            for change in entry.changes
-        )
-        logger.info("Message processing started count=%d", message_count)
         for entry in webhook.entry:
             for change in entry.changes:
                 for message in change.value.messages:
-                    if message.id in self._processed_message_ids:
-                        logger.info("Duplicate message ignored message_id=%s", message.id)
-                        continue
-                    if len(self._message_id_order) == self._message_id_order.maxlen:
-                        self._processed_message_ids.discard(self._message_id_order[0])
-                    self._message_id_order.append(message.id)
-                    self._processed_message_ids.add(message.id)
-                    logger.info("Processing message type=%s", message.type)
-                    if message.type == "text" and message.text is not None:
-                        await self._handle_text_message(message.sender, message.text.body)
-                    elif message.type == "document" and message.document is not None:
-                        await self._handle_document_message(message.sender, message.document)
-                    elif message.type == "interactive" and message.interactive is not None:
-                        reply = (
-                            message.interactive.list_reply
-                            or message.interactive.button_reply
-                        )
-                        if reply is not None:
-                            await self._handle_interactive_reply(message.sender, reply.id)
-                    else:
-                        logger.info("Unsupported message ignored type=%s", message.type)
-        logger.info("Message processing completed count=%d", message_count)
+                    await self._handle_message(message)
 
-    async def _handle_text_message(self, sender: str, body: str) -> None:
-        command_type = self._command_type(body)
-        logger.info("Text message classified command=%s", command_type or "chat")
-        if command_type is CommandType.HELP:
-            await self._send_text(sender, HELP_TEXT)
+    async def _handle_message(self, message: IncomingWhatsAppMessage) -> None:
+        sender = message.sender.lstrip("+")
+        if (
+            self._configuration.seller_allowlist
+            and sender not in self._configuration.seller_allowlist
+        ):
+            logger.warning("Unauthorized WhatsApp sender rejected")
+            await self._send_text(sender, "This WhatsApp number is not authorized.")
             return
-        if command_type is CommandType.ABOUT:
-            await self._send_text(sender, ABOUT_TEXT)
+        if await self._orchestrator.has_processed(sender, message.id):
+            logger.info("Duplicate WhatsApp message ignored message_id=%s", message.id)
             return
-        if command_type is CommandType.ANALYZE:
-            await self._send_text(sender, "Upload a tenant document to generate all quotes automatically.")
-            return
-        if command_type is CommandType.ANALYZE_AND_QUOTE:
+
+        try:
+            if message.type == "text" and message.text is not None:
+                await self._handle_text(sender, message.text.body)
+            elif message.type == "document" and message.document is not None:
+                await self._handle_document(sender, message.document)
+            elif message.type == "interactive" and message.interactive is not None:
+                reply = message.interactive.list_reply or message.interactive.button_reply
+                if reply is None:
+                    raise ValueError("The interactive response was empty.")
+                await self._handle_interactive(sender, reply.id)
+            else:
+                await self._send_text(
+                    sender,
+                    "Send a .csv/.xlsx licence file, text command, or menu selection.",
+                )
+            await self._orchestrator.mark_processed(sender, message.id)
+        except (LicenseAnalysisError, ScenarioError, ValueError) as error:
+            logger.info("User-correctable workflow error type=%s", type(error).__name__)
+            await self._send_text(sender, f"I could not apply that request: {error}")
+            await self._orchestrator.mark_processed(sender, message.id)
+        except WorkflowConflictError:
+            logger.warning("Workflow concurrency conflict message_id=%s", message.id)
+            await self._send_text(sender, "The proposal changed concurrently. Please retry.")
+        except Exception:
+            logger.exception("Unexpected workflow failure message_id=%s", message.id)
             await self._send_text(
                 sender,
-                "Upload a tenant document. I will analyze every license and generate all pricing options.",
+                "I could not complete that operation. It is safe to retry the same message.",
             )
-            return
+            raise
 
-        try:
-            quote_parameters = self._quote_parameters(body, "/quote", include_existing=True)
-            if command_type is CommandType.QUOTE:
-                if quote_parameters is None:
-                    await self._send_text(
-                        sender,
-                        "Use /quote product query | target quantity | existing quantity "
-                        "[| product id | sku id | term duration | billing plan]",
-                    )
-                    return
-                agent_response = await self._pricing_agent_client.create_final_quote(
-                    **quote_parameters
-                )
-            else:
-                agent_response = await self._pricing_agent_client.chat(body)
-            response_body = self._response_text(agent_response)
-            logger.info("Text message agent processing completed")
-        except PricingAgentAPIError as error:
-            logger.error(
-                "Pricing agent failed while processing text status=%s response=%s cause=%r",
-                error.status_code,
-                error.response_body,
-                error.__cause__,
-            )
-            response_body = self._quote_selection_text(error) or (
-                "I could not process your request right now. Please try again."
-            )
-
-        await self._send_text(sender, response_body)
-
-    async def _handle_document_message(
-        self, sender: str, document: IncomingWhatsAppDocument
+    async def _handle_document(
+        self,
+        sender: str,
+        document: IncomingWhatsAppDocument,
     ) -> None:
-        logger.info(
-            "Document processing started filename=%s mime_type=%s",
-            document.filename,
-            document.mime_type,
+        suffix = document.filename.lower().rsplit(".", 1)[-1]
+        if suffix not in {"csv", "xlsx"}:
+            raise LicenseAnalysisError("Upload a .csv or .xlsx licence file.")
+        media = await self._whatsapp_client.download_media(
+            media_id=document.id,
+            filename=document.filename,
+            content_type=document.mime_type,
         )
+        if len(media.content) > self._configuration.max_document_bytes:
+            raise LicenseAnalysisError(
+                f"The file exceeds the {self._configuration.max_document_bytes // 1048576} MB limit."
+            )
+        estate = await self._orchestrator.analyze_document(
+            sender=sender,
+            filename=media.filename,
+            content=media.content,
+        )
+        await self._send_estate_report(sender, estate)
+        if estate.pending_lines:
+            await self._send_text_chunks(sender, format_pending_matches(estate))
+        else:
+            await self._send_scenario_menu(sender)
+
+    async def _send_estate_report(self, sender: str, estate) -> None:
+        pdf = render_estate_pdf(estate)
         try:
-            media = await self._whatsapp_client.download_media(
-                media_id=document.id,
-                filename=document.filename,
-                content_type=document.mime_type,
+            await self._whatsapp_client.send_document(
+                to=sender,
+                content=pdf,
+                filename="customer-licence-estate.pdf",
+                content_type="application/pdf",
+                caption=(
+                    "Customer licence estate grouped by product family, with expiry and "
+                    "migration-review flags"
+                ),
             )
         except WhatsAppAPIError as error:
             logger.error(
-                "Unable to download WhatsApp document media_id=%s status=%s "
-                "network_error=%s response=%s cause=%r",
-                document.id,
+                "Unable to send estate PDF status=%s network_error=%s",
                 error.status_code,
                 error.network_error,
-                error.response_body,
-                error.__cause__,
             )
-            if not error.network_error:
-                await self._send_text(
-                    sender, "I could not download that document. Please try again."
-                )
-            else:
-                logger.error(
-                    "WhatsApp failure notification skipped because Meta is unreachable"
-                )
-            return
-        logger.info("Document downloaded filename=%s bytes=%d", media.filename, len(media.content))
+            raise
 
-        try:
-            results = await self._document_quote_results(
-                file=media.content,
-                filename=media.filename,
-                content_type=media.content_type,
-            )
-        except PricingAgentAPIError as error:
-            logger.exception("Pricing agent failed while processing document %s", document.id)
-            response_body = self._quote_selection_text(error) or (
-                "I could not process that document right now. Please try again."
-            )
-            await self._send_text(sender, response_body)
+    async def _handle_text(self, sender: str, body: str) -> None:
+        command = body.strip()
+        lowered = command.casefold()
+        if lowered in {"/help", "/start", "/about", "/analyze"}:
+            await self._send_text(sender, HELP_TEXT)
             return
-
-        if results.final_quotes:
-            session_id = self._create_quote_session(sender, results)
-            if not await self._send_product_list(sender, session_id, 0):
-                await self._send_text_chunks(
-                    sender,
-                    self._final_quotes_text(
-                        filename=results.filename,
-                        product_count=results.product_count,
-                        final_quotes=results.final_quotes,
-                        failures=results.failures,
-                    ),
-                )
-        else:
-            await self._send_text_chunks(
+        if lowered.startswith("/confirm "):
+            selections = self._parse_confirmations(command[9:])
+            estate = await self._orchestrator.confirm_matches(sender, selections)
+            await self._send_text_chunks(sender, format_estate(estate))
+            await self._send_scenario_menu(sender)
+            return
+        if lowered.startswith("/scenario "):
+            scenario_type, base, copilot = self._parse_scenario(command[10:])
+            scenario = await self._orchestrator.build_scenario(
                 sender,
-                self._final_quotes_text(
-                    filename=results.filename,
-                    product_count=results.product_count,
-                    final_quotes=results.final_quotes,
-                    failures=results.failures,
-                ),
+                scenario_type,
+                base_quantity=base,
+                copilot_quantity=copilot,
             )
-        logger.info("Document processing completed filename=%s", media.filename)
-
-    async def _send_text(self, sender: str, body: str) -> None:
-        if not getattr(self._whatsapp_client, "credentials_valid", True):
-            logger.error(
-                "WhatsApp send skipped because authentication is invalid; "
-                "replace WHATSAPP_ACCESS_TOKEN and restart"
-            )
+            await self._send_scenario(sender, scenario)
             return
-        logger.info("Sending WhatsApp text characters=%d", len(body))
-        try:
-            await self._whatsapp_client.send_message(
-                WhatsAppTextMessage(
-                    to=sender,
-                    text=TextContent(body=body),
-                )
-            )
-            logger.info("WhatsApp text sent")
-        except WhatsAppAPIError as error:
-            logger.error(
-                "Unable to send WhatsApp response status=%s response=%s cause=%r",
-                error.status_code,
-                error.response_body,
-                error.__cause__,
-            )
-
-    async def _send_text_chunks(self, sender: str, body: str) -> None:
-        chunks = self._text_chunks(body)
-        logger.info("Sending WhatsApp response chunks=%d", len(chunks))
-        for index, chunk in enumerate(chunks, start=1):
-            logger.info("Sending WhatsApp response chunk=%d/%d", index, len(chunks))
-            await self._send_text(sender, chunk)
-
-    async def _document_quote_text(
-        self,
-        file: bytes,
-        filename: str,
-        content_type: str,
-    ) -> str:
-        results = await self._document_quote_results(file, filename, content_type)
-        return self._final_quotes_text(
-            filename=results.filename,
-            product_count=results.product_count,
-            final_quotes=results.final_quotes,
-            failures=results.failures,
-        )
-
-    async def _document_quote_results(
-        self,
-        file: bytes,
-        filename: str,
-        content_type: str,
-    ) -> QuoteResults:
-        logger.info("Tenant analysis started filename=%s", filename)
-        tenant_analysis = await self._pricing_agent_client.analyze_tenant_file(
-            file=file,
-            filename=filename,
-            content_type=content_type,
-        )
-        final_quotes: list[dict[str, Any]] = []
-        failures: list[str] = []
-        logger.info(
-            "Tenant analysis completed filename=%s products=%d",
-            filename,
-            len(tenant_analysis["licenses"]),
-        )
-
-        for product_index, license_info in enumerate(tenant_analysis["licenses"], start=1):
-            product_title = license_info["product_title"]
-            target_quantity = license_info["assigned_licenses"]
-            logger.info(
-                "Product quote analysis started product=%d/%d title=%s target_quantity=%d",
-                product_index,
-                len(tenant_analysis["licenses"]),
-                product_title,
-                target_quantity,
-            )
-            try:
-                analysis = await self._pricing_agent_client.analyze_and_quote(
-                    file=file,
-                    filename=filename,
-                    content_type=content_type,
-                    product_query=product_title,
-                    target_quantity=target_quantity,
-                )
-            except PricingAgentAPIError as error:
-                if error.quote_selection is None:
-                    failures.append(f"{product_title}: quote analysis failed")
-                    logger.exception("Quote analysis failed for %s", product_title)
-                    continue
-
-                logger.info(
-                    "Product quote selection required title=%s options=%d",
-                    product_title,
-                    len(error.quote_selection.detail.available_options),
-                )
-                for option in error.quote_selection.detail.available_options:
-                    try:
-                        logger.info(
-                            "Selected quote analysis started title=%s sku_id=%s term=%s billing=%s",
-                            product_title,
-                            option.sku_id,
-                            option.term_duration,
-                            option.billing_plan,
-                        )
-                        selected_analysis = await self._pricing_agent_client.analyze_and_quote(
-                            file=file,
-                            filename=filename,
-                            content_type=content_type,
-                            product_query=product_title,
-                            target_quantity=target_quantity,
-                            product_id=option.product_id,
-                            sku_id=option.sku_id,
-                            term_duration=option.term_duration,
-                            billing_plan=option.billing_plan,
-                        )
-                        final_quote = selected_analysis.final_quote.model_dump(mode="json")
-                        final_quote["_requested_product"] = product_title
-                        final_quotes.append(final_quote)
-                        logger.info(
-                            "Selected quote analysis completed title=%s sku_id=%s",
-                            product_title,
-                            option.sku_id,
-                        )
-                    except PricingAgentAPIError as selection_error:
-                        failures.append(
-                            f"{product_title} ({option.sku_id}, {option.term_duration}, "
-                            f"{option.billing_plan}): final quote failed"
-                        )
-                        logger.error(
-                            "Selected quote failed for %s: status=%s response=%s cause=%r",
-                            product_title,
-                            selection_error.status_code,
-                            selection_error.response_body,
-                            selection_error.__cause__,
-                        )
-                continue
-
-            # The API can return a final quote directly when no selection is required.
-            final_quote = analysis.final_quote.model_dump(mode="json")
-            final_quote["_requested_product"] = product_title
-            final_quotes.append(final_quote)
-            logger.info("Product quote analysis completed title=%s", product_title)
-
-        logger.info(
-            "Document quote generation completed filename=%s quotes=%d failures=%d",
-            filename,
-            len(final_quotes),
-            len(failures),
-        )
-        return QuoteResults(
-            filename=filename,
-            product_count=len(tenant_analysis["licenses"]),
-            final_quotes=final_quotes,
-            failures=failures,
-        )
-
-    def _create_quote_session(self, sender: str, results: QuoteResults) -> str:
-        self._remove_expired_sessions()
-        session_id = secrets.token_urlsafe(8)
-        self._quote_sessions[session_id] = QuoteSession(
-            sender=sender,
-            results=results,
-            expires_at=datetime.now(UTC) + timedelta(minutes=30),
-        )
-        get_running_loop().call_later(30 * 60, self._expire_quote_session, session_id)
-        logger.info(
-            "Quote session created session_id=%s products=%d quotes=%d",
-            session_id,
-            results.product_count,
-            len(results.final_quotes),
-        )
-        return session_id
-
-    def _expire_quote_session(self, session_id: str) -> None:
-        if self._quote_sessions.pop(session_id, None) is not None:
-            logger.info("Quote session expired session_id=%s", session_id)
-
-    def _get_quote_session(self, sender: str, session_id: str) -> QuoteSession | None:
-        self._remove_expired_sessions()
-        session = self._quote_sessions.get(session_id)
-        if session is None or session.sender != sender:
-            return None
-        return session
-
-    def _remove_expired_sessions(self) -> None:
-        now = datetime.now(UTC)
-        expired = [
-            session_id
-            for session_id, session in self._quote_sessions.items()
-            if session.expires_at <= now
-        ]
-        for session_id in expired:
-            del self._quote_sessions[session_id]
-        if expired:
-            logger.info("Expired quote sessions removed count=%d", len(expired))
-
-    async def _handle_interactive_reply(self, sender: str, reply_id: str) -> None:
-        logger.info("Interactive reply received reply_id=%s", reply_id)
-        parts = reply_id.split("|")
-        if len(parts) < 4 or parts[0] != "quote":
-            await self._send_text(sender, "That selection is not recognized. Please try again.")
+        if lowered.startswith("/set "):
+            line_id, quantity = self._line_quantity(command[5:])
+            scenario = await self._orchestrator.edit_quantity(sender, line_id, quantity)
+            await self._send_scenario(sender, scenario)
             return
-
-        session_id, action = parts[1], parts[2]
-        session = self._get_quote_session(sender, session_id)
-        if session is None:
+        if lowered.startswith("/copilot "):
+            quantity = self._positive_or_zero(command[9:].strip(), "Copilot quantity")
+            scenario = await self._orchestrator.edit_quantity(sender, "COPILOT", quantity)
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered.startswith("/promo "):
+            value = command[7:].strip().casefold()
+            if value not in {"on", "off"}:
+                raise ValueError("Use /promo on or /promo off.")
+            scenario = await self._orchestrator.reconfigure_pricing(
+                sender,
+                promo_eligible=value == "on",
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered.startswith("/discount "):
+            percentage = self._decimal_value(command[10:], "Discount percentage")
+            scenario = await self._orchestrator.set_discount(sender, percentage)
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered.startswith("/adjust "):
+            amount = self._decimal_value(command[8:], "Adjustment amount")
+            scenario = await self._orchestrator.set_adjustment(sender, amount)
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered.startswith("/term "):
+            scenario = await self._orchestrator.reconfigure_pricing(
+                sender,
+                term_duration=self._required_text(command[6:], "contract term"),
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered.startswith("/billing "):
+            scenario = await self._orchestrator.reconfigure_pricing(
+                sender,
+                billing_plan=self._required_text(command[9:], "billing plan"),
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered.startswith("/segment "):
+            scenario = await self._orchestrator.reconfigure_pricing(
+                sender,
+                segment=self._required_text(command[9:], "segment"),
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered.startswith("/currency "):
+            requested = self._required_text(command[10:], "currency").upper()
+            configured = self._configuration.currency.upper()
+            if requested != configured:
+                raise ValueError(
+                    "Currency conversion is unavailable because the Outcome Sheet has no "
+                    f"Currency or FX-rate column. Current currency: {configured}."
+                )
             await self._send_text(
                 sender,
-                "This quote selection has expired. Please upload the tenant document again.",
+                f"Currency remains {configured}; no conversion was applied.",
             )
             return
+        disposition_commands = {
+            "/retain ": MigrationDisposition.RETAIN,
+            "/remove ": MigrationDisposition.REMOVE,
+            "/migrate ": MigrationDisposition.MIGRATE,
+            "/included ": MigrationDisposition.INCLUDED,
+        }
+        for prefix, disposition in disposition_commands.items():
+            if lowered.startswith(prefix):
+                line_id = command[len(prefix) :].strip()
+                if not line_id:
+                    raise ValueError(f"Use {prefix.strip()} LINE_ID.")
+                scenario = await self._orchestrator.set_disposition(
+                    sender, line_id, disposition
+                )
+                await self._send_scenario(sender, scenario)
+                return
+        if lowered.startswith("/add "):
+            product, quantity = self._product_quantity(command[5:])
+            scenario = await self._orchestrator.add_sku(sender, product, quantity)
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered.startswith("/replace "):
+            line_id, product, quantity = self._replacement(command[9:])
+            scenario = await self._orchestrator.replace_sku(
+                sender,
+                line_id,
+                product,
+                quantity,
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered.startswith("/comment "):
+            scenario = await self._orchestrator.add_comment(sender, command[9:])
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered == "/finalize":
+            scenario = await self._orchestrator.finalize(sender)
+            await self._send_scenario(sender, scenario)
+            return
+        if lowered == "/compare":
+            await self._send_comparison(sender)
+            return
 
-        try:
-            indexes = [int(value) for value in parts[3:]]
-            sent = False
-            if action == "products" and len(indexes) == 1:
-                sent = await self._send_product_list(sender, session_id, indexes[0])
-            elif action == "product" and len(indexes) == 1:
-                sent = await self._send_variant_list(sender, session_id, indexes[0], 0)
-            elif action == "variants" and len(indexes) == 2:
-                sent = await self._send_variant_list(
-                    sender, session_id, indexes[0], indexes[1]
-                )
-            elif action == "variant" and len(indexes) == 2:
-                sent = await self._send_option_list(
-                    sender, session_id, indexes[0], indexes[1], 0
-                )
-            elif action == "options" and len(indexes) == 3:
-                sent = await self._send_option_list(
-                    sender, session_id, indexes[0], indexes[1], indexes[2]
-                )
-            elif action == "option" and len(indexes) == 3:
-                sent = await self._send_quote_detail(
-                    sender, session_id, indexes[0], indexes[1], indexes[2]
-                )
-            else:
-                raise ValueError("unsupported quote action")
-            if not sent:
+        if self._intent_interpreter is not None:
+            session = await self._orchestrator.get_session(sender)
+            try:
+                intent = await self._intent_interpreter.interpret(command, session)
+            except IntentInterpretationError:
+                logger.warning("Natural-language intent interpretation failed")
                 await self._send_text(
-                    sender, "I could not display that quote selection. Please try again."
+                    sender,
+                    "I could not interpret that sentence safely. Use a menu option or "
+                    "send /help for the equivalent auditable commands.",
                 )
-        except (IndexError, ValueError):
-            logger.warning("Invalid interactive quote selection reply_id=%s", reply_id)
-            await self._send_text(sender, "That quote option is no longer available.")
+                return
+            await self._execute_agent_intent(sender, intent)
+            return
 
-    @staticmethod
-    def _grouped_quotes(
-        results: QuoteResults,
-    ) -> list[tuple[str, list[dict[str, Any]]]]:
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for quote in results.final_quotes:
-            product = quote.get("_requested_product")
-            if not isinstance(product, str):
-                product = str(quote.get("sku_title", "Product"))
-            groups.setdefault(product, []).append(quote)
-        return list(groups.items())
+        session = await self._orchestrator.get_session(sender)
+        if session is None or session.estate is None:
+            await self._send_text(sender, HELP_TEXT)
+            return
+        await self._send_text(
+            sender,
+            "Natural-language routing is disabled in this environment. Use a menu option "
+            "or send /help for the equivalent auditable commands.",
+        )
 
-    @staticmethod
-    def _variant_groups(
-        quotes: list[dict[str, Any]],
-    ) -> list[tuple[str, list[dict[str, Any]]]]:
-        variants: dict[str, list[dict[str, Any]]] = {}
-        for quote in quotes:
-            title = str(quote.get("sku_title", "Pricing option"))
-            variants.setdefault(title, []).append(quote)
-        return list(variants.items())
+    async def _execute_agent_intent(self, sender: str, intent: AgentIntent) -> None:
+        if intent.action == "help":
+            await self._send_text(sender, HELP_TEXT)
+            return
+        if intent.action == "clarify":
+            question = intent.clarification.strip()
+            await self._send_text(
+                sender,
+                f"I need one more detail: {question[:500]}"
+                if question
+                else "I need the exact scenario, line, or quantity before changing the proposal.",
+            )
+            return
+        if intent.action == "build_scenario":
+            if intent.scenario == "none":
+                raise ValueError("Specify Renew As-Is, ME3 + Copilot, ME5 + Copilot, or ME7.")
+            scenario = await self._orchestrator.build_scenario(
+                sender,
+                ScenarioType(intent.scenario),
+                base_quantity=self._optional_quantity(intent.quantity),
+                copilot_quantity=self._optional_quantity(intent.copilot_quantity),
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if intent.action == "set_quantity":
+            line_id = self._required_text(intent.line_id, "line ID")
+            quantity = self._required_quantity(intent.quantity)
+            scenario = await self._orchestrator.edit_quantity(
+                sender, line_id, quantity
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if intent.action == "set_copilot":
+            scenario = await self._orchestrator.edit_quantity(
+                sender,
+                "COPILOT",
+                self._required_quantity(intent.copilot_quantity),
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if intent.action == "set_disposition":
+            line_id = self._required_text(intent.line_id, "line ID")
+            if intent.disposition == "none":
+                raise ValueError("Specify retain, remove, migrate, or included.")
+            scenario = await self._orchestrator.set_disposition(
+                sender,
+                line_id,
+                MigrationDisposition(intent.disposition),
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if intent.action == "add_sku":
+            product = self._required_text(intent.product_query, "product")
+            quantity = self._required_quantity(intent.quantity, allow_zero=False)
+            scenario = await self._orchestrator.add_sku(sender, product, quantity)
+            await self._send_scenario(sender, scenario)
+            return
+        if intent.action == "replace_sku":
+            line_id = self._required_text(intent.line_id, "line ID")
+            product = self._required_text(intent.product_query, "replacement product")
+            quantity = self._required_quantity(intent.quantity, allow_zero=False)
+            scenario = await self._orchestrator.replace_sku(
+                sender, line_id, product, quantity
+            )
+            await self._send_scenario(sender, scenario)
+            return
+        if intent.action == "add_comment":
+            comment = self._required_text(intent.comment, "comment")
+            scenario = await self._orchestrator.add_comment(sender, comment)
+            await self._send_scenario(sender, scenario)
+            return
+        if intent.action == "finalize":
+            scenario = await self._orchestrator.finalize(sender)
+            await self._send_scenario(sender, scenario)
+            return
+        if intent.action == "compare":
+            await self._send_comparison(sender)
+            return
+        raise ValueError("The interpreted action is not supported.")
 
-    async def _send_product_list(
-        self, sender: str, session_id: str, page: int
-    ) -> bool:
-        session = self._get_quote_session(sender, session_id)
-        if session is None:
-            return False
-        products = self._grouped_quotes(session.results)
-        rows = self._paged_rows(
-            items=products,
-            page=page,
-            row_factory=lambda index, item: InteractiveRow(
-                id=f"quote|{session_id}|product|{index}",
-                title=self._short_text(item[0], 24),
-                description=self._short_text(
-                    f"{item[1][0]['target_quantity']} requested, "
-                    f"{item[1][0]['existing_quantity']} existing, {len(item[1])} options",
-                    72,
+    async def _handle_interactive(self, sender: str, reply_id: str) -> None:
+        parts = reply_id.split("|")
+        if len(parts) < 3 or parts[0] != "licensing":
+            raise ValueError("That menu selection is no longer recognized.")
+        action, value = parts[1], parts[2]
+        if action == "scenario":
+            try:
+                scenario_type = ScenarioType(value)
+            except ValueError as error:
+                raise ValueError("Unknown commercial scenario.") from error
+            scenario = await self._orchestrator.build_scenario(sender, scenario_type)
+            await self._send_scenario(sender, scenario)
+            return
+        if action == "compare":
+            await self._send_comparison(sender)
+            return
+        if action == "finalize":
+            scenario = await self._orchestrator.finalize(sender)
+            await self._send_scenario(sender, scenario)
+            return
+        if action == "scenarios":
+            await self._send_scenario_menu(sender)
+            return
+        raise ValueError("Unknown commercial workflow action.")
+
+    async def _send_scenario_menu(self, sender: str) -> None:
+        rows = [
+            InteractiveRow(
+                id=f"licensing|scenario|{scenario.value}",
+                title=scenario.label,
+                description={
+                    ScenarioType.RENEW_AS_IS: "Retain and price the current estate",
+                    ScenarioType.ME3_COPILOT: "ME3 plus independent Copilot quantity",
+                    ScenarioType.ME5_COPILOT: "ME5 plus independent Copilot quantity",
+                    ScenarioType.ME7: "Migrate to the configured ME7 package",
+                }[scenario],
+            )
+            for scenario in ScenarioType
+        ]
+        await self._send_interactive(
+            sender,
+            InteractiveList(
+                body=InteractiveText(
+                    text="Which commercial recommendation would you like to prepare?"
+                ),
+                action=InteractiveListAction(
+                    button="Choose scenario",
+                    sections=[InteractiveSection(title="Scenarios", rows=rows)],
                 ),
             ),
-            previous_id=f"quote|{session_id}|products|{page - 1}",
-            next_id=f"quote|{session_id}|products|{page + 1}",
-        )
-        body = (
-            f"Quote ready for {session.results.filename}\n"
-            f"{session.results.product_count} products and "
-            f"{len(session.results.final_quotes)} pricing options.\n\n"
-            "Select a product to review."
-        )
-        return await self._send_interactive_list(sender, body, "View products", rows)
-
-    async def _send_variant_list(
-        self, sender: str, session_id: str, product_index: int, page: int
-    ) -> bool:
-        session = self._get_quote_session(sender, session_id)
-        if session is None:
-            return False
-        product, quotes = self._grouped_quotes(session.results)[product_index]
-        variants = self._variant_groups(quotes)
-        variant_titles = self._edition_row_titles(
-            product, [variant[0] for variant in variants]
-        )
-        rows = self._paged_rows(
-            items=variants,
-            page=page,
-            row_factory=lambda index, item: InteractiveRow(
-                id=f"quote|{session_id}|variant|{product_index}|{index}",
-                title=variant_titles[index],
-                description=self._short_text(item[0], 72),
-            ),
-            previous_id=f"quote|{session_id}|variants|{product_index}|{page - 1}",
-            next_id=f"quote|{session_id}|variants|{product_index}|{page + 1}",
-        )
-        body = (
-            f"{product}\n"
-            f"{quotes[0]['target_quantity']} requested | "
-            f"{quotes[0]['existing_quantity']} existing\n\n"
-            "Select a license edition."
-        )
-        return await self._send_interactive_list(sender, body, "View editions", rows)
-
-    async def _send_option_list(
-        self,
-        sender: str,
-        session_id: str,
-        product_index: int,
-        variant_index: int,
-        page: int,
-    ) -> bool:
-        session = self._get_quote_session(sender, session_id)
-        if session is None:
-            return False
-        _, product_quotes = self._grouped_quotes(session.results)[product_index]
-        variant, quotes = self._variant_groups(product_quotes)[variant_index]
-        term_labels = {"P1M": "1 month", "P1Y": "1 year", "P3Y": "3 years"}
-
-        def option_row(index: int, quote: dict[str, Any]) -> InteractiveRow:
-            term = term_labels.get(
-                str(quote["term_duration"]), str(quote["term_duration"])
-            )
-            billing = str(quote["billing_plan"])
-            title = f"{term} - {billing}"
-            description = f"INR {self._formatted_amount(quote['total_quote_amount'])} total"
-            promo = self._promo_text(quote, compact=True)
-            if promo:
-                description += f" | {promo}"
-            return InteractiveRow(
-                id=f"quote|{session_id}|option|{product_index}|{variant_index}|{index}",
-                title=self._short_text(title, 24),
-                description=self._short_text(description, 72),
-            )
-
-        rows = self._paged_rows(
-            items=quotes,
-            page=page,
-            row_factory=option_row,
-            previous_id=(
-                f"quote|{session_id}|options|{product_index}|{variant_index}|{page - 1}"
-            ),
-            next_id=(
-                f"quote|{session_id}|options|{product_index}|{variant_index}|{page + 1}"
-            ),
-        )
-        return await self._send_interactive_list(
-            sender,
-            f"{variant}\n\nSelect a term and billing plan.",
-            "View pricing",
-            rows,
         )
 
-    async def _send_quote_detail(
-        self,
-        sender: str,
-        session_id: str,
-        product_index: int,
-        variant_index: int,
-        quote_index: int,
-    ) -> bool:
-        session = self._get_quote_session(sender, session_id)
-        if session is None:
-            return False
-        _, product_quotes = self._grouped_quotes(session.results)[product_index]
-        variant, quotes = self._variant_groups(product_quotes)[variant_index]
-        quote = quotes[quote_index]
-        term_labels = {"P1M": "1 month", "P1Y": "1 year", "P3Y": "3 years"}
-        term = term_labels.get(str(quote["term_duration"]), str(quote["term_duration"]))
-        regular_unit_price = quote.get(
-            "initial_quote_without_promo", quote["total_quote_amount"]
-        )
-        body = (
-            f"*{variant}*\n\n"
-            f"Quantity: {quote['target_quantity']}\n"
-            f"Existing licenses: {quote['existing_quantity']}\n"
-            f"Term: {term}\n"
-            f"Billing: {quote['billing_plan']}\n"
-            f"Regular unit price: INR {self._formatted_amount(regular_unit_price)}"
-        )
-        promo_unit_price = quote.get("initial_quote_with_promo")
-        if promo_unit_price is not None:
-            body += (
-                f"\nPromo unit price: INR {self._formatted_amount(promo_unit_price)}"
-            )
-        else:
-            body += "\nPromo unit price: Not available"
-        if self._promo_is_applied(quote):
-            try:
-                savings = (
-                    Decimal(str(regular_unit_price))
-                    * Decimal(str(quote["target_quantity"]))
-                    - Decimal(str(quote["total_quote_amount"]))
-                )
-            except (InvalidOperation, ValueError):
-                savings = Decimal(0)
-            if savings > 0:
-                body += f"\nTotal savings: INR {self._formatted_amount(savings)}"
-            promo_quantity = quote.get("promo_quantity")
-            if isinstance(promo_quantity, int) and promo_quantity > 0:
-                body += f"\nPromo applied to: {promo_quantity} licenses"
-        body += f"\nFinal total: *INR {self._formatted_amount(quote['total_quote_amount'])}*"
-        promo = self._promo_text(quote)
-        if promo:
-            body += f"\n{promo}"
+    async def _send_scenario(self, sender: str, scenario) -> None:
+        text = format_scenario(scenario, self._configuration.currency)
+        await self._send_text_chunks(sender, text)
         buttons = [
             InteractiveButton(
-                reply=InteractiveReply(
-                    id=f"quote|{session_id}|variant|{product_index}|{variant_index}",
-                    title="Other prices",
-                )
+                reply=InteractiveReply(id="licensing|scenarios|all", title="Other scenario")
             ),
             InteractiveButton(
-                reply=InteractiveReply(
-                    id=f"quote|{session_id}|products|0",
-                    title="Other products",
-                )
+                reply=InteractiveReply(id="licensing|compare|all", title="Compare")
+            ),
+            InteractiveButton(
+                reply=InteractiveReply(id="licensing|finalize|active", title="Finalize")
             ),
         ]
-        return await self._send_interactive_buttons(sender, body, buttons)
-
-    async def _send_interactive_list(
-        self, sender: str, body: str, button: str, rows: list[InteractiveRow]
-    ) -> bool:
-        message = WhatsAppInteractiveMessage(
-            to=sender,
-            interactive=InteractiveList(
-                body=InteractiveText(text=self._short_text(body, 1024)),
-                footer=InteractiveText(text="Selections expire after 30 minutes"),
-                action=InteractiveListAction(
-                    button=button,
-                    sections=[InteractiveSection(rows=rows)],
-                ),
-            ),
-        )
-        return await self._send_interactive(message)
-
-    async def _send_interactive_buttons(
-        self, sender: str, body: str, buttons: list[InteractiveButton]
-    ) -> bool:
-        message = WhatsAppInteractiveMessage(
-            to=sender,
-            interactive=InteractiveButtons(
-                body=InteractiveText(text=self._short_text(body, 1024)),
-                footer=InteractiveText(text="Prices shown in INR"),
+        await self._send_interactive(
+            sender,
+            InteractiveButtons(
+                body=InteractiveText(text="Continue working with this proposal."),
                 action=InteractiveButtonAction(buttons=buttons),
             ),
         )
-        return await self._send_interactive(message)
 
-    async def _send_interactive(self, message: WhatsAppInteractiveMessage) -> bool:
-        if not getattr(self._whatsapp_client, "credentials_valid", True):
-            logger.error(
-                "WhatsApp interactive send skipped because authentication is invalid; "
-                "replace WHATSAPP_ACCESS_TOKEN and restart"
-            )
-            return False
+    async def _send_comparison(self, sender: str) -> None:
+        estate, scenarios, comparison = await self._orchestrator.comparison(sender)
+        await self._send_text_chunks(
+            sender,
+            format_comparison(comparison, self._configuration.currency),
+        )
+        pdf = render_comparison_pdf(
+            estate,
+            scenarios,
+            comparison,
+            currency=self._configuration.currency,
+        )
         try:
-            await self._whatsapp_client.send_message(message)
-            logger.info("WhatsApp interactive message sent type=%s", message.interactive.type)
+            await self._whatsapp_client.send_document(
+                to=sender,
+                content=pdf,
+                filename="licensing-commercial-comparison.pdf",
+                content_type="application/pdf",
+                caption="Customer-ready licensing commercial comparison",
+            )
+        except WhatsAppAPIError as error:
+            logger.error(
+                "Unable to send comparison PDF status=%s network_error=%s",
+                error.status_code,
+                error.network_error,
+            )
+            raise
+
+    async def _send_text(self, sender: str, body: str) -> None:
+        try:
+            await self._whatsapp_client.send_message(
+                WhatsAppTextMessage(to=sender, text=TextContent(body=body))
+            )
+        except WhatsAppAPIError as error:
+            logger.error(
+                "Unable to send WhatsApp text status=%s network_error=%s",
+                error.status_code,
+                error.network_error,
+            )
+            raise
+
+    async def _send_text_chunks(self, sender: str, body: str) -> None:
+        for chunk in self._text_chunks(body):
+            await self._send_text(sender, chunk)
+
+    async def _send_interactive(
+        self,
+        sender: str,
+        interactive: InteractiveList | InteractiveButtons,
+    ) -> bool:
+        try:
+            await self._whatsapp_client.send_message(
+                WhatsAppInteractiveMessage(to=sender, interactive=interactive)
+            )
             return True
         except WhatsAppAPIError as error:
             logger.error(
-                "Unable to send WhatsApp interactive response status=%s response=%s cause=%r",
+                "Unable to send WhatsApp interactive message status=%s network_error=%s",
                 error.status_code,
-                error.response_body,
-                error.__cause__,
+                error.network_error,
             )
-            return False
+            raise
 
     @staticmethod
-    def _paged_rows(
-        items: list[Any],
-        page: int,
-        row_factory: Any,
-        previous_id: str,
-        next_id: str,
-    ) -> list[InteractiveRow]:
-        page_size = 8
-        start = page * page_size
-        if page < 0 or start >= len(items):
-            raise IndexError("page out of range")
-        rows = [
-            row_factory(index, item)
-            for index, item in enumerate(
-                items[start : start + page_size], start=start
-            )
-        ]
-        if page > 0:
-            rows.append(InteractiveRow(id=previous_id, title="Previous page"))
-        if start + page_size < len(items):
-            rows.append(InteractiveRow(id=next_id, title="Next page"))
-        return rows
+    def _parse_confirmations(value: str) -> dict[str, tuple[str, str]]:
+        result: dict[str, tuple[str, str]] = {}
+        for selection in value.split(";"):
+            if "=" not in selection:
+                raise ValueError("Use LINE=PRODUCT_ID,SKU_ID for every pending line.")
+            line_id, identifiers = selection.split("=", 1)
+            parts = [item.strip() for item in identifiers.split(",")]
+            if len(parts) != 2 or not all(parts):
+                raise ValueError("Use LINE=PRODUCT_ID,SKU_ID for every pending line.")
+            normalized_id = line_id.strip().upper()
+            if normalized_id in result:
+                raise ValueError(f"Duplicate confirmation for {normalized_id}.")
+            result[normalized_id] = (parts[0], parts[1])
+        if not result:
+            raise ValueError("No SKU confirmations were provided.")
+        return result
 
     @staticmethod
-    def _short_text(value: object, limit: int) -> str:
-        text = str(value)
-        return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
-
-    @staticmethod
-    def _distinct_row_titles(names: list[str]) -> list[str]:
-        titles = [WhatsAppWebhookService._short_text(name, 24) for name in names]
-        collisions = {title for title in titles if titles.count(title) > 1}
-        if not collisions:
-            return titles
-
-        for index, (name, title) in enumerate(zip(names, titles, strict=True)):
-            if title not in collisions:
-                continue
-            suffix = name[-24:] if len(name) > 24 else name
-            titles[index] = suffix.lstrip(" -")
-
-        # A numeric prefix guarantees uniqueness when the meaningful suffixes also match.
-        for title in set(titles):
-            duplicate_indexes = [
-                index for index, candidate in enumerate(titles) if candidate == title
-            ]
-            if len(duplicate_indexes) > 1:
-                for sequence, index in enumerate(duplicate_indexes, start=1):
-                    titles[index] = f"{sequence}. {title}"[:24]
-        return titles
-
-    @staticmethod
-    def _edition_row_titles(product: str, editions: list[str]) -> list[str]:
-        labels: list[str] = []
-        normalized_product = product.strip().casefold()
-        for edition in editions:
-            normalized_edition = edition.strip().casefold()
-            if normalized_edition == normalized_product:
-                labels.append("Standard")
-                continue
-
-            if normalized_edition.startswith(normalized_product):
-                suffix = edition.strip()[len(product.strip()) :].strip(" -():")
-                if suffix:
-                    suffix = suffix[0].upper() + suffix[1:]
-                    labels.append(WhatsAppWebhookService._short_text(suffix, 24))
-                    continue
-
-            labels.append(WhatsAppWebhookService._short_text(edition, 24))
-
-        if len(set(labels)) == len(labels):
-            return labels
-        return WhatsAppWebhookService._distinct_row_titles(editions)
-
-    @staticmethod
-    def _command_type(body: str) -> CommandType | None:
-        command = body.strip().split(maxsplit=1)[0].lower() if body.strip() else ""
-        return COMMAND_ALIASES.get(command)
-
-    @staticmethod
-    def _quote_parameters(
-        command: str, prefix: str, include_existing: bool
-    ) -> dict[str, str | int | None] | None:
-        normalized_command = command.strip()
-        if not normalized_command.lower().startswith(prefix):
-            return None
-
-        fields = [field.strip() for field in normalized_command[len(prefix) :].split("|")]
-        required_fields = 3 if include_existing else 2
-        if len(fields) < required_fields or not all(fields[:required_fields]):
-            return None
-
-        try:
-            parameters: dict[str, str | int | None] = {
-                "product_query": fields[0],
-                "target_quantity": int(fields[1]),
-            }
-            if include_existing:
-                parameters["existing_quantity"] = int(fields[2])
-        except ValueError:
-            return None
-
-        if parameters["target_quantity"] <= 0 or (
-            include_existing and parameters["existing_quantity"] < 0
-        ):
-            return None
-
-        optional_names = ("product_id", "sku_id", "term_duration", "billing_plan")
-        optional_fields = fields[3:] if include_existing else fields[2:]
-        parameters.update(
-            {
-                name: value or None
-                for name, value in zip(optional_names, optional_fields, strict=False)
-            }
+    def _parse_scenario(value: str) -> tuple[ScenarioType, int | None, int | None]:
+        parts = [item.strip() for item in value.split("|")]
+        scenario = SCENARIO_ALIASES.get(parts[0].casefold())
+        if scenario is None:
+            raise ValueError("Scenario must be renew, me3, me5, or me7.")
+        base = (
+            WhatsAppWebhookService._positive_or_zero(parts[1], "Base quantity")
+            if len(parts) > 1 and parts[1]
+            else None
         )
-        return parameters
+        copilot = (
+            WhatsAppWebhookService._positive_or_zero(parts[2], "Copilot quantity")
+            if len(parts) > 2 and parts[2]
+            else None
+        )
+        return scenario, base, copilot
 
     @staticmethod
-    def _response_text(agent_response: dict[str, Any]) -> str:
-        tenant_analysis = WhatsAppWebhookService._tenant_analysis_text(agent_response)
-        if tenant_analysis is not None:
-            return tenant_analysis
-
-        for key in ("response", "message", "answer"):
-            value = agent_response.get(key)
-            if isinstance(value, str) and value.strip():
-                return value[:4096]
-
-        string_values = [
-            value for value in agent_response.values() if isinstance(value, str) and value.strip()
-        ]
-        if len(string_values) == 1:
-            return string_values[0][:4096]
-
-        return json.dumps(agent_response, ensure_ascii=True, indent=2)[:4096]
-
-    @staticmethod
-    def _tenant_analysis_text(agent_response: dict[str, Any]) -> str | None:
-        licenses = agent_response.get("licenses")
-        if not isinstance(licenses, list):
-            return None
-
-        source_file = agent_response.get("source_file")
-        total_products = agent_response.get("total_products_detected")
-        commercial_products = agent_response.get("commercial_products_detected")
-        excluded_products = agent_response.get("excluded_products_detected")
-        active = agent_response.get("total_active_commercial_licenses")
-        assigned = agent_response.get("total_assigned_commercial_licenses")
-        if not all(isinstance(value, int) for value in (total_products, commercial_products, excluded_products, active, assigned)):
-            return None
-
-        utilisation = (assigned / active * 100) if active else 0
-        lines = [
-            "Tenant license analysis",
-            f"File: {source_file}" if isinstance(source_file, str) else "File analyzed",
-            f"Products: {total_products} detected, {commercial_products} commercial, {excluded_products} excluded",
-            f"Licenses: {assigned:,}/{active:,} assigned ({utilisation:.1f}% utilization)",
-        ]
-
-        over_assigned: list[str] = []
-        no_capacity: list[str] = []
-        for license_info in licenses:
-            if not isinstance(license_info, dict):
-                continue
-            title = license_info.get("product_title")
-            assigned_licenses = license_info.get("assigned_licenses")
-            active_licenses = license_info.get("active_licenses")
-            available_licenses = license_info.get("available_licenses")
-            if not isinstance(title, str) or not isinstance(assigned_licenses, int):
-                continue
-            if isinstance(active_licenses, int) and assigned_licenses > active_licenses:
-                over_assigned.append(title)
-            elif available_licenses == 0:
-                no_capacity.append(title)
-
-        if over_assigned:
-            lines.append("Over-assigned: " + ", ".join(over_assigned))
-        if no_capacity:
-            lines.append("No available licenses: " + ", ".join(no_capacity))
-
-        return "\n".join(lines)[:4096]
-
-    @staticmethod
-    def _final_quotes_text(
-        filename: str,
-        product_count: int,
-        final_quotes: list[dict[str, Any]],
-        failures: list[str],
-    ) -> str:
-        grouped_quotes: dict[str, list[dict[str, Any]]] = {}
-        for quote in final_quotes:
-            requested_product = quote.get("_requested_product")
-            if not isinstance(requested_product, str):
-                requested_product = str(quote.get("sku_title", "Product"))
-            grouped_quotes.setdefault(requested_product, []).append(quote)
-
-        lines = [
-            "*Final quote summary*",
-            f"File: {filename}",
-            f"{product_count} products | {len(final_quotes)} pricing options",
-        ]
-
-        term_labels = {"P1M": "1 month", "P1Y": "1 year", "P3Y": "3 years"}
-        for requested_product, quotes in grouped_quotes.items():
-            first_quote = quotes[0]
-            lines.extend(
-                [
-                    "",
-                    f"*{requested_product}*",
-                    f"{first_quote['target_quantity']} requested | "
-                    f"{first_quote['existing_quantity']} existing | "
-                    f"{len(quotes)} options",
-                ]
-            )
-            for index, quote in enumerate(quotes, start=1):
-                term = term_labels.get(
-                    str(quote["term_duration"]), str(quote["term_duration"])
-                )
-                billing = str(quote["billing_plan"])
-                billing_label = (
-                    "billing unavailable" if billing.lower() == "none" else billing.lower()
-                )
-                if WhatsAppWebhookService._promo_is_applied(quote):
-                    promo_amount = WhatsAppWebhookService._formatted_amount(
-                        quote.get("initial_quote_with_promo", quote["total_quote_amount"])
-                    )
-                    regular_amount = WhatsAppWebhookService._formatted_amount(
-                        quote.get(
-                            "initial_quote_without_promo", quote["total_quote_amount"]
-                        )
-                    )
-                    price_text = f"INR {promo_amount} (regular INR {regular_amount})"
-                else:
-                    price_text = (
-                        f"INR {WhatsAppWebhookService._formatted_amount(quote['total_quote_amount'])}"
-                    )
-                promo = WhatsAppWebhookService._promo_text(quote, compact=True)
-                promo_suffix = f" | {promo}" if promo else ""
-                lines.append(
-                    f"{index}. {quote['sku_title']} - {term}, {billing_label} - "
-                    f"{price_text}{promo_suffix}"
-                )
-
-        if failures:
-            lines.extend(("", f"*Could not generate {len(failures)} options*", *failures))
-        if not final_quotes and not failures:
-            lines.extend(("", "No quotes could be generated for the analyzed licenses."))
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def _formatted_amount(value: object) -> str:
-        try:
-            return f"{Decimal(str(value)):,.2f}"
-        except (InvalidOperation, ValueError):
-            return str(value)
-
-    @staticmethod
-    def _promo_text(quote: dict[str, Any], compact: bool = False) -> str | None:
-        percentage = WhatsAppWebhookService._promo_percentage(quote)
-        if percentage <= 0:
-            return None
-
-        percentage_text = format(percentage.normalize(), "f")
-        applied = WhatsAppWebhookService._promo_is_applied(quote)
-        if applied:
-            formatted_percentage = f"{percentage_text}% promo"
-        else:
-            existing_quantity = quote.get("existing_quantity")
-            formatted_percentage = (
-                f"{percentage_text}% promo unavailable ({existing_quantity} existing)"
-                if isinstance(existing_quantity, int) and existing_quantity > 0
-                else f"{percentage_text}% promo unavailable"
-            )
-        promo_code = quote.get("promo_code") or quote.get("promotion_code")
-        if isinstance(promo_code, str) and promo_code.strip():
-            return (
-                f"{formatted_percentage} - code {promo_code.strip()}"
-                if compact
-                else (
-                    f"Promotion: {percentage_text}% off"
-                    + (
-                        " (applied)"
-                        if applied
-                        else WhatsAppWebhookService._promo_unavailable_reason(quote)
-                    )
-                    + f"\nPromo code: *{promo_code.strip()}*"
-                )
-            )
-        return (
-            f"{formatted_percentage} - automatic"
-            if compact and applied
-            else (
-                formatted_percentage
-                if compact
-                else (
-                    f"Promotion: {percentage_text}% off (applied automatically)"
-                    if applied
-                    else (
-                        f"Promotion available: {percentage_text}% off\n"
-                        f"Promo status: Not applied"
-                        f"{WhatsAppWebhookService._promo_unavailable_reason(quote)}"
-                    )
-                )
-            )
+    def _line_quantity(value: str) -> tuple[str, int]:
+        parts = value.split()
+        if len(parts) != 2:
+            raise ValueError("Use /set LINE_ID QUANTITY.")
+        return parts[0].upper(), WhatsAppWebhookService._positive_or_zero(
+            parts[1], "Quantity"
         )
 
     @staticmethod
-    def _promo_unavailable_reason(quote: dict[str, Any]) -> str:
-        existing_quantity = quote.get("existing_quantity")
-        promo_quantity = quote.get("promo_quantity")
-        if (
-            isinstance(existing_quantity, int)
-            and existing_quantity > 0
-            and promo_quantity == 0
-        ):
-            return (
-                f" - API returned 0 promo-eligible licenses "
-                f"({existing_quantity} existing licenses)"
-            )
-        return " - API returned 0 promo-eligible licenses"
+    def _product_quantity(value: str) -> tuple[str, int]:
+        parts = [item.strip() for item in value.split("|")]
+        if len(parts) != 2 or not parts[0]:
+            raise ValueError("Use /add PRODUCT TITLE | QUANTITY.")
+        quantity = WhatsAppWebhookService._positive_or_zero(parts[1], "Quantity")
+        if quantity == 0:
+            raise ValueError("Added SKU quantity must be greater than zero.")
+        return parts[0], quantity
 
     @staticmethod
-    def _promo_percentage(quote: dict[str, Any]) -> Decimal:
-        regular_price = quote.get("initial_quote_without_promo")
-        promo_price = quote.get("initial_quote_with_promo")
-        try:
-            regular = Decimal(str(regular_price))
-            promo = Decimal(str(promo_price))
-            if regular > 0 and 0 <= promo < regular:
-                return ((regular - promo) / regular * 100).quantize(Decimal("0.01"))
-        except (InvalidOperation, ValueError):
-            pass
-
-        try:
-            percentage = Decimal(str(quote.get("promo_percentage", 0)))
-        except (InvalidOperation, ValueError):
-            return Decimal(0)
-        return percentage * 100 if 0 < percentage < 1 else percentage
+    def _replacement(value: str) -> tuple[str, str, int]:
+        parts = [item.strip() for item in value.split("|")]
+        if len(parts) != 3 or not parts[0] or not parts[1]:
+            raise ValueError("Use /replace LINE_ID | PRODUCT TITLE | QUANTITY.")
+        quantity = WhatsAppWebhookService._positive_or_zero(parts[2], "Quantity")
+        if quantity == 0:
+            raise ValueError("Replacement quantity must be greater than zero.")
+        return parts[0].upper(), parts[1], quantity
 
     @staticmethod
-    def _has_promo_offer(quote: dict[str, Any]) -> bool:
-        return WhatsAppWebhookService._promo_percentage(quote) > 0
+    def _positive_or_zero(value: str, name: str) -> int:
+        try:
+            result = int(value)
+        except ValueError as error:
+            raise ValueError(f"{name} must be a whole number.") from error
+        if result < 0:
+            raise ValueError(f"{name} cannot be negative.")
+        return result
 
     @staticmethod
-    def _promo_is_applied(quote: dict[str, Any]) -> bool:
-        promo_quantity = quote.get("promo_quantity")
-        if isinstance(promo_quantity, int):
-            return promo_quantity > 0
+    def _optional_quantity(value: int) -> int | None:
+        if value == -1:
+            return None
+        if value < 0:
+            raise ValueError("Quantity cannot be negative.")
+        return value
+
+    @staticmethod
+    def _required_quantity(value: int, *, allow_zero: bool = True) -> int:
+        if value < 0 or (not allow_zero and value == 0):
+            qualifier = "zero or greater" if allow_zero else "greater than zero"
+            raise ValueError(f"Provide a whole-number quantity {qualifier}.")
+        return value
+
+    @staticmethod
+    def _required_text(value: str, name: str) -> str:
+        result = value.strip()
+        if not result or result.casefold() == "none":
+            raise ValueError(f"Provide the {name}.")
+        return result
+
+    @staticmethod
+    def _decimal_value(value: str, name: str) -> Decimal:
         try:
-            return Decimal(str(quote.get("promo_amount", 0))) > 0
-        except (InvalidOperation, ValueError):
-            return False
+            result = Decimal(value.strip().replace(",", ""))
+        except (InvalidOperation, ValueError) as error:
+            raise ValueError(f"{name} must be a number.") from error
+        if not result.is_finite():
+            raise ValueError(f"{name} must be a finite number.")
+        return result
 
     @staticmethod
     def _text_chunks(body: str, limit: int = 4096) -> list[str]:
@@ -1110,22 +695,3 @@ class WhatsAppWebhookService:
         if remaining:
             chunks.append(remaining)
         return chunks
-
-    @staticmethod
-    def _quote_selection_text(error: PricingAgentAPIError) -> str | None:
-        if error.quote_selection is None:
-            return None
-
-        detail = error.quote_selection.detail
-        lines = [
-            detail.message,
-            "",
-            "Re-upload with the same query and quantity, followed by one option:",
-        ]
-        for option in detail.available_options:
-            lines.append(
-                f"{option.product_id} | {option.sku_id} | {option.term_duration} | "
-                f"{option.billing_plan}"
-                f" - {option.sku_title}"
-            )
-        return "\n".join(lines)[:4096]

@@ -5,7 +5,12 @@ from typing import Any
 from httpx import AsyncClient, HTTPStatusError, RequestError
 
 from app.config import get_logger
-from app.schema.whatsapp import WhatsAppInteractiveMessage, WhatsAppTextMessage
+from app.schema.whatsapp import (
+    DocumentContent,
+    WhatsAppDocumentMessage,
+    WhatsAppInteractiveMessage,
+    WhatsAppTextMessage,
+)
 
 logger = get_logger(__name__)
 
@@ -53,6 +58,7 @@ class WhatsAppClient:
             f"{base_url.rstrip('/')}/{api_version.strip('/')}/"
         )
         self._messages_url = f"{self._api_url}{phone_number_id}/messages"
+        self._media_upload_url = f"{self._api_url}{phone_number_id}/media"
 
     @property
     def credentials_valid(self) -> bool:
@@ -84,7 +90,10 @@ class WhatsAppClient:
         logger.info("WhatsApp credential validation completed")
 
     async def send_message(
-        self, message: WhatsAppTextMessage | WhatsAppInteractiveMessage
+        self,
+        message: WhatsAppTextMessage
+        | WhatsAppInteractiveMessage
+        | WhatsAppDocumentMessage,
     ) -> dict[str, Any]:
         started_at = perf_counter()
         logger.info("WhatsApp API send request started type=%s", message.type)
@@ -141,6 +150,62 @@ class WhatsAppClient:
             )
 
         return payload
+
+    async def send_document(
+        self,
+        *,
+        to: str,
+        content: bytes,
+        filename: str,
+        content_type: str = "application/pdf",
+        caption: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            response = await self._http_client.post(
+                self._media_upload_url,
+                data={"messaging_product": "whatsapp", "type": content_type},
+                files={"file": (filename, content, content_type)},
+                headers=self._headers,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            media_id = payload.get("id") if isinstance(payload, dict) else None
+            if not isinstance(media_id, str):
+                raise WhatsAppAPIError(
+                    "WhatsApp Cloud API did not return an uploaded media ID.",
+                    status_code=response.status_code,
+                    response_body=response.text,
+                )
+        except HTTPStatusError as error:
+            if self._is_auth_error(error.response):
+                self._credentials_valid = False
+            raise WhatsAppAPIError(
+                "WhatsApp Cloud API rejected the media upload.",
+                status_code=error.response.status_code,
+                response_body=error.response.text,
+            ) from error
+        except RequestError as error:
+            raise WhatsAppAPIError(
+                "Unable to upload media to the WhatsApp Cloud API.",
+                network_error=True,
+            ) from error
+        except ValueError as error:
+            raise WhatsAppAPIError(
+                "WhatsApp Cloud API returned invalid media metadata.",
+                status_code=response.status_code,
+                response_body=response.text,
+            ) from error
+
+        return await self.send_message(
+            WhatsAppDocumentMessage(
+                to=to,
+                document=DocumentContent(
+                    id=media_id,
+                    filename=filename,
+                    caption=caption,
+                ),
+            )
+        )
 
     async def download_media(
         self,

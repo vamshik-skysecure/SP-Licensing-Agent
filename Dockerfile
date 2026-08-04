@@ -16,6 +16,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
 COPY app ./app
+COPY docs/blob_storage.xlsx ./docs/blob_storage.xlsx
 COPY main.py ./main.py
 
 FROM python:3.12-slim-bookworm AS runtime
@@ -30,6 +31,7 @@ RUN useradd --create-home --uid 10001 appuser
 
 COPY --from=builder --chown=appuser:appuser /app/.venv ./.venv
 COPY --from=builder --chown=appuser:appuser /app/app ./app
+COPY --from=builder --chown=appuser:appuser /app/docs ./docs
 COPY --from=builder --chown=appuser:appuser /app/main.py ./main.py
 
 USER appuser
