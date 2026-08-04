@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Callable
+from typing import Callable, Literal
+from uuid import uuid4
 
 from .analysis import LicenseAnalyzer
 from .models import (
@@ -11,12 +12,14 @@ from .models import (
     CommercialScenario,
     LicenseEstate,
     MigrationDisposition,
+    PendingSkuChange,
     ScenarioType,
+    SkuChangeResult,
     WorkflowSession,
     WorkflowStage,
 )
-from .rate_card import RateCardProvider
-from .scenarios import ScenarioEngine, ScenarioError
+from .rate_card import RateCardCatalog, RateCardProvider
+from .scenarios import ScenarioEngine, ScenarioError, SkuSelector
 from .store import WorkflowConflictError, WorkflowStore
 
 
@@ -87,6 +90,7 @@ class LicensingOrchestrator:
                     "estate": estate,
                     "scenarios": {},
                     "active_scenario": None,
+                    "pending_sku_change": None,
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
                         if estate.pending_lines
@@ -156,6 +160,7 @@ class LicensingOrchestrator:
                 update={
                     "scenarios": scenarios,
                     "active_scenario": scenario_type,
+                    "pending_sku_change": None,
                     "stage": WorkflowStage.REVIEWING_SCENARIO,
                     "updated_at": datetime.now(UTC),
                 }
@@ -238,16 +243,12 @@ class LicensingOrchestrator:
         sender: str,
         product_query: str,
         quantity: int,
-    ) -> CommercialScenario:
-        catalog = await self._rate_cards.get()
-        return await self._edit_active(
-            sender,
-            lambda scenario: self._scenarios.add_sku(
-                scenario,
-                product_query=product_query,
-                quantity=quantity,
-                catalog=catalog,
-            ),
+    ) -> SkuChangeResult:
+        return await self._request_sku_change(
+            sender=sender,
+            action="add",
+            product_query=product_query,
+            quantity=quantity,
         )
 
     async def replace_sku(
@@ -256,17 +257,193 @@ class LicensingOrchestrator:
         line_id: str,
         product_query: str,
         quantity: int,
-    ) -> CommercialScenario:
+    ) -> SkuChangeResult:
+        return await self._request_sku_change(
+            sender=sender,
+            action="replace",
+            product_query=product_query,
+            quantity=quantity,
+            source_line_id=line_id.upper(),
+        )
+
+    async def confirm_sku_change(
+        self,
+        sender: str,
+        candidate_number: int,
+        *,
+        confirmation_id: str | None = None,
+    ) -> SkuChangeResult:
         catalog = await self._rate_cards.get()
-        return await self._edit_active(
-            sender,
-            lambda scenario: self._scenarios.replace_sku(
-                scenario,
-                line_id=line_id.upper(),
-                product_query=product_query,
+        result: SkuChangeResult | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            pending = session.pending_sku_change
+            if pending is None:
+                raise ScenarioError("There is no pending SKU change to confirm.")
+            if confirmation_id is not None and pending.id != confirmation_id:
+                raise ScenarioError(
+                    "That SKU confirmation is stale; submit the add/replace request again."
+                )
+            if candidate_number < 1 or candidate_number > len(pending.candidates):
+                raise ScenarioError(
+                    f"Choose a candidate from 1 to {len(pending.candidates)}."
+                )
+            if session.active_scenario != pending.scenario_type:
+                raise ScenarioError("The active scenario changed; submit the add/replace request again.")
+            current = session.scenarios.get(pending.scenario_type)
+            if current is None or current.revision != pending.scenario_revision:
+                raise ScenarioError("The proposal changed; submit the add/replace request again.")
+            candidate = pending.candidates[candidate_number - 1]
+            selector = SkuSelector(
+                sku_title=candidate.sku_title,
+                product_id=candidate.product_id,
+                sku_id=candidate.sku_id,
+            )
+            changed = self._apply_sku_change(current, pending, selector, catalog)
+            scenarios = dict(session.scenarios)
+            scenarios[pending.scenario_type] = changed
+            result = SkuChangeResult(state="applied", scenario=changed)
+            return session.model_copy(
+                update={
+                    "scenarios": scenarios,
+                    "pending_sku_change": None,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
+
+    async def cancel_sku_change(self, sender: str) -> bool:
+        cancelled = False
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal cancelled
+            cancelled = session.pending_sku_change is not None
+            return session.model_copy(
+                update={
+                    "pending_sku_change": None,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        return cancelled
+
+    async def _request_sku_change(
+        self,
+        *,
+        sender: str,
+        action: Literal["add", "replace"],
+        product_query: str,
+        quantity: int,
+        source_line_id: str | None = None,
+    ) -> SkuChangeResult:
+        cleaned_query = product_query.strip()
+        if not cleaned_query:
+            raise ScenarioError("Product query cannot be empty.")
+        if quantity <= 0:
+            raise ScenarioError("SKU quantity must be greater than zero.")
+        catalog = await self._rate_cards.get()
+        candidates = catalog.candidates(cleaned_query, limit=3)
+        if not candidates:
+            raise ScenarioError(f"No rate-card SKU matched {cleaned_query!r}.")
+        result: SkuChangeResult | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            if session.active_scenario is None:
+                raise ScenarioError("Select a scenario before editing it.")
+            current = session.scenarios.get(session.active_scenario)
+            if current is None:
+                raise ScenarioError("The active scenario could not be found.")
+            if action == "replace" and not any(
+                line.line_id == source_line_id for line in current.lines
+            ):
+                raise ScenarioError(
+                    f"Scenario line {source_line_id!r} was not found."
+                )
+            exact = len(candidates) == 1 and candidates[0].confidence == 100
+            if exact:
+                candidate = candidates[0]
+                pending = PendingSkuChange(
+                    id=uuid4().hex,
+                    action=action,
+                    scenario_type=session.active_scenario,
+                    scenario_revision=current.revision,
+                    source_line_id=source_line_id,
+                    product_query=cleaned_query,
+                    quantity=quantity,
+                    candidates=candidates,
+                )
+                selector = SkuSelector(
+                    sku_title=candidate.sku_title,
+                    product_id=candidate.product_id,
+                    sku_id=candidate.sku_id,
+                )
+                changed = self._apply_sku_change(current, pending, selector, catalog)
+                scenarios = dict(session.scenarios)
+                scenarios[session.active_scenario] = changed
+                result = SkuChangeResult(state="applied", scenario=changed)
+                return session.model_copy(
+                    update={
+                        "scenarios": scenarios,
+                        "pending_sku_change": None,
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+
+            pending = PendingSkuChange(
+                id=uuid4().hex,
+                action=action,
+                scenario_type=session.active_scenario,
+                scenario_revision=current.revision,
+                source_line_id=source_line_id,
+                product_query=cleaned_query,
                 quantity=quantity,
+                candidates=candidates,
+            )
+            result = SkuChangeResult(
+                state="confirmation_required",
+                confirmation=pending,
+            )
+            return session.model_copy(
+                update={
+                    "pending_sku_change": pending,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
+
+    def _apply_sku_change(
+        self,
+        scenario: CommercialScenario,
+        pending: PendingSkuChange,
+        selector: SkuSelector,
+        catalog: RateCardCatalog,
+    ) -> CommercialScenario:
+        if pending.action == "add":
+            return self._scenarios.add_sku(
+                scenario,
+                product_query=pending.product_query,
+                quantity=pending.quantity,
                 catalog=catalog,
-            ),
+                selector=selector,
+            )
+        if pending.source_line_id is None:
+            raise ScenarioError("A replacement requires a source line ID.")
+        return self._scenarios.replace_sku(
+            scenario,
+            line_id=pending.source_line_id,
+            product_query=selector.sku_title,
+            quantity=pending.quantity,
+            catalog=catalog,
+            selector=selector,
         )
 
     async def add_comment(self, sender: str, comment: str) -> CommercialScenario:
@@ -313,6 +490,7 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "scenarios": scenarios,
+                    "pending_sku_change": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -341,6 +519,7 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "scenarios": scenarios,
+                    "pending_sku_change": None,
                     "updated_at": datetime.now(UTC),
                 }
             )

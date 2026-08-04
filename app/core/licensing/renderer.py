@@ -379,6 +379,14 @@ def render_comparison_pdf(
         alignment=TA_CENTER,
         textColor=colors.HexColor("#17365D"),
     )
+    detail_cell_style = ParagraphStyle(
+        "DetailCell",
+        parent=styles["BodyText"],
+        fontSize=6,
+        leading=7,
+        spaceAfter=0,
+        spaceBefore=0,
+    )
     story = [
         Paragraph("SP/SSP Licensing Commercial Recommendation", title_style),
         Spacer(1, 5 * mm),
@@ -438,9 +446,13 @@ def render_comparison_pdf(
             "Action",
             "Existing",
             "Proposed",
+            "Licence term",
+            "Billing plan",
+            "Renewal / expiration",
             "Unit price",
             "Extended",
             "Price status",
+            "Replacement / target note",
         ]]
         for line in scenario.lines:
             if line.disposition.value in {"migrate", "included", "remove"}:
@@ -453,29 +465,66 @@ def render_comparison_pdf(
                 price_status = "Priced"
             detail.append(
                 [
-                    line.sku_title,
+                    Paragraph(escape(line.sku_title), detail_cell_style),
                     line.disposition.value,
                     str(line.existing_quantity),
                     str(line.proposed_quantity),
+                    line.term_duration,
+                    line.billing_plan,
+                    _date(line.renewal_date or line.expiration_date),
                     format_money(line.unit_price, currency),
                     format_money(line.extended_price, currency),
-                    price_status,
+                    Paragraph(escape(price_status), detail_cell_style),
+                    Paragraph(escape(line.note or "-"), detail_cell_style),
                 ]
             )
+        discount_amount = (
+            scenario.subtotal * scenario.discount_percentage / Decimal("100")
+        )
+        financial_summary = [
+            ["Commercial field", "Value"],
+            ["Subtotal", format_money(scenario.subtotal, currency)],
+            ["Discount percentage", f"{scenario.discount_percentage:,.2f}%"],
+            ["Discount amount", format_money(discount_amount, currency)],
+            ["Adjustment amount", format_money(scenario.adjustment_amount, currency)],
+            ["Final total", format_money(scenario.total_value, currency)],
+        ]
         story.extend(
             [
                 Spacer(1, 4 * mm),
                 _table(
                     detail,
-                    [65 * mm, 27 * mm, 20 * mm, 20 * mm, 31 * mm, 31 * mm, 41 * mm],
+                    [
+                        37 * mm,
+                        17 * mm,
+                        13 * mm,
+                        14 * mm,
+                        18 * mm,
+                        20 * mm,
+                        25 * mm,
+                        23 * mm,
+                        25 * mm,
+                        27 * mm,
+                        54 * mm,
+                    ],
+                    font_size=6,
+                    cell_padding=2,
                 ),
                 Spacer(1, 4 * mm),
-                Paragraph(
-                    f"Final total: <b>{format_money(scenario.total_value, currency)}</b>",
-                    styles["Heading3"],
+                Paragraph("Scenario commercial summary", styles["Heading3"]),
+                _table(
+                    financial_summary,
+                    [55 * mm, 55 * mm],
                 ),
+                Spacer(1, 3 * mm),
+                Paragraph("Unresolved decisions", styles["Heading3"]),
             ]
         )
+        if scenario.unresolved_decisions:
+            for decision in scenario.unresolved_decisions:
+                story.append(Paragraph(f"• {escape(decision)}", styles["Normal"]))
+        else:
+            story.append(Paragraph("None", styles["Normal"]))
         if scenario.comments or scenario.assumptions:
             story.append(Paragraph("Comments and assumptions", styles["Heading3"]))
             for comment in [*scenario.comments, *scenario.assumptions]:
@@ -485,7 +534,13 @@ def render_comparison_pdf(
     return output.getvalue()
 
 
-def _table(data: list[list[object]], widths: list[float]):
+def _table(
+    data: list[list[object]],
+    widths: list[float],
+    *,
+    font_size: int = 8,
+    cell_padding: int = 4,
+):
     from reportlab.lib import colors
     from reportlab.platypus import Table, TableStyle
 
@@ -499,9 +554,9 @@ def _table(data: list[list[object]], widths: list[float]):
                 ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B7C9E2")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F3F6FA")]),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
-                ("LEFTPADDING", (0, 0), (-1, -1), 4),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("FONTSIZE", (0, 0), (-1, -1), font_size),
+                ("LEFTPADDING", (0, 0), (-1, -1), cell_padding),
+                ("RIGHTPADDING", (0, 0), (-1, -1), cell_padding),
             ]
         )
     )

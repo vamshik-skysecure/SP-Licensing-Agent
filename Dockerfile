@@ -16,6 +16,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
 COPY app ./app
+COPY config ./config
 COPY docs/blob_storage.xlsx ./docs/blob_storage.xlsx
 COPY main.py ./main.py
 

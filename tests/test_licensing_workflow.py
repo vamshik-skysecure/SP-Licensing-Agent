@@ -12,6 +12,10 @@ from app.core.licensing.analysis import (
     parse_customer_file,
 )
 from app.core.licensing.agent import AgentIntent, OpenAIIntentInterpreter
+from app.core.licensing.migration_rules import (
+    MigrationSeedCatalog,
+    MigrationSeedDocument,
+)
 from app.core.licensing.models import (
     EstateStatus,
     LicenseEstate,
@@ -26,6 +30,7 @@ from app.core.licensing.rate_card import (
     RateCardCatalog,
     RateCardPayload,
     RateCardProvider,
+    normalize_product_title,
     parse_rate_card,
 )
 from app.core.licensing.renderer import (
@@ -85,6 +90,26 @@ async def workflow_components():
 
 
 class ParsingTests(unittest.TestCase):
+    def test_real_migration_seed_is_unverified_unapproved_and_matches_workbook(self) -> None:
+        root = Path(__file__).parents[1]
+        seeds = MigrationSeedCatalog.load(root / "config" / "migration_seed.json")
+        items = parse_rate_card(
+            (root / "docs" / "blob_storage.xlsx").read_bytes(),
+            "blob_storage.xlsx",
+            "Outcome Sheet",
+        )
+        titles = [normalize_product_title(item.sku_title) for item in items]
+
+        self.assertEqual(len(seeds.rules), 30)
+        for rule in seeds.rules:
+            self.assertEqual(rule.source, "heuristic_unverified")
+            self.assertFalse(rule.approved)
+            pattern = normalize_product_title(rule.title_pattern)
+            self.assertTrue(
+                any(pattern in title for title in titles),
+                msg=f"Seed pattern did not match the Outcome Sheet: {rule.title_pattern}",
+            )
+
     def test_customer_parser_uses_renewal_not_assigned_quantity(self) -> None:
         rows = parse_customer_file(CUSTOMER, "customer.csv")
 
@@ -292,6 +317,81 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         finalized = self.engine.finalize(resolved)
         self.assertEqual(finalized.status, ScenarioStatus.FINAL)
 
+    async def test_unapproved_migration_seed_is_suggestion_only(self) -> None:
+        root = Path(__file__).parents[1]
+        workbook = root / "docs" / "blob_storage.xlsx"
+        catalog = RateCardCatalog(
+            parse_rate_card(workbook.read_bytes(), workbook.name, "Outcome Sheet"),
+            "seed-test",
+        )
+        candidate = catalog.candidates("Advanced Data Residency")[0]
+        estate = LicenseEstate(
+            id="seed-estate",
+            thread_id="seed-thread",
+            source_file="seed.csv",
+            status=EstateStatus.READY,
+            rate_card_version="seed-test",
+            lines=[
+                NormalizedLicenseLine(
+                    line_id="L1",
+                    row_number=2,
+                    source_product_title=candidate.sku_title,
+                    product_id=candidate.product_id,
+                    sku_id=candidate.sku_id,
+                    sku_title=candidate.sku_title,
+                    total_licenses=5,
+                    expired_licenses=0,
+                    assigned_licenses=5,
+                    renewal_quantity=5,
+                    match_confidence=100,
+                    match_method="exact",
+                )
+            ],
+        )
+        seeds = MigrationSeedCatalog.load(root / "config" / "migration_seed.json")
+
+        unapproved = ScenarioEngine(seeds).build(
+            estate=estate,
+            scenario_type=ScenarioType.ME3_COPILOT,
+            catalog=catalog,
+            term_duration="P1Y",
+            billing_plan="Annual",
+            segment="Commercial",
+            base_quantity=5,
+            copilot_quantity=0,
+        )
+        source = next(line for line in unapproved.lines if line.line_id == "L1")
+
+        self.assertEqual(source.disposition, MigrationDisposition.NEEDS_DECISION)
+        self.assertTrue(source.decision_required)
+        self.assertIn("Suggested default only: retain", source.note or "")
+        self.assertIn("approved=false", source.note or "")
+        self.assertIn("No migration action was auto-applied", source.note or "")
+
+        seed_rule = next(
+            rule for rule in seeds.rules if rule.id == "advanced-data-residency"
+        )
+        approved_document = MigrationSeedDocument(
+            version=1,
+            description="Test-only approved copy",
+            rules=[seed_rule.model_copy(update={"approved": True})],
+        )
+        approved = ScenarioEngine(MigrationSeedCatalog(approved_document)).build(
+            estate=estate,
+            scenario_type=ScenarioType.ME3_COPILOT,
+            catalog=catalog,
+            term_duration="P1Y",
+            billing_plan="Annual",
+            segment="Commercial",
+            base_quantity=5,
+            copilot_quantity=0,
+        )
+        approved_source = next(line for line in approved.lines if line.line_id == "L1")
+
+        self.assertEqual(approved_source.disposition, MigrationDisposition.RETAIN)
+        self.assertFalse(approved_source.decision_required)
+        self.assertIn("Approved migration seed", approved_source.note or "")
+
     async def test_me7_does_not_claim_copilot_is_bundled(self) -> None:
         estate = await self.analyzer.analyze(
             thread_id="thread-1", filename="customer.csv", content=CUSTOMER
@@ -377,9 +477,13 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             copilot_quantity=3,
         )
 
-        replaced = await self.orchestrator.replace_sku(
+        result = await self.orchestrator.replace_sku(
             "911234567890", "L2", "Product A", 4
         )
+        self.assertEqual(result.state, "applied")
+        self.assertIsNotNone(result.scenario)
+        replaced = result.scenario
+        assert replaced is not None
 
         source = next(line for line in replaced.lines if line.line_id == "L2")
         added = replaced.lines[-1]
@@ -389,21 +493,122 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(added.extended_price, Decimal("400.00"))
         self.assertEqual(replaced.total_value, Decimal("1260.00"))
 
+    async def test_fuzzy_add_requires_confirmation_before_mutation(self) -> None:
+        sender = "911234567890"
+        await self.orchestrator.analyze_document(
+            sender=sender, filename="customer.csv", content=CUSTOMER
+        )
+        original = await self.orchestrator.build_scenario(
+            sender, ScenarioType.RENEW_AS_IS
+        )
+
+        result = await self.orchestrator.add_sku(sender, "Prod A", 4)
+        after_request = await self.orchestrator.get_session(sender)
+
+        self.assertEqual(result.state, "confirmation_required")
+        self.assertIsNone(result.scenario)
+        self.assertIsNotNone(result.confirmation)
+        assert result.confirmation is not None
+        self.assertEqual(result.confirmation.candidates[0].sku_title, "Product A")
+        self.assertLess(result.confirmation.candidates[0].confidence, 100)
+        assert after_request is not None
+        unchanged = after_request.scenarios[ScenarioType.RENEW_AS_IS]
+        self.assertEqual(unchanged.revision, original.revision)
+        self.assertEqual(unchanged.total_value, original.total_value)
+        self.assertEqual(len(unchanged.lines), len(original.lines))
+
+        confirmed = await self.orchestrator.confirm_sku_change(sender, 1)
+
+        self.assertEqual(confirmed.state, "applied")
+        self.assertIsNotNone(confirmed.scenario)
+        assert confirmed.scenario is not None
+        self.assertEqual(confirmed.scenario.lines[-1].sku_id, "sku-a")
+        self.assertEqual(confirmed.scenario.lines[-1].proposed_quantity, 4)
+        self.assertIsNone((await self.orchestrator.get_session(sender)).pending_sku_change)  # type: ignore[union-attr]
+
+    async def test_fuzzy_replace_does_not_remove_source_before_confirmation(self) -> None:
+        sender = "911234567890"
+        await self.orchestrator.analyze_document(
+            sender=sender, filename="customer.csv", content=CUSTOMER
+        )
+        original = await self.orchestrator.build_scenario(
+            sender, ScenarioType.RENEW_AS_IS
+        )
+
+        result = await self.orchestrator.replace_sku(
+            sender, "L2", "Prod A", 4
+        )
+        session = await self.orchestrator.get_session(sender)
+
+        self.assertEqual(result.state, "confirmation_required")
+        assert session is not None
+        unchanged = session.scenarios[ScenarioType.RENEW_AS_IS]
+        source = next(line for line in unchanged.lines if line.line_id == "L2")
+        self.assertEqual(source.disposition, MigrationDisposition.RETAIN)
+        self.assertEqual(unchanged.total_value, original.total_value)
+
+        confirmed = await self.orchestrator.confirm_sku_change(sender, 1)
+        assert confirmed.scenario is not None
+        source = next(
+            line for line in confirmed.scenario.lines if line.line_id == "L2"
+        )
+        self.assertEqual(source.disposition, MigrationDisposition.REMOVE)
+        self.assertEqual(confirmed.scenario.lines[-1].sku_id, "sku-a")
+
     async def test_comparison_pdf_is_generated_in_memory(self) -> None:
+        from reportlab.platypus import Paragraph as RealParagraph
+        from reportlab.platypus import Table as RealTable
+
         await self.orchestrator.analyze_document(
             sender="911234567890", filename="customer.csv", content=CUSTOMER
         )
         await self.orchestrator.build_scenario(
             "911234567890", ScenarioType.RENEW_AS_IS
         )
+        await self.orchestrator.set_discount("911234567890", Decimal("10"))
+        await self.orchestrator.set_adjustment("911234567890", Decimal("5"))
         estate, scenarios, comparison = await self.orchestrator.comparison(
             "911234567890"
         )
+        rendered_text: list[str] = []
+        rendered_tables: list[list[list[object]]] = []
 
-        pdf = render_comparison_pdf(estate, scenarios, comparison)
+        def capture_paragraph(text: str, *args: object, **kwargs: object):
+            rendered_text.append(text)
+            return RealParagraph(text, *args, **kwargs)
+
+        def capture_table(data: list[list[object]], *args: object, **kwargs: object):
+            rendered_tables.append(data)
+            return RealTable(data, *args, **kwargs)
+
+        with (
+            patch("reportlab.platypus.Paragraph", side_effect=capture_paragraph),
+            patch("reportlab.platypus.Table", side_effect=capture_table),
+        ):
+            pdf = render_comparison_pdf(estate, scenarios, comparison)
 
         self.assertTrue(pdf.startswith(b"%PDF"))
         self.assertGreater(len(pdf), 1000)
+        table_text = "\n".join(
+            str(getattr(cell, "text", cell))
+            for table in rendered_tables
+            for row in table
+            for cell in row
+        )
+        for required in (
+            "Licence term",
+            "Billing plan",
+            "Renewal / expiration",
+            "Replacement / target note",
+            "Subtotal",
+            "Discount percentage",
+            "10.00%",
+            "Discount amount",
+            "Adjustment amount",
+            "2027-08-01",
+        ):
+            self.assertIn(required, table_text)
+        self.assertIn("Unresolved decisions", rendered_text)
 
     async def test_comparison_auto_builds_all_four_scenarios(self) -> None:
         await self.orchestrator.analyze_document(
@@ -649,6 +854,52 @@ class FakeIntentInterpreter:
 
 
 class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fuzzy_add_prompts_whatsapp_confirmation_before_change(self) -> None:
+        provider, _, store, _, orchestrator = await workflow_components()
+        client = FakeWhatsAppClient()
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            orchestrator,
+            ServiceConfiguration(frozenset(), 1024 * 1024),
+        )
+        sender = "911234567890"
+        await orchestrator.analyze_document(
+            sender=sender, filename="customer.csv", content=CUSTOMER
+        )
+        original = await orchestrator.build_scenario(
+            sender, ScenarioType.RENEW_AS_IS
+        )
+
+        await service._handle_text(sender, "/add Prod A | 2")
+
+        prompt_bodies = [
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+        ]
+        self.assertTrue(any("*Confirmation required*" in body for body in prompt_bodies))
+        self.assertTrue(any("No change was made" in body for body in prompt_bodies))
+        confirmation_menu = client.messages[-1]
+        self.assertEqual(confirmation_menu.interactive.type, "list")  # type: ignore[attr-defined]
+        session = await orchestrator.get_session(sender)
+        assert session is not None
+        self.assertEqual(
+            session.scenarios[ScenarioType.RENEW_AS_IS].revision,
+            original.revision,
+        )
+
+        await service._handle_text(sender, "/confirm-sku 1")
+
+        session = await orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNone(session.pending_sku_change)
+        self.assertEqual(
+            session.scenarios[ScenarioType.RENEW_AS_IS].lines[-1].sku_id,
+            "sku-a",
+        )
+        await store.close()
+        await provider.close()
+
     async def test_upload_displays_estate_and_scenario_menu(self) -> None:
         provider, _, store, _, orchestrator = await workflow_components()
         client = FakeWhatsAppClient()

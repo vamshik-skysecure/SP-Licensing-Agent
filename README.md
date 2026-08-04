@@ -27,6 +27,9 @@ so local/UAT testing does not require a real WhatsApp number.
   scenario, revision number, line-level actions, assumptions, unresolved decisions, and total.
 - A request such as `Remove L3` or `Change Copilot to 55` applies one validated edit and returns
   the fully recalculated proposal immediately.
+- A fuzzy `/add` or `/replace` match creates a persisted confirmation request and makes no
+  commercial change. The seller must choose an exact ProductId/SkuId with `/confirm-sku N`
+  or the WhatsApp list before the proposal is mutated.
 - An ambiguous request asks one concise clarification question and makes no commercial change.
 - `/compare` auto-builds any missing scenario, returns all four side-by-side totals,
   selects a recommended option with a one-line rationale, and sends a customer-ready PDF.
@@ -37,6 +40,9 @@ so local/UAT testing does not require a real WhatsApp number.
   zero is displayed separately as a no-charge product.
 - An unknown migration is never invented: the licence remains priced and is marked
   `needs_decision` until an authorized seller resolves it.
+- `config/migration_seed.json` contains human-editable, title-pattern suggestions derived
+  from real Outcome Sheet families. Every seed is `heuristic_unverified` and defaults to
+  `approved: false`; unapproved rows are displayed as suggestions but never auto-applied.
 - E3, E5, E7, and standalone Copilot identities are resolved by exact product title from
   the current Outcome Sheet; no product ID, SKU ID, or price is maintained elsewhere.
 - The workbook has no entitlement or migration-map columns. Therefore, non-core add-ons

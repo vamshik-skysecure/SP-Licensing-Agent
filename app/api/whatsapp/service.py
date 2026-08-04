@@ -10,7 +10,7 @@ from app.core.licensing.agent import (
     IntentInterpretationError,
     IntentInterpreter,
 )
-from app.core.licensing.models import MigrationDisposition, ScenarioType
+from app.core.licensing.models import MigrationDisposition, ScenarioType, SkuChangeResult
 from app.core.licensing.orchestrator import LicensingOrchestrator
 from app.core.licensing.renderer import (
     format_comparison,
@@ -57,6 +57,8 @@ Commands:
 /retain LINE, /remove LINE, /migrate LINE, /included LINE
 /add PRODUCT TITLE | QTY
 /replace LINE | PRODUCT TITLE | QTY
+/confirm-sku NUMBER
+/cancel-sku
 /copilot QTY
 /promo on|off
 /discount PERCENT
@@ -214,6 +216,22 @@ class WhatsAppWebhookService:
             await self._send_text_chunks(sender, format_estate(estate))
             await self._send_scenario_menu(sender)
             return
+        if lowered.startswith("/confirm-sku "):
+            value = command[13:].strip()
+            if not value.isdigit():
+                raise ValueError("Use /confirm-sku NUMBER.")
+            result = await self._orchestrator.confirm_sku_change(sender, int(value))
+            await self._send_sku_change_result(sender, result)
+            return
+        if lowered == "/cancel-sku":
+            cancelled = await self._orchestrator.cancel_sku_change(sender)
+            await self._send_text(
+                sender,
+                "Pending SKU change cancelled."
+                if cancelled
+                else "There is no pending SKU change to cancel.",
+            )
+            return
         if lowered.startswith("/scenario "):
             scenario_type, base, copilot = self._parse_scenario(command[10:])
             scenario = await self._orchestrator.build_scenario(
@@ -306,18 +324,18 @@ class WhatsAppWebhookService:
                 return
         if lowered.startswith("/add "):
             product, quantity = self._product_quantity(command[5:])
-            scenario = await self._orchestrator.add_sku(sender, product, quantity)
-            await self._send_scenario(sender, scenario)
+            result = await self._orchestrator.add_sku(sender, product, quantity)
+            await self._send_sku_change_result(sender, result)
             return
         if lowered.startswith("/replace "):
             line_id, product, quantity = self._replacement(command[9:])
-            scenario = await self._orchestrator.replace_sku(
+            result = await self._orchestrator.replace_sku(
                 sender,
                 line_id,
                 product,
                 quantity,
             )
-            await self._send_scenario(sender, scenario)
+            await self._send_sku_change_result(sender, result)
             return
         if lowered.startswith("/comment "):
             scenario = await self._orchestrator.add_comment(sender, command[9:])
@@ -410,17 +428,17 @@ class WhatsAppWebhookService:
         if intent.action == "add_sku":
             product = self._required_text(intent.product_query, "product")
             quantity = self._required_quantity(intent.quantity, allow_zero=False)
-            scenario = await self._orchestrator.add_sku(sender, product, quantity)
-            await self._send_scenario(sender, scenario)
+            result = await self._orchestrator.add_sku(sender, product, quantity)
+            await self._send_sku_change_result(sender, result)
             return
         if intent.action == "replace_sku":
             line_id = self._required_text(intent.line_id, "line ID")
             product = self._required_text(intent.product_query, "replacement product")
             quantity = self._required_quantity(intent.quantity, allow_zero=False)
-            scenario = await self._orchestrator.replace_sku(
+            result = await self._orchestrator.replace_sku(
                 sender, line_id, product, quantity
             )
-            await self._send_scenario(sender, scenario)
+            await self._send_sku_change_result(sender, result)
             return
         if intent.action == "add_comment":
             comment = self._required_text(intent.comment, "comment")
@@ -448,6 +466,16 @@ class WhatsAppWebhookService:
                 raise ValueError("Unknown commercial scenario.") from error
             scenario = await self._orchestrator.build_scenario(sender, scenario_type)
             await self._send_scenario(sender, scenario)
+            return
+        if action == "sku_confirm":
+            if len(parts) != 4 or not parts[3].isdigit():
+                raise ValueError("That SKU confirmation is invalid.")
+            result = await self._orchestrator.confirm_sku_change(
+                sender,
+                int(parts[3]),
+                confirmation_id=value,
+            )
+            await self._send_sku_change_result(sender, result)
             return
         if action == "compare":
             await self._send_comparison(sender)
@@ -507,6 +535,61 @@ class WhatsAppWebhookService:
             InteractiveButtons(
                 body=InteractiveText(text="Continue working with this proposal."),
                 action=InteractiveButtonAction(buttons=buttons),
+            ),
+        )
+
+    async def _send_sku_change_result(
+        self,
+        sender: str,
+        result: SkuChangeResult,
+    ) -> None:
+        if result.state == "applied":
+            if result.scenario is None:
+                raise RuntimeError("Applied SKU change did not return a scenario.")
+            await self._send_scenario(sender, result.scenario)
+            return
+        pending = result.confirmation
+        if pending is None:
+            raise RuntimeError("SKU confirmation state did not contain candidates.")
+        lines = [
+            "*Confirmation required*",
+            f"No change was made for: {pending.product_query}",
+            "Choose the intended Outcome Sheet SKU:",
+        ]
+        rows: list[InteractiveRow] = []
+        for index, candidate in enumerate(pending.candidates, start=1):
+            lines.append(
+                f"{index}) {candidate.sku_title} "
+                f"[{candidate.product_id}/{candidate.sku_id}] "
+                f"({candidate.confidence:.1f}%)"
+            )
+            rows.append(
+                InteractiveRow(
+                    id=f"licensing|sku_confirm|{pending.id}|{index}",
+                    title=candidate.sku_title[:24],
+                    description=(
+                        f"{candidate.confidence:.1f}% · "
+                        f"{candidate.product_id}/{candidate.sku_id}"
+                    )[:72],
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "Reply /confirm-sku NUMBER, choose a row below, or send /cancel-sku.",
+            ]
+        )
+        await self._send_text_chunks(sender, "\n".join(lines))
+        await self._send_interactive(
+            sender,
+            InteractiveList(
+                body=InteractiveText(
+                    text="Confirm the exact SKU before changing the proposal."
+                ),
+                action=InteractiveListAction(
+                    button="Choose exact SKU",
+                    sections=[InteractiveSection(title="Top matches", rows=rows)],
+                ),
             ),
         )
 

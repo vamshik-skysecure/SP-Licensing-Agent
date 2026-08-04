@@ -68,11 +68,14 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 - `Outcome Sheet` is the only licensing catalogue and pricing source.
 - The required workflow options identify E3, E5, E7, and standalone Copilot by exact title;
   their ProductId, SkuId, term, billing plan, and prices are resolved from the current sheet.
-- No separate migration JSON, database, hidden Phase 1 service, or model-generated licensing
-  knowledge is used.
+- `config/migration_seed.json` is a separate, human-maintained advisory layer. Its initial
+  rows are title-pattern heuristics marked `source=heuristic_unverified` and
+  `approved=false`; they may be displayed as suggestions but cannot change a disposition.
+  An authorized business reviewer can promote an individual row to explicit configuration
+  by setting `approved=true`. No model-generated mapping is accepted at runtime.
 - Exact E3/E5/E7 core-suite rows can safely feed the target base quantity. Every other
   existing SKU defaults to `needs_decision`, remains priced, and requires an explicit seller
-  action before finalization because the workbook contains no entitlement mappings.
+  action before finalization unless a matching seed row has been explicitly approved.
 - The current sheet contains no field proving that ME7 includes Copilot, so the application
   does not make that claim or silently price it as bundled.
 

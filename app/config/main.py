@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     default_customer_segment: str = "Commercial"
     default_currency: str = "INR"
     sku_match_threshold: float = Field(default=90.0, ge=0, le=100)
+    migration_seed_path: Path = Path("config/migration_seed.json")
     max_document_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     session_ttl_hours: int = Field(default=24, ge=1, le=24 * 30)
 

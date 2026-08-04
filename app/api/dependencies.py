@@ -16,6 +16,7 @@ from app.core.dispatch import (
 )
 from app.core.licensing.agent import IntentInterpreter, OpenAIIntentInterpreter
 from app.core.licensing.analysis import LicenseAnalyzer
+from app.core.licensing.migration_rules import MigrationSeedCatalog
 from app.core.licensing.orchestrator import LicensingOrchestrator
 from app.core.licensing.rate_card import (
     AzureBlobRateCardSource,
@@ -103,7 +104,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         rate_cards,
         match_threshold=settings.sku_match_threshold,
     )
-    scenario_engine = ScenarioEngine()
+    migration_seeds = MigrationSeedCatalog.load(settings.migration_seed_path)
+    scenario_engine = ScenarioEngine(migration_seeds)
     catalog = await rate_cards.get()
     scenario_engine.validate_catalog(
         catalog,
@@ -112,9 +114,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         segment=settings.default_customer_segment,
     )
     logger.info(
-        "Outcome Sheet validated version=%s rows=%s",
+        "Outcome Sheet validated version=%s rows=%s migration_seed_rules=%s approved=%s",
         catalog.version,
         len(catalog.items),
+        len(migration_seeds.rules),
+        sum(rule.approved for rule in migration_seeds.rules),
     )
     orchestrator = LicensingOrchestrator(
         analyzer=analyzer,

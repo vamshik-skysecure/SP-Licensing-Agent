@@ -178,6 +178,28 @@ class CommercialScenario(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class PendingSkuChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    action: Literal["add", "replace"]
+    scenario_type: ScenarioType
+    scenario_revision: int = Field(ge=1)
+    product_query: str
+    quantity: int = Field(gt=0)
+    source_line_id: str | None = None
+    candidates: list[SkuMatchCandidate] = Field(min_length=1, max_length=3)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class SkuChangeResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["applied", "confirmation_required"]
+    scenario: CommercialScenario | None = None
+    confirmation: PendingSkuChange | None = None
+
+
 class WorkflowStage(StrEnum):
     AWAITING_UPLOAD = "awaiting_upload"
     AWAITING_MATCH_CONFIRMATION = "awaiting_match_confirmation"
@@ -195,6 +217,7 @@ class WorkflowSession(BaseModel):
     estate: LicenseEstate | None = None
     scenarios: dict[ScenarioType, CommercialScenario] = Field(default_factory=dict)
     active_scenario: ScenarioType | None = None
+    pending_sku_change: PendingSkuChange | None = None
     processed_message_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

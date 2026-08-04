@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import uuid4
 
+from .migration_rules import MigrationSeedCatalog
 from .models import (
     CommercialComparison,
     CommercialScenario,
@@ -62,6 +63,9 @@ def money(value: Decimal) -> Decimal:
 
 
 class ScenarioEngine:
+    def __init__(self, migration_seeds: MigrationSeedCatalog | None = None) -> None:
+        self._migration_seeds = migration_seeds
+
     def validate_catalog(
         self,
         catalog: RateCardCatalog,
@@ -307,10 +311,11 @@ class ScenarioEngine:
         product_query: str,
         quantity: int,
         catalog: RateCardCatalog,
+        selector: SkuSelector | None = None,
     ) -> CommercialScenario:
         if quantity <= 0:
             raise ScenarioError("Added SKU quantity must be greater than zero.")
-        selector = SkuSelector(sku_title=product_query)
+        selector = selector or SkuSelector(sku_title=product_query)
         item = self._select_price(
             catalog,
             selector,
@@ -361,6 +366,7 @@ class ScenarioEngine:
         product_query: str,
         quantity: int,
         catalog: RateCardCatalog,
+        selector: SkuSelector | None = None,
     ) -> CommercialScenario:
         removed = self.set_disposition(
             scenario,
@@ -372,6 +378,7 @@ class ScenarioEngine:
             product_query=product_query,
             quantity=quantity,
             catalog=catalog,
+            selector=selector,
         )
         return replaced.model_copy(
             update={
@@ -617,17 +624,48 @@ class ScenarioEngine:
                     note = "Already the selected target suite; represented by the target line."
                 else:
                     disposition = MigrationDisposition.MIGRATE
-                    note = "Core-suite licence migrates to the selected target suite."
+                    note = f"Core-suite licence migrates to {definition.base_title}."
             elif copilot_key is not None and source_key == copilot_key:
                 copilot_sources.append(source.renewal_quantity)
                 disposition = MigrationDisposition.INCLUDED
                 note = "Existing standalone Copilot is represented by the Copilot target line."
             else:
-                disposition = MigrationDisposition.NEEDS_DECISION
-                note = (
-                    "The Outcome Sheet contains no entitlement or migration mapping for this "
-                    "SKU; retained and priced until the seller decides."
+                suggestion = (
+                    self._migration_seeds.match(source.display_title, scenario_type)
+                    if self._migration_seeds is not None
+                    else None
                 )
+                if suggestion is None:
+                    disposition = MigrationDisposition.NEEDS_DECISION
+                    note = (
+                        "The Outcome Sheet contains no entitlement or migration mapping for "
+                        "this SKU; retained and priced until the seller decides."
+                    )
+                elif suggestion.approved:
+                    disposition = suggestion.disposition
+                    target_note = (
+                        f" Replacement target: {definition.base_title}."
+                        if disposition
+                        in {
+                            MigrationDisposition.MIGRATE,
+                            MigrationDisposition.INCLUDED,
+                            MigrationDisposition.REMOVE,
+                        }
+                        else ""
+                    )
+                    note = (
+                        f"Approved migration seed {suggestion.rule_id} applies "
+                        f"{disposition.value}; source={suggestion.source}."
+                        f"{target_note} {suggestion.rationale}"
+                    ).strip()
+                else:
+                    disposition = MigrationDisposition.NEEDS_DECISION
+                    note = (
+                        f"Suggested default only: {suggestion.disposition.value} from "
+                        f"{suggestion.rule_id}; source={suggestion.source}; approved=false. "
+                        "No migration action was auto-applied. "
+                        f"{suggestion.rationale}"
+                    )
             price_existing = disposition in {
                 MigrationDisposition.RETAIN,
                 MigrationDisposition.NEEDS_DECISION,
