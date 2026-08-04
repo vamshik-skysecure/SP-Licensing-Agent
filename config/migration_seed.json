@@ -1,46 +1,56 @@
 {
   "version": 1,
-  "description": "Unverified title-pattern suggestions derived from product families visible in the Outcome Sheet. Rows are advisory only until approved is explicitly changed to true by an authorized business reviewer.",
+  "description": "Title-pattern suggestions derived from product families visible in the Outcome Sheet. Source metadata records research confidence, but every row remains advisory until approved is explicitly changed to true by an authorized business reviewer.",
+  "sourced_row_count": 10,
+  "unsourced_row_count": 20,
   "rules": [
     {
       "id": "enterprise-mobility-security",
       "title_pattern": "Enterprise Mobility + Security",
       "match_mode": "contains",
       "priority": 20,
-      "source": "heuristic_unverified",
+      "source": "microsoft_official",
+      "source_url": "https://www.microsoft.com/en-us/licensing/product-licensing/microsoft-365-enterprise",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Standalone EMS-family licensing may overlap a target suite, but entitlement equivalence is not present in the workbook; retain is the conservative suggestion.",
-      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "retain"}
+      "rationale": "Microsoft 365 E3/E5/E7 is built from Office 365 + EMS + Windows Enterprise; a standalone EMS line is redundant once the customer has any Microsoft 365 suite tier, though EMS E5-specific advanced features (Cloud App Security, ATP) may exceed what a lower M365 tier provides — flag for seller review if migrating EMS E5 into ME3.",
+      "suggested_dispositions": {"me3_copilot": "included", "me5_copilot": "included", "me7": "included"}
     },
     {
       "id": "copilot-family",
       "title_pattern": "Copilot",
       "match_mode": "contains",
       "priority": 20,
-      "source": "heuristic_unverified",
+      "source": "microsoft_official",
+      "source_url": "https://learn.microsoft.com/en-us/microsoft-365/copilot/microsoft-365-copilot-license-feature-overview",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Copilot-like rows may be represented by the standalone Copilot target in ME3/ME5; ME7 inclusion is not proven by the workbook.",
-      "suggested_dispositions": {"me3_copilot": "included", "me5_copilot": "included", "me7": "retain"}
+      "rationale": "Copilot is a separate paid add-on for E3/E5; natively bundled only in E7. A standalone Copilot line becomes redundant only when migrating to E7.",
+      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "included"}
     },
     {
       "id": "teams-phone-family",
       "title_pattern": "Teams Phone",
       "match_mode": "contains",
       "priority": 20,
-      "source": "heuristic_unverified",
+      "source": "third_party_sourced",
+      "source_url": "https://www.aguidetocloud.com/licensing/microsoft-365-e3/",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Teams Phone appears as a distinct product family, so retention is the conservative suggestion pending entitlement review.",
-      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "retain"}
+      "rationale": "Teams Phone System is bundled starting at Microsoft 365 E5.",
+      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "included", "me7": "included"}
     },
     {
       "id": "audio-conferencing-family",
       "title_pattern": "Audio Conferencing",
       "match_mode": "contains",
       "priority": 20,
-      "source": "heuristic_unverified",
+      "source": "third_party_sourced",
+      "source_url": "https://www.aguidetocloud.com/licensing/microsoft-365-e3/",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Audio-conferencing variants require product-specific entitlement review; retention avoids assuming bundle inclusion.",
-      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "retain"}
+      "rationale": "Audio Conferencing is bundled starting at Microsoft 365 E5.",
+      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "included", "me7": "included"}
     },
     {
       "id": "microsoft-365-family",
@@ -67,20 +77,24 @@
       "title_pattern": "Power BI",
       "match_mode": "contains",
       "priority": 50,
-      "source": "heuristic_unverified",
+      "source": "third_party_sourced",
+      "source_url": "https://www.aguidetocloud.com/licensing/microsoft-365-e3/",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Power BI rows form a distinct analytics family; retain is the conservative proposal until target-suite entitlements are approved.",
-      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "retain"}
+      "rationale": "Power BI Pro is bundled starting at Microsoft 365 E5; not included in E3.",
+      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "included", "me7": "included"}
     },
     {
       "id": "defender-family",
       "title_pattern": "Defender",
       "match_mode": "contains",
       "priority": 50,
-      "source": "heuristic_unverified",
+      "source": "microsoft_official",
+      "source_url": "https://learn.microsoft.com/en-us/microsoft-365/copilot/microsoft-365-copilot-license-feature-overview",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Defender products span multiple workloads and editions; retain is suggested until exact overlap is confirmed.",
-      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "retain"}
+      "rationale": "Microsoft 365 E3 includes basic Defender protection; full Defender XDR is only included from E5 upward. Seller must confirm which Defender plan the existing SKU represents.",
+      "suggested_dispositions": {"me3_copilot": "needs_decision", "me5_copilot": "needs_decision", "me7": "needs_decision"}
     },
     {
       "id": "microsoft-teams-family",
@@ -127,9 +141,11 @@
       "title_pattern": "Dynamics 365",
       "match_mode": "contains",
       "priority": 50,
-      "source": "heuristic_unverified",
+      "source": "microsoft_official",
+      "source_url": "https://www.microsoft.com/licensing/guidance/Dynamics-365",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Dynamics 365 products are workload-specific and not proven to be replaced by the target suites; retain is suggested.",
+      "rationale": "Dynamics 365 is a fully separate Microsoft product line, never bundled into any Microsoft 365 Enterprise suite.",
       "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "retain"}
     },
     {
@@ -137,20 +153,24 @@
       "title_pattern": "Microsoft Entra",
       "match_mode": "contains",
       "priority": 50,
-      "source": "heuristic_unverified",
+      "source": "microsoft_official",
+      "source_url": "https://learn.microsoft.com/en-us/microsoft-365/copilot/microsoft-365-copilot-license-feature-overview",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Entra products may overlap suite identity features, but the workbook does not provide entitlement comparison; retain is suggested.",
-      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "retain"}
+      "rationale": "Microsoft 365 E3 includes Entra ID P1; E5 includes Entra ID P2; E7 includes the full Entra Suite. Whether a specific existing Entra SKU is redundant depends on its plan level, which this workbook does not indicate — seller must confirm the plan level.",
+      "suggested_dispositions": {"me3_copilot": "needs_decision", "me5_copilot": "needs_decision", "me7": "needs_decision"}
     },
     {
       "id": "intune-family",
       "title_pattern": "Intune",
       "match_mode": "contains",
       "priority": 50,
-      "source": "heuristic_unverified",
+      "source": "microsoft_official",
+      "source_url": "https://www.microsoft.com/en-us/microsoft-365/enterprise-mobility-security/compare-plans-and-pricing",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Intune variants require edition-level entitlement review; retain is the conservative suggestion.",
-      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "retain"}
+      "rationale": "Intune Plan 1 baseline is included from E3; Intune Plan 2 plus Advanced Analytics and Remote Help are only included from E5 upward. Seller must confirm which Intune plan the existing SKU represents.",
+      "suggested_dispositions": {"me3_copilot": "needs_decision", "me5_copilot": "needs_decision", "me7": "needs_decision"}
     },
     {
       "id": "project-family",
@@ -227,10 +247,12 @@
       "title_pattern": "Windows 11",
       "match_mode": "contains",
       "priority": 40,
-      "source": "heuristic_unverified",
+      "source": "microsoft_official",
+      "source_url": "https://learn.microsoft.com/en-us/microsoft-365/copilot/microsoft-365-copilot-license-feature-overview",
+      "verified_date": "2026-08-04",
       "approved": false,
-      "rationale": "Windows 11 rows include upgrade and device products; retain is suggested pending device-rights review.",
-      "suggested_dispositions": {"me3_copilot": "retain", "me5_copilot": "retain", "me7": "retain"}
+      "rationale": "Windows 11 Enterprise licensing rights are included at all three Microsoft 365 Enterprise tiers.",
+      "suggested_dispositions": {"me3_copilot": "included", "me5_copilot": "included", "me7": "included"}
     },
     {
       "id": "sql-family",

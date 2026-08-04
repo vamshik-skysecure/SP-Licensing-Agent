@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 from .models import MigrationDisposition, ScenarioType
 from .rate_card import normalize_product_title
@@ -32,7 +33,13 @@ class MigrationSeedRule(BaseModel):
     title_pattern: str
     match_mode: Literal["contains", "prefix", "exact"] = "contains"
     priority: int = Field(default=100, ge=0)
-    source: Literal["heuristic_unverified"]
+    source: Literal[
+        "heuristic_unverified",
+        "microsoft_official",
+        "third_party_sourced",
+    ]
+    source_url: HttpUrl | None = None
+    verified_date: date | None = None
     approved: bool = False
     rationale: str
     suggested_dispositions: dict[ScenarioType, MigrationDisposition]
@@ -51,6 +58,24 @@ class MigrationSeedRule(BaseModel):
         if unsupported:
             values = sorted(disposition.value for disposition in unsupported)
             raise ValueError(f"Unsupported seed dispositions: {values}")
+        if self.source == "heuristic_unverified":
+            if self.source_url is not None or self.verified_date is not None:
+                raise ValueError(
+                    "Unverified heuristic rows cannot claim a source URL or verified date."
+                )
+        elif self.source_url is None or self.verified_date is None:
+            raise ValueError("Sourced rows require source_url and verified_date.")
+        if self.source_url is not None:
+            host = (self.source_url.host or "").casefold()
+            microsoft_host = host == "microsoft.com" or host.endswith(".microsoft.com")
+            if self.source == "microsoft_official" and not microsoft_host:
+                raise ValueError(
+                    "microsoft_official rows must use a microsoft.com source URL."
+                )
+            if self.source == "third_party_sourced" and microsoft_host:
+                raise ValueError(
+                    "Microsoft-domain sources must use source=microsoft_official."
+                )
         return self
 
 
@@ -59,6 +84,8 @@ class MigrationSeedDocument(BaseModel):
 
     version: int = Field(ge=1)
     description: str
+    sourced_row_count: int = Field(ge=0)
+    unsourced_row_count: int = Field(ge=0)
     rules: list[MigrationSeedRule]
 
     @model_validator(mode="after")
@@ -66,6 +93,12 @@ class MigrationSeedDocument(BaseModel):
         ids = [rule.id for rule in self.rules]
         if len(ids) != len(set(ids)):
             raise ValueError("Migration seed rule IDs must be unique.")
+        sourced = sum(rule.source != "heuristic_unverified" for rule in self.rules)
+        unsourced = len(self.rules) - sourced
+        if self.sourced_row_count != sourced or self.unsourced_row_count != unsourced:
+            raise ValueError(
+                "Migration seed sourced/unsourced summary counts do not match the rules."
+            )
         return self
 
 
@@ -76,6 +109,8 @@ class MigrationSeedMatch:
     approved: bool
     disposition: MigrationDisposition
     rationale: str
+    source_url: str | None
+    verified_date: date | None
 
 
 class MigrationSeedCatalog:
@@ -125,6 +160,8 @@ class MigrationSeedCatalog:
             approved=rule.approved,
             disposition=rule.suggested_dispositions[scenario_type],
             rationale=rule.rationale,
+            source_url=str(rule.source_url) if rule.source_url is not None else None,
+            verified_date=rule.verified_date,
         )
 
     @staticmethod

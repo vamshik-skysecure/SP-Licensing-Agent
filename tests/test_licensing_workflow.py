@@ -90,7 +90,7 @@ async def workflow_components():
 
 
 class ParsingTests(unittest.TestCase):
-    def test_real_migration_seed_is_unverified_unapproved_and_matches_workbook(self) -> None:
+    def test_real_migration_seed_sources_counts_and_workbook_patterns(self) -> None:
         root = Path(__file__).parents[1]
         seeds = MigrationSeedCatalog.load(root / "config" / "migration_seed.json")
         items = parse_rate_card(
@@ -101,13 +101,58 @@ class ParsingTests(unittest.TestCase):
         titles = [normalize_product_title(item.sku_title) for item in items]
 
         self.assertEqual(len(seeds.rules), 30)
+        self.assertEqual(seeds.document.sourced_row_count, 10)
+        self.assertEqual(seeds.document.unsourced_row_count, 20)
+        self.assertEqual(
+            sum(rule.source != "heuristic_unverified" for rule in seeds.rules),
+            10,
+        )
         for rule in seeds.rules:
-            self.assertEqual(rule.source, "heuristic_unverified")
             self.assertFalse(rule.approved)
+            if rule.source == "heuristic_unverified":
+                self.assertIsNone(rule.source_url)
+                self.assertIsNone(rule.verified_date)
+            else:
+                self.assertIsNotNone(rule.source_url)
+                self.assertEqual(rule.verified_date.isoformat(), "2026-08-04")  # type: ignore[union-attr]
             pattern = normalize_product_title(rule.title_pattern)
             self.assertTrue(
                 any(pattern in title for title in titles),
                 msg=f"Seed pattern did not match the Outcome Sheet: {rule.title_pattern}",
+            )
+        self.assertEqual(
+            {
+                rule.id
+                for rule in seeds.rules
+                if rule.source == "third_party_sourced"
+            },
+            {"power-bi-family", "teams-phone-family", "audio-conferencing-family"},
+        )
+        by_id = {rule.id: rule for rule in seeds.rules}
+        expected = {
+            "copilot-family": ("retain", "retain", "included"),
+            "enterprise-mobility-security": ("included", "included", "included"),
+            "power-bi-family": ("retain", "included", "included"),
+            "teams-phone-family": ("retain", "included", "included"),
+            "audio-conferencing-family": ("retain", "included", "included"),
+            "windows-11-family": ("included", "included", "included"),
+            "dynamics-365-family": ("retain", "retain", "retain"),
+            "entra-family": ("needs_decision", "needs_decision", "needs_decision"),
+            "intune-family": ("needs_decision", "needs_decision", "needs_decision"),
+            "defender-family": ("needs_decision", "needs_decision", "needs_decision"),
+        }
+        for rule_id, dispositions in expected.items():
+            rule = by_id[rule_id]
+            self.assertEqual(
+                tuple(
+                    rule.suggested_dispositions[scenario].value
+                    for scenario in (
+                        ScenarioType.ME3_COPILOT,
+                        ScenarioType.ME5_COPILOT,
+                        ScenarioType.ME7,
+                    )
+                ),
+                dispositions,
             )
 
     def test_customer_parser_uses_renewal_not_assigned_quantity(self) -> None:
@@ -374,6 +419,8 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         approved_document = MigrationSeedDocument(
             version=1,
             description="Test-only approved copy",
+            sourced_row_count=0,
+            unsourced_row_count=1,
             rules=[seed_rule.model_copy(update={"approved": True})],
         )
         approved = ScenarioEngine(MigrationSeedCatalog(approved_document)).build(

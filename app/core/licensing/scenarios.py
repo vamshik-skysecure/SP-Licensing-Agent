@@ -643,6 +643,13 @@ class ScenarioEngine:
                     )
                 elif suggestion.approved:
                     disposition = suggestion.disposition
+                    verification = (
+                        f" verified={suggestion.verified_date.isoformat()};"
+                        f" source_url={suggestion.source_url};"
+                        if suggestion.verified_date is not None
+                        and suggestion.source_url is not None
+                        else ""
+                    )
                     target_note = (
                         f" Replacement target: {definition.base_title}."
                         if disposition
@@ -656,13 +663,21 @@ class ScenarioEngine:
                     note = (
                         f"Approved migration seed {suggestion.rule_id} applies "
                         f"{disposition.value}; source={suggestion.source}."
-                        f"{target_note} {suggestion.rationale}"
+                        f"{verification}{target_note} {suggestion.rationale}"
                     ).strip()
                 else:
                     disposition = MigrationDisposition.NEEDS_DECISION
+                    verification = (
+                        f" verified={suggestion.verified_date.isoformat()};"
+                        f" source_url={suggestion.source_url};"
+                        if suggestion.verified_date is not None
+                        and suggestion.source_url is not None
+                        else ""
+                    )
                     note = (
                         f"Suggested default only: {suggestion.disposition.value} from "
-                        f"{suggestion.rule_id}; source={suggestion.source}; approved=false. "
+                        f"{suggestion.rule_id}; source={suggestion.source};"
+                        f"{verification} approved=false. "
                         "No migration action was auto-applied. "
                         f"{suggestion.rationale}"
                     )

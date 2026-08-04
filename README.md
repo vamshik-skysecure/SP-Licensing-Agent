@@ -41,8 +41,9 @@ so local/UAT testing does not require a real WhatsApp number.
 - An unknown migration is never invented: the licence remains priced and is marked
   `needs_decision` until an authorized seller resolves it.
 - `config/migration_seed.json` contains human-editable, title-pattern suggestions derived
-  from real Outcome Sheet families. Every seed is `heuristic_unverified` and defaults to
-  `approved: false`; unapproved rows are displayed as suggestions but never auto-applied.
+  from real Outcome Sheet families. Rows record official, third-party, or unverified
+  provenance, but every seed remains `approved: false`; unapproved rows are displayed as
+  suggestions and never auto-applied.
 - E3, E5, E7, and standalone Copilot identities are resolved by exact product title from
   the current Outcome Sheet; no product ID, SKU ID, or price is maintained elsewhere.
 - The workbook has no entitlement or migration-map columns. Therefore, non-core add-ons
