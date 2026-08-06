@@ -90,6 +90,15 @@ async def workflow_components():
 
 
 class ParsingTests(unittest.TestCase):
+    def test_whatsapp_chunking_preserves_table_code_blocks(self) -> None:
+        body = "```\n" + "\n".join(f"L{index:04d} product row" for index in range(500)) + "\n```"
+
+        chunks = WhatsAppWebhookService._text_chunks(body, limit=500)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 500 for chunk in chunks))
+        self.assertTrue(all(chunk.count("```") % 2 == 0 for chunk in chunks))
+
     def test_real_migration_seed_sources_counts_and_workbook_patterns(self) -> None:
         root = Path(__file__).parents[1]
         seeds = MigrationSeedCatalog.load(root / "config" / "migration_seed.json")
@@ -308,9 +317,10 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         output = format_estate(estate) + "\n" + format_scenario(scenario)
 
-        self.assertIn("L1 · Microsoft 365 E3", output)
-        self.assertIn("existing 8 → proposed 0", output)
-        self.assertIn("⚠ decision", output)
+        self.assertIn("*L1 — Microsoft 365 E3*", output)
+        self.assertIn("*BASE — Microsoft 365 E3*", output)
+        self.assertIn("L2: seller decision required", output)
+        self.assertNotIn("```", output)
         for corrupted in ("Â·", "â€¢", "âš", "â†’"):
             self.assertNotIn(corrupted, output)
 
@@ -743,6 +753,15 @@ class IntentAdapterTests(unittest.IsolatedAsyncioTestCase):
             copilot_quantity=40,
             product_query="",
             disposition="none",
+            boolean_value="none",
+            percentage=-1,
+            amount=-1,
+            term_duration="",
+            billing_plan="",
+            segment="",
+            currency="",
+            candidate_number=-1,
+            match_selections=[],
             comment="",
             clarification="",
         )
@@ -869,6 +888,7 @@ class FakeWhatsAppClient:
     def __init__(self) -> None:
         self.messages: list[object] = []
         self.documents: list[dict[str, object]] = []
+        self.images: list[dict[str, object]] = []
 
     async def download_media(self, **_: object) -> WhatsAppMedia:
         return WhatsAppMedia(CUSTOMER, "customer.csv", "text/csv")
@@ -879,6 +899,10 @@ class FakeWhatsAppClient:
 
     async def send_document(self, **kwargs: object) -> dict[str, object]:
         self.documents.append(kwargs)
+        return {}
+
+    async def send_image(self, **kwargs: object) -> dict[str, object]:
+        self.images.append(kwargs)
         return {}
 
 
@@ -892,9 +916,54 @@ class FakeIntentInterpreter:
             copilot_quantity=3,
             product_query="",
             disposition="none",
+            boolean_value="none",
+            percentage=-1,
+            amount=-1,
+            term_duration="",
+            billing_plan="",
+            segment="",
+            currency="",
+            candidate_number=-1,
+            match_selections=[],
             comment="",
             clarification="",
         )
+
+    async def close(self) -> None:
+        return None
+
+
+def agent_intent(action: str, **updates: object) -> AgentIntent:
+    values: dict[str, object] = {
+        "action": action,
+        "scenario": "none",
+        "line_id": "",
+        "quantity": -1,
+        "copilot_quantity": -1,
+        "product_query": "",
+        "disposition": "none",
+        "boolean_value": "none",
+        "percentage": -1,
+        "amount": -1,
+        "term_duration": "",
+        "billing_plan": "",
+        "segment": "",
+        "currency": "",
+        "candidate_number": -1,
+        "match_selections": [],
+        "comment": "",
+        "clarification": "",
+    }
+    values.update(updates)
+    return AgentIntent.model_validate(values)
+
+
+class MutableIntentInterpreter:
+    def __init__(self, intent: AgentIntent) -> None:
+        self.intent = intent
+
+    async def interpret(self, _message: str, _session: object) -> AgentIntent:
+        return self.intent
 
     async def close(self) -> None:
         return None
@@ -1039,19 +1108,103 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         await service.handle(upload)
         await service.handle(natural_request)
 
-        scenario_messages = [
-            message
-            for message in client.messages
-            if "*ME3 + Copilot" in getattr(
-                getattr(message, "text", None), "body", ""
-            )
+        scenario_images = [
+            image
+            for image in client.images
+            if image["filename"].startswith("me3_copilot-proposal-table-")
         ]
-        self.assertEqual(len(scenario_messages), 1)
+        self.assertEqual(len(scenario_images), 1)
+        self.assertTrue(scenario_images[0]["content"].startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertIn("ME3", scenario_images[0]["caption"])
         scenario = (await orchestrator.get_session("911234567890")).scenarios[  # type: ignore[union-attr]
             ScenarioType.ME3_COPILOT
         ]
         self.assertEqual(scenario.copilot_quantity, 3)
         self.assertEqual(scenario.total_value, Decimal("1010.00"))
+        await store.close()
+        await provider.close()
+
+    async def test_natural_language_covers_commercial_edit_operations(self) -> None:
+        provider, _, store, _, orchestrator = await workflow_components()
+        client = FakeWhatsAppClient()
+        interpreter = MutableIntentInterpreter(
+            agent_intent("set_quantity", line_id="L2", quantity=5)
+        )
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            orchestrator,
+            ServiceConfiguration(frozenset(), 1024 * 1024),
+            intent_interpreter=interpreter,
+        )
+        sender = "911234567890"
+        await orchestrator.analyze_document(
+            sender=sender,
+            filename="customer.csv",
+            content=CUSTOMER,
+        )
+        await orchestrator.build_scenario(sender, ScenarioType.RENEW_AS_IS)
+
+        operations = [
+            (agent_intent("set_quantity", line_id="L2", quantity=5), "Change L2 to five"),
+            (agent_intent("set_promo", boolean_value="true"), "Customer is promo eligible"),
+            (agent_intent("set_discount", percentage=5), "Apply five percent discount"),
+            (agent_intent("set_adjustment", amount=-10), "Subtract ten as an adjustment"),
+            (agent_intent("set_term", term_duration="P1Y"), "Keep a one-year term"),
+            (agent_intent("set_billing", billing_plan="Annual"), "Use annual billing"),
+            (agent_intent("set_segment", segment="Commercial"), "Commercial segment"),
+            (agent_intent("set_currency", currency="INR"), "Keep the currency in INR"),
+            (
+                agent_intent("add_comment", comment="Customer approval pending"),
+                "Add a note that customer approval is pending",
+            ),
+            (
+                agent_intent("add_sku", product_query="Product A", quantity=2),
+                "Add two Product A licences",
+            ),
+            (
+                agent_intent(
+                    "replace_sku",
+                    line_id="L2",
+                    product_query="Product A",
+                    quantity=4,
+                ),
+                "Replace L2 with four Product A licences",
+            ),
+            (
+                agent_intent(
+                    "set_disposition",
+                    line_id="L1",
+                    disposition="remove",
+                ),
+                "Remove L1",
+            ),
+        ]
+        for intent, sentence in operations:
+            interpreter.intent = intent
+            await service._handle_text(sender, sentence)
+
+        session = await orchestrator.get_session(sender)
+        assert session is not None
+        scenario = session.scenarios[ScenarioType.RENEW_AS_IS]
+        self.assertEqual(scenario.discount_percentage, Decimal("5.0"))
+        self.assertEqual(scenario.adjustment_amount, Decimal("-10.00"))
+        self.assertEqual(scenario.term_duration, "P1Y")
+        self.assertEqual(scenario.billing_plan, "Annual")
+        self.assertEqual(scenario.segment, "Commercial")
+        self.assertIn("Customer approval pending", scenario.comments)
+        self.assertEqual(next(line for line in scenario.lines if line.line_id == "L1").proposed_quantity, 0)
+        replaced_source = next(line for line in scenario.lines if line.line_id == "L2")
+        self.assertEqual(replaced_source.proposed_quantity, 0)
+        replacements = [
+            line
+            for line in scenario.lines
+            if line.source_line_id is None
+            and line.sku_id == "sku-a"
+            and line.proposed_quantity == 4
+        ]
+        self.assertEqual(len(replacements), 1)
+        self.assertTrue(any(line.source_line_id is None for line in scenario.lines))
+
         await store.close()
         await provider.close()
 

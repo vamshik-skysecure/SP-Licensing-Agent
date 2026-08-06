@@ -30,6 +30,19 @@ class WhatsAppDocumentMessage(BaseModel):
     document: DocumentContent
 
 
+class ImageContent(BaseModel):
+    id: str
+    caption: str | None = None
+
+
+class WhatsAppImageMessage(BaseModel):
+    messaging_product: Literal["whatsapp"] = "whatsapp"
+    recipient_type: Literal["individual"] = "individual"
+    to: str
+    type: Literal["image"] = "image"
+    image: ImageContent
+
+
 class InteractiveText(BaseModel):
     text: str
 

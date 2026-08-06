@@ -138,7 +138,12 @@ class RateCardCatalog:
         sku_id: str | None = None,
         limit: int = 3,
     ) -> list[SkuMatchCandidate]:
-        if product_id and sku_id:
+        if (
+            product_id
+            and sku_id
+            and not _is_placeholder_identifier(product_id)
+            and not _is_placeholder_identifier(sku_id)
+        ):
             exact_ids = [
                 identity
                 for identity in self.identities
@@ -146,7 +151,27 @@ class RateCardCatalog:
                 and identity.sku_id.casefold() == sku_id.casefold()
             ]
             if exact_ids:
-                return [self._candidate(identity, 100.0) for identity in exact_ids[:limit]]
+                normalized_query = normalize_product_title(query)
+                exact_title = [
+                    identity
+                    for identity in exact_ids
+                    if normalize_product_title(identity.sku_title) == normalized_query
+                ]
+                if exact_title:
+                    return [
+                        self._candidate(identity, 100.0)
+                        for identity in exact_title[:limit]
+                    ]
+                if len(exact_ids) == 1:
+                    return [self._candidate(exact_ids[0], 100.0)]
+                best = max(
+                    exact_ids,
+                    key=lambda identity: fuzz.WRatio(
+                        normalized_query,
+                        normalize_product_title(identity.sku_title),
+                    ),
+                )
+                return [self._candidate(best, 100.0)]
 
         normalized = normalize_product_title(query)
         exact = [
@@ -277,27 +302,40 @@ _HEADERS = {
     "productid": "product_id",
     "skuid": "sku_id",
     "skutitle": "sku_title",
+    "contracttype": "contract_type",
     "termduration": "term_duration",
     "billingplan": "billing_plan",
     "segment": "segment",
+    "erp": "erp_price",
     "erpprice": "erp_price",
+    "catalogueprice": "catalogue_price",
     "unitpricecatalogue": "catalogue_price",
+    "promoname": "promo_name",
+    "promo": "promo_percentage",
     "promoifnewtoms": "promo_percentage",
+    "customereligibility": "customer_eligibility",
+    "newtomicrosoftrequired": "new_to_microsoft_required",
+    "minimumseats": "minimum_seats",
+    "maximumseats": "maximum_seats",
+    "geography": "geography",
     "nettoms": "net_to_ms",
     "expectedpartnerpricingwithpromo": "partner_price_with_promo",
     "expectedpartnerpricingwithoutpromo": "partner_price_without_promo",
+    "distributorlandingprice": "distributor_landing_price",
+    "partnerlandingpricefromdistributor": "partner_landing_price",
+    "partnerscostofproduct": "partner_cost",
+    "partnerbestoffer": "partner_best_offer",
+    "priceonmarketplace": "marketplace_price",
     "initialquotewithpromo": "initial_quote_with_promo",
     "initialquotewithoutpromo": "initial_quote_without_promo",
 }
 
-_REQUIRED = {
+_BASE_REQUIRED = {
     "product_id",
     "sku_id",
     "sku_title",
     "term_duration",
     "billing_plan",
-    "initial_quote_with_promo",
-    "initial_quote_without_promo",
 }
 
 
@@ -340,6 +378,10 @@ def _header_key(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
 
 
+def _is_placeholder_identifier(value: str) -> bool:
+    return value.strip().casefold() in {"0", "-", "n/a", "na", "none", "unmapped"}
+
+
 def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
     iterator = iter(rows)
     try:
@@ -352,9 +394,20 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
         field = _HEADERS.get(_header_key(header))
         if field:
             columns[index] = field
-    missing = sorted(_REQUIRED - set(columns.values()))
+    available_fields = set(columns.values())
+    missing = sorted(_BASE_REQUIRED - available_fields)
     if missing:
         raise RateCardError("Missing rate-card columns: " + ", ".join(missing))
+    has_legacy_quotes = {
+        "initial_quote_with_promo",
+        "initial_quote_without_promo",
+    }.issubset(available_fields)
+    has_final_offer = "partner_best_offer" in available_fields
+    if not has_legacy_quotes and not has_final_offer:
+        raise RateCardError(
+            "Missing rate-card price columns: provide Initial Quote With/Without "
+            "Promo or Partner Best Offer."
+        )
 
     items: list[RateCardItem] = []
     for row_number, values in enumerate(iterator, start=2):
@@ -371,6 +424,27 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
             )
             if not record[field]:
                 raise RateCardError(f"Rate-card row {row_number} has an empty {field}.")
+
+        # Microsoft SKU V5.0 makes the maintained Final Output Sheet authoritative.
+        # Its Partner Best Offer is the direct seller quote. Promotional rows are
+        # deliberately not exposed as a non-promotional price: the seller must first
+        # confirm eligibility, while standard rows remain usable in either mode.
+        if has_final_offer and not has_legacy_quotes:
+            offer = record.get("partner_best_offer")
+            normalized_offer = _decimal(offer, "partner_best_offer", row_number)
+            promo_percentage = _decimal(
+                record.get("promo_percentage"), "promo_percentage", row_number
+            )
+            promo_name = str(record.get("promo_name") or "").strip()
+            is_promotional = promo_percentage > 0 or promo_name not in {"", "0"}
+            offer_is_available = offer not in (None, "") and normalized_offer > 0
+            record["initial_quote_with_promo"] = (
+                offer if is_promotional and offer_is_available else None
+            )
+            record["initial_quote_without_promo"] = (
+                offer if not is_promotional and offer_is_available else None
+            )
+
         record["initial_quote_with_promo_available"] = record.get(
             "initial_quote_with_promo"
         ) not in (None, "")
@@ -384,12 +458,28 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
             "net_to_ms",
             "partner_price_with_promo",
             "partner_price_without_promo",
+            "distributor_landing_price",
+            "partner_landing_price",
+            "partner_cost",
+            "partner_best_offer",
+            "marketplace_price",
             "initial_quote_with_promo",
             "initial_quote_without_promo",
         ):
             record[field] = _decimal(record.get(field), field, row_number)
-        segment = record.get("segment")
-        record["segment"] = str(segment).strip() if segment not in (None, "") else None
+        for field in (
+            "contract_type",
+            "segment",
+            "promo_name",
+            "customer_eligibility",
+            "new_to_microsoft_required",
+            "geography",
+        ):
+            value = record.get(field)
+            normalized = str(value).strip() if value not in (None, "", 0, "0") else None
+            record[field] = normalized
+        for field in ("minimum_seats", "maximum_seats"):
+            record[field] = _optional_int(record.get(field), field, row_number)
         items.append(RateCardItem(**record, source_row_number=row_number))
     return items
 
@@ -409,3 +499,19 @@ def _decimal(value: object, field: str, row_number: int) -> Decimal:
     # 1746.3600000000001. Normalize at the ingestion boundary while retaining
     # more precision than the two-decimal commercial output.
     return result.quantize(Decimal("0.000001"))
+
+
+def _optional_int(value: object, field: str, row_number: int) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        result = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError) as error:
+        raise RateCardError(
+            f"Rate-card row {row_number} has an invalid {field}."
+        ) from error
+    if result < 0 or result != result.to_integral_value():
+        raise RateCardError(
+            f"Rate-card row {row_number} has an invalid {field}."
+        )
+    return int(result)

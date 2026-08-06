@@ -27,6 +27,36 @@ class ScenarioError(ValueError):
     pass
 
 
+def price_unavailability_message(
+    item: RateCardItem,
+    promo_eligible: bool,
+) -> str:
+    if (
+        not promo_eligible
+        and item.initial_quote_with_promo_available
+        and not item.initial_quote_without_promo_available
+    ):
+        return (
+            "Promotion eligibility confirmation required: the pricebook has a "
+            "promotional quote but no standard quote."
+        )
+    return "Selected pricebook quote is blank; price is unavailable."
+
+
+def price_unavailability_decision(
+    line_id: str,
+    item: RateCardItem,
+    promo_eligible: bool,
+) -> str:
+    if (
+        not promo_eligible
+        and item.initial_quote_with_promo_available
+        and not item.initial_quote_without_promo_available
+    ):
+        return f"{line_id}: confirm promotion eligibility before pricing."
+    return f"{line_id}: price is unavailable in the pricebook."
+
+
 @dataclass(frozen=True)
 class SkuSelector:
     sku_title: str
@@ -63,8 +93,14 @@ def money(value: Decimal) -> Decimal:
 
 
 class ScenarioEngine:
-    def __init__(self, migration_seeds: MigrationSeedCatalog | None = None) -> None:
+    def __init__(
+        self,
+        migration_seeds: MigrationSeedCatalog | None = None,
+        *,
+        apply_bundle_rules: bool = True,
+    ) -> None:
         self._migration_seeds = migration_seeds
+        self._apply_bundle_rules = apply_bundle_rules
 
     def validate_catalog(
         self,
@@ -88,10 +124,12 @@ class ScenarioEngine:
                 billing_plan,
                 segment,
             )
-            _, price_unavailable = self._unit_price(item, False)
-            if price_unavailable:
+            if not (
+                item.initial_quote_with_promo_available
+                or item.initial_quote_without_promo_available
+            ):
                 raise ScenarioError(
-                    f"The required Outcome Sheet price is blank for {title!r}."
+                    f"The required pricebook price is blank for {title!r}."
                 )
 
     def build(
@@ -210,7 +248,7 @@ class ScenarioEngine:
             }
             if not available_segments:
                 raise ScenarioError(
-                    "The Outcome Sheet has no Segment column; segment cannot be changed."
+                    "The pricebook has no Segment column; segment cannot be changed."
                 )
             if target_segment.casefold() not in available_segments:
                 choices = ", ".join(sorted(available_segments))
@@ -232,6 +270,23 @@ class ScenarioEngine:
                 target_segment,
             )
             unit, price_unavailable = self._unit_price(item, target_promo)
+            unavailable_note = price_unavailability_message(item, target_promo)
+            existing_note = (line.note or "").replace(
+                "Selected Outcome Sheet quote is blank; price is unavailable.",
+                "",
+            ).replace(
+                "Selected pricebook quote is blank; price is unavailable.",
+                "",
+            ).replace(
+                "Promotion eligibility confirmation required: the pricebook has a "
+                "promotional quote but no standard quote.",
+                "",
+            ).strip()
+            note = (
+                f"{existing_note} {unavailable_note}".strip()
+                if price_unavailable
+                else (existing_note or None)
+            )
             lines.append(
                 line.model_copy(
                     update={
@@ -244,6 +299,7 @@ class ScenarioEngine:
                         ),
                         "term_duration": item.term_duration,
                         "billing_plan": item.billing_plan,
+                        "note": note,
                     }
                 )
             )
@@ -340,7 +396,7 @@ class ScenarioEngine:
             disposition=MigrationDisposition.ADD,
             decision_required=price_unavailable,
             note=(
-                "Added by seller; selected Outcome Sheet quote is blank"
+                f"Added by seller. {price_unavailability_message(item, scenario.promo_eligible)}"
                 if price_unavailable
                 else "Added by seller"
             ),
@@ -413,7 +469,8 @@ class ScenarioEngine:
         pending = [line.line_id for line in scenario.lines if line.decision_required]
         if pending:
             raise ScenarioError(
-                "Resolve migration decisions before finalizing: " + ", ".join(pending)
+                "Resolve seller decisions or unavailable prices before finalizing: "
+                + ", ".join(pending)
             )
         return scenario.model_copy(
             update={
@@ -432,6 +489,14 @@ class ScenarioEngine:
         if not scenarios:
             raise ScenarioError("At least one scenario is required for comparison.")
         rows: list[ComparisonRow] = []
+        renewal_total = next(
+            (
+                scenario.total_value
+                for scenario in scenarios
+                if scenario.scenario_type == ScenarioType.RENEW_AS_IS
+            ),
+            scenarios[0].total_value,
+        )
         for scenario in scenarios:
             base = sum(
                 (line.extended_price for line in scenario.lines if line.category == "base"),
@@ -453,6 +518,9 @@ class ScenarioEngine:
                     copilot=money(copilot),
                     additional_or_retained=money(additional),
                     total_cost=scenario.total_value,
+                    difference_from_renew_as_is=money(
+                        scenario.total_value - renewal_total
+                    ),
                 )
             )
         scenario_order = {scenario: index for index, scenario in enumerate(ScenarioType)}
@@ -520,13 +588,17 @@ class ScenarioEngine:
                 )
                 unit, price_unavailable = self._unit_price(item, promo_eligible)
                 note = (
-                    "Selected Outcome Sheet quote is blank; price is unavailable."
+                    price_unavailability_message(item, promo_eligible)
                     if price_unavailable
                     else None
                 )
                 if price_unavailable:
                     unresolved.append(
-                        f"{source.line_id}: price is unavailable in the Outcome Sheet."
+                        price_unavailability_decision(
+                            source.line_id,
+                            item,
+                            promo_eligible,
+                        )
                     )
             except ScenarioError as error:
                 item = None
@@ -613,6 +685,11 @@ class ScenarioEngine:
         lines: list[ScenarioLine] = []
         unresolved: list[str] = []
         assumptions: list[str] = []
+        if not self._apply_bundle_rules:
+            assumptions.append(
+                "No add-on bundle entitlement was inferred. Every non-core SKU is "
+                "retained and priced unless the seller explicitly changes it."
+            )
         base_sources: list[int] = []
         copilot_sources: list[int] = []
         for source in estate.lines:
@@ -630,57 +707,64 @@ class ScenarioEngine:
                 disposition = MigrationDisposition.INCLUDED
                 note = "Existing standalone Copilot is represented by the Copilot target line."
             else:
-                suggestion = (
-                    self._migration_seeds.match(source.display_title, scenario_type)
-                    if self._migration_seeds is not None
-                    else None
-                )
-                if suggestion is None:
-                    disposition = MigrationDisposition.NEEDS_DECISION
+                if not self._apply_bundle_rules:
+                    disposition = MigrationDisposition.RETAIN
                     note = (
-                        "The Outcome Sheet contains no entitlement or migration mapping for "
-                        "this SKU; retained and priced until the seller decides."
+                        "Retained unchanged; no add-on bundle entitlement assumption "
+                        "was applied."
                     )
-                elif suggestion.approved:
-                    disposition = suggestion.disposition
-                    verification = (
-                        f" verified={suggestion.verified_date.isoformat()};"
-                        f" source_url={suggestion.source_url};"
-                        if suggestion.verified_date is not None
-                        and suggestion.source_url is not None
-                        else ""
-                    )
-                    target_note = (
-                        f" Replacement target: {definition.base_title}."
-                        if disposition
-                        in {
-                            MigrationDisposition.MIGRATE,
-                            MigrationDisposition.INCLUDED,
-                            MigrationDisposition.REMOVE,
-                        }
-                        else ""
-                    )
-                    note = (
-                        f"Approved migration seed {suggestion.rule_id} applies "
-                        f"{disposition.value}; source={suggestion.source}."
-                        f"{verification}{target_note} {suggestion.rationale}"
-                    ).strip()
                 else:
-                    disposition = MigrationDisposition.NEEDS_DECISION
-                    verification = (
-                        f" verified={suggestion.verified_date.isoformat()};"
-                        f" source_url={suggestion.source_url};"
-                        if suggestion.verified_date is not None
-                        and suggestion.source_url is not None
-                        else ""
+                    suggestion = (
+                        self._migration_seeds.match(source.display_title, scenario_type)
+                        if self._migration_seeds is not None
+                        else None
                     )
-                    note = (
-                        f"Suggested default only: {suggestion.disposition.value} from "
-                        f"{suggestion.rule_id}; source={suggestion.source};"
-                        f"{verification} approved=false. "
-                        "No migration action was auto-applied. "
-                        f"{suggestion.rationale}"
-                    )
+                    if suggestion is None:
+                        disposition = MigrationDisposition.NEEDS_DECISION
+                        note = (
+                            "The pricebook contains no entitlement or migration mapping for "
+                            "this SKU; retained and priced until the seller decides."
+                        )
+                    elif suggestion.approved:
+                        disposition = suggestion.disposition
+                        verification = (
+                            f" verified={suggestion.verified_date.isoformat()};"
+                            f" source_url={suggestion.source_url};"
+                            if suggestion.verified_date is not None
+                            and suggestion.source_url is not None
+                            else ""
+                        )
+                        target_note = (
+                            f" Replacement target: {definition.base_title}."
+                            if disposition
+                            in {
+                                MigrationDisposition.MIGRATE,
+                                MigrationDisposition.INCLUDED,
+                                MigrationDisposition.REMOVE,
+                            }
+                            else ""
+                        )
+                        note = (
+                            f"Approved migration seed {suggestion.rule_id} applies "
+                            f"{disposition.value}; source={suggestion.source}."
+                            f"{verification}{target_note} {suggestion.rationale}"
+                        ).strip()
+                    else:
+                        disposition = MigrationDisposition.NEEDS_DECISION
+                        verification = (
+                            f" verified={suggestion.verified_date.isoformat()};"
+                            f" source_url={suggestion.source_url};"
+                            if suggestion.verified_date is not None
+                            and suggestion.source_url is not None
+                            else ""
+                        )
+                        note = (
+                            f"Suggested default only: {suggestion.disposition.value} from "
+                            f"{suggestion.rule_id}; source={suggestion.source};"
+                            f"{verification} approved=false. "
+                            "No migration action was auto-applied. "
+                            f"{suggestion.rationale}"
+                        )
             price_existing = disposition in {
                 MigrationDisposition.RETAIN,
                 MigrationDisposition.NEEDS_DECISION,
@@ -704,11 +788,15 @@ class ScenarioEngine:
                     unit, price_unavailable = self._unit_price(item, promo_eligible)
                     if price_unavailable:
                         note = (
-                            f"{note or ''} Selected Outcome Sheet quote is blank; "
-                            "price is unavailable."
+                            f"{note or ''} "
+                            f"{price_unavailability_message(item, promo_eligible)}"
                         ).strip()
                         unresolved.append(
-                            f"{source.line_id}: price is unavailable in the Outcome Sheet."
+                            price_unavailability_decision(
+                                source.line_id,
+                                item,
+                                promo_eligible,
+                            )
                         )
                 except ScenarioError as error:
                     price_unavailable = True
@@ -780,7 +868,9 @@ class ScenarioEngine:
         )
         if base_price_unavailable:
             base_requires_confirmation = True
-            unresolved.append("BASE: price is unavailable in the Outcome Sheet.")
+            unresolved.append(
+                price_unavailability_decision("BASE", base_item, promo_eligible)
+            )
         lines.append(
             ScenarioLine(
                 line_id="BASE",
@@ -797,7 +887,11 @@ class ScenarioEngine:
                 category="base",
                 disposition=MigrationDisposition.ADD,
                 decision_required=base_requires_confirmation,
-                note="Target suite",
+                note=(
+                    f"Target suite. {price_unavailability_message(base_item, promo_eligible)}"
+                    if base_price_unavailable
+                    else "Target suite"
+                ),
             )
         )
 
@@ -816,10 +910,17 @@ class ScenarioEngine:
                     )
                     unresolved.append("Confirm the proposed Copilot quantity.")
             else:
-                resolved_copilot_quantity = base_quantity
+                resolved_copilot_quantity = (
+                    base_quantity if self._apply_bundle_rules else 0
+                )
                 assumptions.append(
-                    "No existing standalone Copilot line was found; Copilot defaults to the "
-                    "base-suite quantity and remains independently editable."
+                    "No existing standalone Copilot line was found; Copilot "
+                    + (
+                        "defaults to the base-suite quantity"
+                        if self._apply_bundle_rules
+                        else "defaults to zero"
+                    )
+                    + " and remains independently editable."
                 )
             copilot_item = self._select_price(
                 catalog,
@@ -834,7 +935,13 @@ class ScenarioEngine:
             )
             if copilot_price_unavailable:
                 copilot_requires_confirmation = True
-                unresolved.append("COPILOT: price is unavailable in the Outcome Sheet.")
+                unresolved.append(
+                    price_unavailability_decision(
+                        "COPILOT",
+                        copilot_item,
+                        promo_eligible,
+                    )
+                )
             lines.append(
                 ScenarioLine(
                     line_id="COPILOT",
@@ -851,12 +958,17 @@ class ScenarioEngine:
                     category="copilot",
                     disposition=MigrationDisposition.ADD,
                     decision_required=copilot_requires_confirmation,
-                    note="Copilot quantity is independently editable.",
+                    note=(
+                        "Copilot quantity is independently editable. "
+                        + price_unavailability_message(copilot_item, promo_eligible)
+                        if copilot_price_unavailable
+                        else "Copilot quantity is independently editable."
+                    ),
                 )
             )
         else:
             assumptions.append(
-                "The Outcome Sheet has no field proving that Copilot is included with ME7; "
+                "The pricebook has no field proving that Copilot is included with ME7; "
                 "Copilot is therefore not included or priced automatically."
             )
 
@@ -901,14 +1013,14 @@ class ScenarioEngine:
         ]
         if not matches:
             raise ScenarioError(
-                f"The Outcome Sheet does not contain the required exact product {title!r}."
+                f"The pricebook does not contain the required exact product {title!r}."
             )
         if len(matches) > 1:
             identities = ", ".join(
                 f"{item.product_id}/{item.sku_id}" for item in matches
             )
             raise ScenarioError(
-                f"The Outcome Sheet contains multiple identities for {title!r}: "
+                f"The pricebook contains multiple identities for {title!r}: "
                 f"{identities}."
             )
         match = matches[0]

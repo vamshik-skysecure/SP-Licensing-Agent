@@ -170,6 +170,134 @@ class LicensingOrchestrator:
         assert result is not None
         return result
 
+    async def request_initial_validation(self, sender: str) -> CommercialScenario:
+        result: CommercialScenario | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            if session.estate is None or session.active_scenario is None:
+                raise ScenarioError(
+                    "Upload a licence file and prepare Renew As-Is before validation."
+                )
+            result = session.scenarios.get(session.active_scenario)
+            if result is None:
+                raise ScenarioError("The initial proposal could not be found.")
+            return session.model_copy(
+                update={
+                    "stage": WorkflowStage.AWAITING_INITIAL_VALIDATION,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
+
+    async def confirm_initial_validation(self, sender: str) -> CommercialScenario:
+        result: CommercialScenario | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            if session.stage != WorkflowStage.AWAITING_INITIAL_VALIDATION:
+                raise ScenarioError("There is no initial seller validation awaiting approval.")
+            if session.active_scenario is None:
+                raise ScenarioError("The initial proposal could not be found.")
+            result = session.scenarios.get(session.active_scenario)
+            if result is None:
+                raise ScenarioError("The initial proposal could not be found.")
+            if result.unresolved_decisions or any(
+                line.decision_required for line in result.lines
+            ):
+                raise ScenarioError(
+                    "Resolve unavailable prices and seller decisions before validating "
+                    "the initial analysis."
+                )
+            return session.model_copy(
+                update={
+                    "stage": WorkflowStage.REVIEWING_SCENARIO,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
+
+    async def request_finalization(self, sender: str) -> CommercialScenario:
+        result: CommercialScenario | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            if session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION:
+                raise ScenarioError(
+                    "Validate the initial estate and pricing before finalization."
+                )
+            if session.active_scenario is None:
+                raise ScenarioError("Select a scenario before finalizing it.")
+            result = session.scenarios.get(session.active_scenario)
+            if result is None:
+                raise ScenarioError("The active scenario could not be found.")
+            # Validate readiness without mutating or incrementing the proposal revision.
+            self._scenarios.finalize(result)
+            return session.model_copy(
+                update={
+                    "stage": WorkflowStage.AWAITING_FINAL_VALIDATION,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
+
+    async def confirm_finalization(self, sender: str) -> CommercialScenario:
+        result: CommercialScenario | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            if session.stage != WorkflowStage.AWAITING_FINAL_VALIDATION:
+                raise ScenarioError("There is no final seller validation awaiting approval.")
+            if session.active_scenario is None:
+                raise ScenarioError("Select a scenario before finalizing it.")
+            current = session.scenarios.get(session.active_scenario)
+            if current is None:
+                raise ScenarioError("The active scenario could not be found.")
+            result = self._scenarios.finalize(current)
+            scenarios = dict(session.scenarios)
+            scenarios[session.active_scenario] = result
+            return session.model_copy(
+                update={
+                    "scenarios": scenarios,
+                    "pending_sku_change": None,
+                    "stage": WorkflowStage.FINALIZED,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
+
+    async def cancel_finalization(self, sender: str) -> bool:
+        cancelled = False
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal cancelled
+            cancelled = session.stage == WorkflowStage.AWAITING_FINAL_VALIDATION
+            return session.model_copy(
+                update={
+                    "stage": (
+                        WorkflowStage.REVIEWING_SCENARIO
+                        if cancelled
+                        else session.stage
+                    ),
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        return cancelled
+
     async def edit_quantity(
         self,
         sender: str,
@@ -471,16 +599,86 @@ class LicensingOrchestrator:
             if session.estate is None:
                 raise ScenarioError("Upload a licence file before requesting a comparison.")
             scenarios = dict(session.scenarios)
+            template = (
+                scenarios.get(session.active_scenario)
+                if session.active_scenario is not None
+                else None
+            )
+            template_base_quantity = (
+                max(
+                    (
+                        line.proposed_quantity
+                        for line in template.lines
+                        if line.category == "base"
+                    ),
+                    default=0,
+                )
+                if template is not None
+                else 0
+            )
+            template_copilot_quantity = (
+                max(
+                    (
+                        line.proposed_quantity
+                        for line in template.lines
+                        if line.category == "copilot"
+                    ),
+                    default=0,
+                )
+                if template is not None
+                else 0
+            )
             for scenario_type in ScenarioType:
                 if scenario_type not in scenarios:
-                    scenarios[scenario_type] = self._scenarios.build(
+                    scenario = self._scenarios.build(
                         estate=session.estate,
                         scenario_type=scenario_type,
                         catalog=catalog,
-                        term_duration=self._default_term_duration,
-                        billing_plan=self._default_billing_plan,
-                        segment=self._default_segment,
+                        term_duration=(
+                            template.term_duration
+                            if template is not None
+                            else self._default_term_duration
+                        ),
+                        billing_plan=(
+                            template.billing_plan
+                            if template is not None
+                            else self._default_billing_plan
+                        ),
+                        segment=(
+                            template.segment
+                            if template is not None
+                            else self._default_segment
+                        ),
+                        promo_eligible=(
+                            template.promo_eligible if template is not None else False
+                        ),
+                        base_quantity=(
+                            template_base_quantity
+                            if template_base_quantity > 0
+                            and scenario_type != ScenarioType.RENEW_AS_IS
+                            else None
+                        ),
+                        copilot_quantity=(
+                            template_copilot_quantity
+                            if template_copilot_quantity > 0
+                            and scenario_type
+                            in {
+                                ScenarioType.ME3_COPILOT,
+                                ScenarioType.ME5_COPILOT,
+                            }
+                            else None
+                        ),
                     )
+                    if template is not None:
+                        scenario = self._scenarios.set_discount(
+                            scenario,
+                            template.discount_percentage,
+                        )
+                        scenario = self._scenarios.set_adjustment(
+                            scenario,
+                            template.adjustment_amount,
+                        )
+                    scenarios[scenario_type] = scenario
             ordered = [scenarios[scenario_type] for scenario_type in ScenarioType]
             result = (
                 session.estate,

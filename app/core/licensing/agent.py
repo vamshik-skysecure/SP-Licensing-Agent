@@ -17,11 +17,30 @@ AgentAction = Literal[
     "set_disposition",
     "add_sku",
     "replace_sku",
+    "set_promo",
+    "set_discount",
+    "set_adjustment",
+    "set_term",
+    "set_billing",
+    "set_segment",
+    "set_currency",
+    "confirm_matches",
+    "confirm_sku",
+    "cancel_sku",
     "add_comment",
     "finalize",
+    "confirm_validation",
+    "reject_validation",
     "compare",
     "clarify",
 ]
+
+
+class MatchSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    line_id: str
+    candidate_number: int
 
 
 class AgentIntent(BaseModel):
@@ -44,6 +63,15 @@ class AgentIntent(BaseModel):
     disposition: Literal[
         "retain", "remove", "migrate", "included", "none"
     ]
+    boolean_value: Literal["true", "false", "none"]
+    percentage: float
+    amount: float
+    term_duration: str
+    billing_plan: str
+    segment: str
+    currency: str
+    candidate_number: int
+    match_selections: list[MatchSelection]
     comment: str
     clarification: str
 
@@ -68,7 +96,10 @@ select SKUs, invent migration rules, or claim an action succeeded. The applicati
 and validates every commercial operation after you return the action.
 
 Rules:
-- Use build_scenario for Renew As-Is, ME3 + Copilot, ME5 + Copilot, or ME7.
+- Use build_scenario for Renew As-Is, ME3, ME5, or ME7. Copilot is a separately
+  priced, independently editable quantity and must never be inferred as bundled.
+- In a renewal-only workflow, use build_scenario with renew_as_is only when the seller
+  explicitly asks to rebuild the current renewal proposal. Do not suggest bundle scenarios.
 - quantity is the optional base-suite quantity and copilot_quantity is independent.
 - Use -1 for any quantity that the seller did not state. Never guess a quantity.
 - For set_quantity/set_copilot/add_sku/replace_sku, a stated quantity is mandatory.
@@ -76,11 +107,42 @@ Rules:
   and included.
 - If an add/replace/edit request is ambiguous or missing a required value, use clarify and
   ask one short question in clarification.
+- Use set_promo when the seller confirms or rejects promotion eligibility. boolean_value
+  must be true or false.
+- Use set_discount for a seller-stated discount percentage and set_adjustment for a
+  seller-stated positive or negative monetary adjustment.
+- Use set_term, set_billing, set_segment, and set_currency for those commercial settings.
+- Use confirm_sku with candidate_number for an explicit numbered add/replace SKU choice;
+  use cancel_sku when the seller cancels that pending change.
+- Use confirm_matches when the seller selects numbered candidates for every unresolved
+  uploaded line. Put each line and one-based option number in match_selections.
 - Use add_comment only for an explicit note or assumption.
-- Use help for capability questions and compare/finalize only for explicit requests.
-- Fields irrelevant to the action must use "none", an empty string, or -1.
-- If SKU-match confirmation is requested, use clarify and direct the seller to the pending
-  confirmation choices shown by the application.
+- Use finalize only when the seller explicitly asks to start finalization. The application
+  will show a final validation summary and ask for a second confirmation.
+- Use confirm_validation when the seller explicitly approves the displayed analysis/pricing
+  during awaiting_initial_validation, or explicitly approves finalization during
+  awaiting_final_validation.
+- Use reject_validation when the seller reports that the displayed initial details are
+  incorrect, cancels finalization, or asks to continue editing at a validation gate.
+- A bare "yes" means confirm_validation only when the current stage is one of the two
+  validation stages. Otherwise use clarify.
+- Use help for capability questions and compare only for explicit requests.
+- Fields irrelevant to the action must use "none", an empty string, -1, or -1.0.
+- If the seller has not selected every unresolved uploaded line, use clarify and ask for
+  the remaining choices; never guess a SKU match.
+
+Examples:
+- "Change L2 to 45 licences" -> set_quantity, line_id L2, quantity 45.
+- "Add 20 Power BI Pro licences" -> add_sku, product_query Power BI Pro, quantity 20.
+- "Remove L3" -> set_disposition remove for L3.
+- "The customer is eligible for the promotion" -> set_promo true.
+- "Apply a 5 percent discount" -> set_discount, percentage 5.
+- "Subtract 25000 as a commercial adjustment" -> set_adjustment, amount -25000.
+- "Use annual billing" -> set_billing, billing_plan Annual.
+- "Finalize this proposal" -> finalize.
+- "I confirm the uploaded details and pricing" -> confirm_validation.
+- "Yes, finalize this proposal" while awaiting_final_validation -> confirm_validation.
+- "No, continue editing" -> reject_validation.
 """
 
 

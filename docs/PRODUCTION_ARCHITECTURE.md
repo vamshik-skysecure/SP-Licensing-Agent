@@ -4,7 +4,7 @@
 
 The draft PRD's domain boundaries are retained, but the seven-agent supervisor design is replaced by a deterministic persisted workflow.
 
-This workflow is commercial software: SKU identity, migration action, quantities, prices, discounts, and totals must be reproducible and auditable. The official OpenAI Python SDK and Responses API translate natural language into one validated command, but the model is not an authority for commercial state changes. Buttons and explicit commands remain available as deterministic fallbacks.
+This workflow is commercial software: SKU identity, quantities, prices, discounts, and totals must be reproducible and auditable. The official OpenAI Python SDK and Responses API translate natural language into one validated action, but the model is not an authority for commercial state changes. Deterministic command handlers remain available as operational fallbacks.
 
 The linked `ssp-v2-boilerplate` repository was assessed and is not used as a code base. Its own guide identifies it as an early scaffold with empty prompts/tools, an invalid model wrapper, no graph, no WhatsApp route, no tests, and no production wiring. Its data-contract and acceptance-criteria ideas informed this implementation.
 
@@ -26,14 +26,15 @@ OpenAI Responses API intent adapter (free-form messages only)
 Deterministic licensing workflow
    |               |              |
    v               v              v
-Analysis      Scenario/pricing   PDF renderer
-              engine
+Analysis      Scenario/pricing   Output renderers
+              engine             |-- portrait PNG tables
+                                 +-- detailed PDFs
    |               |
    +---------------+
               |
        Azure Blob JSON state (ETag concurrency)
 
-Azure Blob Storage -> maintained Excel workbook -> Outcome Sheet cache
+Azure Blob Storage -> maintained Excel workbook -> Final Output Sheet cache
 ```
 
 ## Why this differs from the draft PRD
@@ -43,7 +44,7 @@ Azure Blob Storage -> maintained Excel workbook -> Outcome Sheet cache
 - The edit operation must recalculate and persist atomically. That belongs in one application transaction, not a conversation between agents.
 - Service Bus is added because FastAPI background tasks are not durable across process restarts or deployments.
 - Managed Identity is the production default for Azure data services.
-- The rate-card workbook is read directly, so the business can update the Outcome Sheet without coordinating changes with hidden Phase 1 code.
+- The rate-card workbook is read directly, so the business can update the Final Output Sheet without coordinating changes with hidden Phase 1 code.
 
 The intent adapter uses a strict JSON Schema and receives only the seller message plus a
 bounded workflow summary. It never receives the workbook or uploaded file bytes. Its output
@@ -55,8 +56,14 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 
 ### Blob Storage
 
-- One maintained `.xlsx` workbook in a private pricing container.
-- Configured worksheet: `Outcome Sheet`.
+- `STORAGE_MODE=local` selects the checked-in workbook plus in-memory workflow state
+  for local testing. `STORAGE_MODE=azure_blob` selects Blob for both pricing and
+  workflow sessions. The high-level switch is authoritative when set.
+
+- One maintained `.xlsx` workbook in the private `pricing-workbooks` container, with
+  the reviewed active version published as `active/Microsoft_SKU_Active.xlsx`.
+- Current local workbook: `docs/microsoft_sku_v5.xlsx`.
+- Configured worksheet: `Final Output Sheet`.
 - Application caches the parsed catalog for five minutes and records the Blob ETag/content digest as the rate-card version.
 - A separate private workflow container in the same Storage account holds one JSON blob per hashed seller thread.
 - Blob ETags and `If-Match` conditional writes provide optimistic concurrency and prevent lost updates.
@@ -65,7 +72,15 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 
 ### Excel-only commercial authority
 
-- `Outcome Sheet` is the only licensing catalogue and pricing source.
+- `Final Output Sheet` is the licensing catalogue and pricing source.
+- `Partner Best Offer` is the direct seller quote. Promotional rows require explicit
+  seller confirmation of promotion eligibility; they are not reused as standard prices.
+- `WORKFLOW_MODE=upgrade_comparison` is the default. It automatically prepares Renew As-Is,
+  then compares annual P1Y/Annual ME3, ME5, and ME7 upgrades on request.
+- In `upgrade_comparison`, the requested core-suite upgrade is automatic, but every non-core
+  add-on remains separately licensed and priced until the seller explicitly edits it. No
+  migration seed or bundle entitlement is applied.
+- `WORKFLOW_MODE=scenario_comparison` is reserved for a future approved bundling dataset.
 - The required workflow options identify E3, E5, E7, and standalone Copilot by exact title;
   their ProductId, SkuId, term, billing plan, and prices are resolved from the current sheet.
 - `config/migration_seed.json` is a separate, human-maintained advisory layer. Each row
@@ -74,9 +89,9 @@ LangGraph can still be introduced later if genuine long-running human interrupts
   rows remain `approved=false`; provenance improves review context but cannot change a
   disposition. An authorized business reviewer can promote an individual row to explicit
   configuration by setting `approved=true`. No model-generated mapping is accepted at runtime.
-- Exact E3/E5/E7 core-suite rows can safely feed the target base quantity. Every other
-  existing SKU defaults to `needs_decision`, remains priced, and requires an explicit seller
-  action before finalization unless a matching seed row has been explicitly approved.
+- Exact E3/E5/E7 core-suite rows can safely feed the target base quantity. In the default
+  mode, every other existing SKU is retained and priced. The seller can explicitly remove,
+  replace, or reclassify it; no inferred mapping blocks the comparison.
 - The current sheet contains no field proving that ME7 includes Copilot, so the application
   does not make that claim or silently price it as bundled.
 

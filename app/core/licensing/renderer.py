@@ -11,6 +11,7 @@ from .models import (
     CommercialScenario,
     LicenseEstate,
     NormalizedLicenseLine,
+    ScenarioLine,
 )
 
 
@@ -18,36 +19,43 @@ def format_money(value: Decimal, currency: str = "INR") -> str:
     return f"{currency} {value:,.2f}"
 
 
-def format_estate(estate: LicenseEstate) -> str:
+def format_estate(
+    estate: LicenseEstate,
+    *,
+    include_migration_review: bool = True,
+) -> str:
     lines = [
         "*Current licence estate*",
-        f"File: {estate.source_file}",
-        f"Rate card: {estate.rate_card_version}",
-        "",
+        f"Source: {estate.source_file}",
+        f"SKU lines: {len(estate.lines)}",
+        f"Total licences: {sum(item.total_licenses for item in estate.lines):,}",
     ]
+    grouped: dict[str, list[NormalizedLicenseLine]] = defaultdict(list)
     for item in estate.lines:
-        date_value = item.renewal_date or item.expiration_date
-        sku = (
-            f"{item.product_id}/{item.sku_id}"
-            if item.product_id and item.sku_id
-            else "Needs confirmation"
-        )
-        lines.extend(
-            [
-                f"*{item.line_id} · {item.display_title}*",
-                f"SKU: {sku}",
-                f"Total {item.total_licenses:,} | Expired {item.expired_licenses:,} | "
-                f"Renew {item.renewal_quantity:,}",
-                f"Assigned {item.assigned_licenses:,} | Renewal/expiry: {_date(date_value)}",
-                "",
-            ]
-        )
+        grouped[product_family(item.display_title)].append(item)
+    for family in sorted(grouped):
+        lines.extend(("", f"*{family}*"))
+        for item in grouped[family]:
+            date_value = item.renewal_date or item.expiration_date
+            lines.extend(
+                (
+                    "",
+                    f"*{item.line_id} — {item.display_title}*",
+                    f"Total: {item.total_licenses:,} | Assigned: "
+                    f"{item.assigned_licenses:,} | Expired: {item.expired_licenses:,}",
+                    f"Renewal quantity: {item.renewal_quantity:,}",
+                    f"Renewal/expiration: {_date(date_value)}",
+                )
+            )
     if estate.pending_lines:
+        lines.extend(("", "*Attention required*"))
         lines.append(
             f"{len(estate.pending_lines)} SKU matches require confirmation before pricing."
         )
     else:
-        lines.append("Choose a commercial scenario to prepare.")
+        lines.extend(("", "All uploaded SKUs matched the maintained pricebook."))
+        if include_migration_review:
+            lines.append("Choose a commercial scenario to prepare.")
     return "\n".join(lines).strip()
 
 
@@ -63,8 +71,8 @@ def format_pending_matches(estate: LicenseEstate) -> str:
     lines.extend(
         (
             "",
-            "Reply once with every choice, for example:",
-            "/confirm L1=PRODUCT_ID,SKU_ID; L2=PRODUCT_ID,SKU_ID",
+            "Reply naturally with every choice, for example:",
+            "“For L1 choose option 1, and for L2 choose option 2.”",
         )
     )
     return "\n".join(lines)
@@ -82,8 +90,6 @@ def product_family(title: str) -> str:
     normalized = title.casefold()
     rules = (
         ("enterprise mobility + security", "Enterprise Mobility + Security"),
-        ("microsoft 365", "Microsoft 365"),
-        ("office 365", "Office 365"),
         ("dynamics 365", "Dynamics 365"),
         ("power bi", "Power BI"),
         ("power apps", "Power Platform"),
@@ -93,6 +99,8 @@ def product_family(title: str) -> str:
         ("defender", "Microsoft Defender"),
         ("teams", "Microsoft Teams"),
         ("azure", "Azure"),
+        ("microsoft 365", "Microsoft 365"),
+        ("office 365", "Office 365"),
     )
     for marker, family in rules:
         if marker in normalized:
@@ -116,6 +124,7 @@ def estate_line_flags(
     *,
     as_of: date,
     near_expiry_days: int,
+    include_migration_review: bool = True,
 ) -> list[str]:
     flags: list[str] = []
     deadline = line.renewal_date or line.expiration_date
@@ -125,9 +134,12 @@ def estate_line_flags(
         flags.append("Renewal/expiry overdue")
     elif deadline <= as_of + timedelta(days=near_expiry_days):
         flags.append(f"Due within {near_expiry_days} days")
-    review = migration_review_status(line)
-    if review in {"SKU match required", "Seller decision required"}:
-        flags.append(review)
+    if include_migration_review:
+        review = migration_review_status(line)
+        if review in {"SKU match required", "Seller decision required"}:
+            flags.append(review)
+    elif line.match_method == "unresolved":
+        flags.append("SKU match required")
     return flags
 
 
@@ -136,6 +148,7 @@ def render_estate_pdf(
     *,
     as_of: date | None = None,
     near_expiry_days: int = 90,
+    include_migration_review: bool = True,
 ) -> bytes:
     """Render the immediate post-upload estate as a grouped customer-facing PDF."""
     from reportlab.lib import colors
@@ -155,6 +168,7 @@ def render_estate_pdf(
             line,
             as_of=report_date,
             near_expiry_days=near_expiry_days,
+            include_migration_review=include_migration_review,
         ))
         for line in estate.lines
     ]
@@ -214,7 +228,7 @@ def render_estate_pdf(
             "Renew",
             "Assigned",
             "Renewal / expiry",
-            "Migration review",
+            "Migration review" if include_migration_review else "Match status",
         ]]
         for line in sorted(grouped[family], key=lambda item: item.display_title.casefold()):
             sku = (
@@ -231,7 +245,18 @@ def render_estate_pdf(
                 str(line.renewal_quantity),
                 str(line.assigned_licenses),
                 _date(line.renewal_date or line.expiration_date),
-                Paragraph(escape(migration_review_status(line)), styles["BodyText"]),
+                Paragraph(
+                    escape(
+                        migration_review_status(line)
+                        if include_migration_review
+                        else (
+                            "SKU match required"
+                            if line.match_method == "unresolved"
+                            else "Matched"
+                        )
+                    ),
+                    styles["BodyText"],
+                ),
             ])
         story.extend([
             _table(
@@ -252,7 +277,14 @@ def render_estate_pdf(
             ])
         story.append(_table(attention_data, [16 * mm, 95 * mm, 125 * mm]))
     else:
-        story.append(Paragraph("No near-expiry, missing-date, match, or migration-review flags.", styles["Normal"]))
+        story.append(
+            Paragraph(
+                "No near-expiry, missing-date, or match flags."
+                if not include_migration_review
+                else "No near-expiry, missing-date, match, or migration-review flags.",
+                styles["Normal"],
+            )
+        )
 
     document.build(story)
     return output.getvalue()
@@ -263,57 +295,92 @@ def format_scenario(
     currency: str = "INR",
 ) -> str:
     lines = [
-        f"*{scenario.scenario_type.label} · revision {scenario.revision}*",
-        f"Term: {scenario.term_duration} | Billing: {scenario.billing_plan} | "
+        f"*{scenario.scenario_type.label} — Revision {scenario.revision}*",
+        f"Term: {scenario.term_duration}",
+        f"Billing: {scenario.billing_plan}",
         f"Segment: {scenario.segment}",
-        f"Promo pricing: {'on' if scenario.promo_eligible else 'off'}",
+        f"Promotion pricing: {'Applied' if scenario.promo_eligible else 'Not applied'}",
         "",
+        "*Proposed licence configuration*",
     ]
     for item in scenario.lines:
-        decision = " ⚠ decision" if item.decision_required else ""
-        if item.disposition.value in {"migrate", "included", "remove"}:
-            price_status = " · price not applicable"
-        elif item.price_unavailable:
-            price_status = " ⚠ PRICE UNAVAILABLE"
-        elif item.unit_price == 0:
-            price_status = " · no-charge price"
+        lines.extend(("", f"*{item.line_id} — {item.sku_title}*"))
+        lines.append(f"Action: {_scenario_action(item)}")
+        if item.existing_quantity == item.proposed_quantity:
+            lines.append(f"Quantity: {item.proposed_quantity:,}")
         else:
-            price_status = ""
-        lines.extend(
-            [
-                f"*{item.line_id} · {item.sku_title}*{decision}",
-                f"{item.disposition.value} | existing {item.existing_quantity:,} → "
-                f"proposed {item.proposed_quantity:,}",
-                f"{format_money(item.unit_price, currency)} each | "
-                f"{format_money(item.extended_price, currency)}{price_status}",
-            ]
+            lines.append(
+                f"Existing: {item.existing_quantity:,} | "
+                f"Proposed: {item.proposed_quantity:,}"
+            )
+        if item.disposition.value in {"migrate", "included", "remove"}:
+            lines.append("Pricing: Not applicable to this source line")
+        elif item.price_unavailable:
+            lines.append(
+                "Price: Eligibility confirmation required"
+                if _promotion_eligibility_required(item)
+                else "Price: Unavailable — this is not a free product"
+            )
+        elif item.unit_price == 0:
+            lines.append(
+                f"Unit price: {format_money(item.unit_price, currency)} "
+                "(confirmed no-charge)"
+            )
+            lines.append(f"Line total: {format_money(item.extended_price, currency)}")
+        else:
+            lines.append(f"Unit price: {format_money(item.unit_price, currency)}")
+            lines.append(f"Line total: {format_money(item.extended_price, currency)}")
+        lines.append(
+            f"Renewal/expiration: {_date(item.renewal_date or item.expiration_date)}"
         )
-        if item.note:
+        if item.note and item.disposition.value in {
+            "migrate",
+            "included",
+            "remove",
+            "needs_decision",
+        }:
             lines.append(f"Note: {item.note}")
-        lines.append("")
+
+    exceptions: list[str] = []
+    for item in scenario.lines:
+        if item.decision_required:
+            exceptions.append(f"{item.line_id}: seller decision required")
+        if item.price_unavailable:
+            exceptions.append(
+                f"{item.line_id}: promotion eligibility confirmation required"
+                if _promotion_eligibility_required(item)
+                else f"{item.line_id}: price unavailable"
+            )
+        elif item.unit_price == 0 and item.disposition.value not in {
+            "migrate",
+            "included",
+            "remove",
+        }:
+            exceptions.append(f"{item.line_id}: no-charge price")
+    discount_amount = (
+        scenario.subtotal * scenario.discount_percentage / Decimal("100")
+    )
     lines.extend(
         [
+            "",
+            "*Commercial summary*",
             f"Subtotal: {format_money(scenario.subtotal, currency)}",
-            f"Discount: {scenario.discount_percentage}%",
-            f"Adjustments: {format_money(scenario.adjustment_amount, currency)}",
-            f"*Final total: {format_money(scenario.total_value, currency)}*",
+            f"Discount: {scenario.discount_percentage:,.2f}% "
+            f"(-{format_money(discount_amount, currency)})",
+            f"Adjustment: {format_money(scenario.adjustment_amount, currency)}",
+            f"*Final annual total: {format_money(scenario.total_value, currency)}*",
         ]
     )
+    if exceptions:
+        lines.extend(("", "*Line notes*"))
+        lines.extend(f"- {value}" for value in exceptions)
     if scenario.assumptions:
         lines.extend(("", "*Assumptions*"))
         lines.extend(f"- {value}" for value in scenario.assumptions)
     if scenario.unresolved_decisions:
         lines.extend(("", "*Seller decisions required*"))
         lines.extend(f"- {value}" for value in scenario.unresolved_decisions)
-    lines.extend(
-        (
-            "",
-            "Edit commands: /set LINE QTY, /retain LINE, /remove LINE, "
-            "/add PRODUCT | QTY, /replace LINE | PRODUCT | QTY, /copilot QTY, "
-            "/promo on|off, /discount PERCENT, /adjust AMOUNT, /term TERM, "
-            "/billing PLAN, /segment SEGMENT, /currency CODE, /comment TEXT, /finalize",
-        )
-    )
+    lines.extend(("", "Reply with the next change, or choose an action below."))
     return "\n".join(lines)
 
 
@@ -322,23 +389,209 @@ def format_comparison(
     currency: str = "INR",
 ) -> str:
     lines = [
-        "*Commercial comparison*",
+        "*Annual commercial comparison*",
+        f"Currency: {currency}",
+        "All options use a one-year term and annual billing.",
         "",
         f"*Recommended option: {comparison.recommended_scenario.label}*",
         comparison.recommendation_rationale,
     ]
     for row in comparison.rows:
         lines.extend(
-            [
+            (
                 "",
                 f"*{row.scenario_type.label}*",
-                f"Base: {format_money(row.base_licences, currency)}",
+                f"Annual total: *{format_money(row.total_cost, currency)}*",
+                "Difference: "
+                + _comparison_difference(
+                    row.difference_from_renew_as_is,
+                    currency,
+                ),
+                f"Base licences: {format_money(row.base_licences, currency)}",
                 f"Copilot: {format_money(row.copilot, currency)}",
-                f"Additional/retained: {format_money(row.additional_or_retained, currency)}",
-                f"Total: *{format_money(row.total_cost, currency)}*",
-            ]
+                "Additional/retained licences: "
+                f"{format_money(row.additional_or_retained, currency)}",
+            )
         )
+    lines.extend(
+        [
+            "",
+            "No add-on bundle entitlement is assumed; retained add-ons remain "
+            "separately priced unless the seller explicitly changes them.",
+        ]
+    )
     return "\n".join(lines)
+
+
+def _scenario_action(item) -> str:
+    if item.line_id == "BASE":
+        return "Add selected target suite"
+    if item.line_id == "COPILOT":
+        return "Add Copilot separately"
+    return {
+        "retain": "Retain separately",
+        "migrate": "Replace with selected target suite",
+        "included": "Represented by selected target suite",
+        "remove": "Remove",
+        "needs_decision": "Seller decision required",
+        "add": "Add",
+    }[item.disposition.value]
+
+
+def _comparison_difference(value: Decimal, currency: str) -> str:
+    if value == 0:
+        return "Same as Renew As-Is"
+    if value < 0:
+        return f"{format_money(abs(value), currency)} lower than Renew As-Is"
+    return f"{format_money(value, currency)} higher than Renew As-Is"
+
+
+def render_proposal_pdf(
+    estate: LicenseEstate,
+    scenario: CommercialScenario,
+    *,
+    currency: str = "INR",
+) -> bytes:
+    """Render the active renewal proposal without requiring bundle scenarios."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+    output = io.BytesIO()
+    document = SimpleDocTemplate(
+        output,
+        pagesize=landscape(A4),
+        rightMargin=10 * mm,
+        leftMargin=10 * mm,
+        topMargin=10 * mm,
+        bottomMargin=10 * mm,
+        title="SP/SSP Licensing Renewal Proposal",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ProposalTitle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#17365D"),
+    )
+    detail_style = ParagraphStyle(
+        "ProposalDetail",
+        parent=styles["BodyText"],
+        fontSize=6,
+        leading=7,
+        spaceAfter=0,
+        spaceBefore=0,
+    )
+    story: list[object] = [
+        Paragraph("SP/SSP Licensing Renewal Proposal", title_style),
+        Spacer(1, 3 * mm),
+        Paragraph(f"Source file: {escape(estate.source_file)}", styles["Normal"]),
+        Paragraph(f"Rate-card version: {escape(estate.rate_card_version)}", styles["Normal"]),
+        Paragraph(
+            f"Revision: {scenario.revision} | Status: {scenario.status.value} | "
+            f"Term: {escape(scenario.term_duration)} | "
+            f"Billing: {escape(scenario.billing_plan)} | "
+            f"Segment: {escape(scenario.segment)}",
+            styles["Normal"],
+        ),
+        Spacer(1, 5 * mm),
+        Paragraph("Proposed licence configuration", styles["Heading2"]),
+    ]
+
+    detail: list[list[object]] = [[
+        "Line",
+        "Product",
+        "Action",
+        "Existing",
+        "Proposed",
+        "Licence term",
+        "Billing plan",
+        "Renewal / expiration",
+        "Unit price",
+        "Extended",
+        "Price status / replacement note",
+    ]]
+    for line in scenario.lines:
+        if line.disposition.value in {"migrate", "included", "remove"}:
+            price_status = "Not applicable"
+        elif line.price_unavailable:
+            price_status = (
+                "ELIGIBILITY REQUIRED"
+                if _promotion_eligibility_required(line)
+                else "PRICE UNAVAILABLE"
+            )
+        elif line.unit_price == 0:
+            price_status = "No-charge price"
+        else:
+            price_status = "Priced"
+        note = f"{price_status}. {line.note}" if line.note else price_status
+        detail.append([
+            line.line_id,
+            Paragraph(escape(line.sku_title), detail_style),
+            line.disposition.value,
+            str(line.existing_quantity),
+            str(line.proposed_quantity),
+            line.term_duration,
+            line.billing_plan,
+            _date(line.renewal_date or line.expiration_date),
+            format_money(line.unit_price, currency),
+            format_money(line.extended_price, currency),
+            Paragraph(escape(note), detail_style),
+        ])
+    story.extend([
+        _table(
+            detail,
+            [
+                12 * mm,
+                48 * mm,
+                18 * mm,
+                15 * mm,
+                16 * mm,
+                19 * mm,
+                21 * mm,
+                27 * mm,
+                25 * mm,
+                27 * mm,
+                49 * mm,
+            ],
+            font_size=6,
+            cell_padding=2,
+        ),
+        Spacer(1, 5 * mm),
+        Paragraph("Commercial summary", styles["Heading2"]),
+    ])
+    discount_amount = scenario.subtotal * scenario.discount_percentage / Decimal("100")
+    story.append(
+        _table(
+            [
+                ["Commercial field", "Value"],
+                ["Subtotal", format_money(scenario.subtotal, currency)],
+                ["Discount percentage", f"{scenario.discount_percentage:,.2f}%"],
+                ["Discount amount", format_money(discount_amount, currency)],
+                ["Adjustment amount", format_money(scenario.adjustment_amount, currency)],
+                ["Final total", format_money(scenario.total_value, currency)],
+            ],
+            [60 * mm, 60 * mm],
+        )
+    )
+
+    story.extend((Spacer(1, 4 * mm), Paragraph("Unresolved decisions", styles["Heading3"])))
+    if scenario.unresolved_decisions:
+        for decision in scenario.unresolved_decisions:
+            story.append(Paragraph(f"- {escape(decision)}", styles["Normal"]))
+    else:
+        story.append(Paragraph("None", styles["Normal"]))
+
+    if scenario.comments or scenario.assumptions:
+        story.append(Paragraph("Comments and assumptions", styles["Heading3"]))
+        for value in [*scenario.comments, *scenario.assumptions]:
+            story.append(Paragraph(f"- {escape(value)}", styles["Normal"]))
+
+    document.build(story)
+    return output.getvalue()
 
 
 def render_comparison_pdf(
@@ -421,7 +674,14 @@ def render_comparison_pdf(
         ]
     )
 
-    comparison_data = [["Scenario", "Base", "Copilot", "Additional / Retained", "Total"]]
+    comparison_data = [[
+        "Scenario",
+        "Base",
+        "Copilot",
+        "Additional / Retained",
+        "Annual total",
+        "Difference vs Renew As-Is",
+    ]]
     for row in comparison.rows:
         comparison_data.append(
             [
@@ -430,12 +690,16 @@ def render_comparison_pdf(
                 format_money(row.copilot, currency),
                 format_money(row.additional_or_retained, currency),
                 format_money(row.total_cost, currency),
+                format_money(row.difference_from_renew_as_is, currency),
             ]
         )
     story.extend(
         [
             Paragraph("Scenario comparison", styles["Heading2"]),
-            _table(comparison_data, [48 * mm, 43 * mm, 43 * mm, 56 * mm, 43 * mm]),
+            _table(
+                comparison_data,
+                [42 * mm, 35 * mm, 35 * mm, 48 * mm, 42 * mm, 42 * mm],
+            ),
         ]
     )
 
@@ -458,7 +722,11 @@ def render_comparison_pdf(
             if line.disposition.value in {"migrate", "included", "remove"}:
                 price_status = "Not applicable"
             elif line.price_unavailable:
-                price_status = "PRICE UNAVAILABLE"
+                price_status = (
+                    "ELIGIBILITY REQUIRED"
+                    if _promotion_eligibility_required(line)
+                    else "PRICE UNAVAILABLE"
+                )
             elif line.unit_price == 0:
                 price_status = "No-charge price"
             else:
@@ -565,3 +833,9 @@ def _table(
 
 def _date(value: date | None) -> str:
     return value.isoformat() if value else "Not supplied"
+
+
+def _promotion_eligibility_required(line: ScenarioLine) -> bool:
+    return line.price_unavailable and "promotion eligibility confirmation required" in (
+        line.note or ""
+    ).casefold()

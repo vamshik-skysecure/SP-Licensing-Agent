@@ -7,7 +7,9 @@ from httpx import AsyncClient, HTTPStatusError, RequestError
 from app.config import get_logger
 from app.schema.whatsapp import (
     DocumentContent,
+    ImageContent,
     WhatsAppDocumentMessage,
+    WhatsAppImageMessage,
     WhatsAppInteractiveMessage,
     WhatsAppTextMessage,
 )
@@ -93,7 +95,8 @@ class WhatsAppClient:
         self,
         message: WhatsAppTextMessage
         | WhatsAppInteractiveMessage
-        | WhatsAppDocumentMessage,
+        | WhatsAppDocumentMessage
+        | WhatsAppImageMessage,
     ) -> dict[str, Any]:
         started_at = perf_counter()
         logger.info("WhatsApp API send request started type=%s", message.type)
@@ -160,6 +163,50 @@ class WhatsAppClient:
         content_type: str = "application/pdf",
         caption: str | None = None,
     ) -> dict[str, Any]:
+        media_id = await self._upload_media(
+            content=content,
+            filename=filename,
+            content_type=content_type,
+        )
+        return await self.send_message(
+            WhatsAppDocumentMessage(
+                to=to,
+                document=DocumentContent(
+                    id=media_id,
+                    filename=filename,
+                    caption=caption,
+                ),
+            )
+        )
+
+    async def send_image(
+        self,
+        *,
+        to: str,
+        content: bytes,
+        filename: str,
+        content_type: str = "image/png",
+        caption: str | None = None,
+    ) -> dict[str, Any]:
+        media_id = await self._upload_media(
+            content=content,
+            filename=filename,
+            content_type=content_type,
+        )
+        return await self.send_message(
+            WhatsAppImageMessage(
+                to=to,
+                image=ImageContent(id=media_id, caption=caption),
+            )
+        )
+
+    async def _upload_media(
+        self,
+        *,
+        content: bytes,
+        filename: str,
+        content_type: str,
+    ) -> str:
         try:
             response = await self._http_client.post(
                 self._media_upload_url,
@@ -176,6 +223,7 @@ class WhatsAppClient:
                     status_code=response.status_code,
                     response_body=response.text,
                 )
+            return media_id
         except HTTPStatusError as error:
             if self._is_auth_error(error.response):
                 self._credentials_valid = False
@@ -195,17 +243,6 @@ class WhatsAppClient:
                 status_code=response.status_code,
                 response_body=response.text,
             ) from error
-
-        return await self.send_message(
-            WhatsAppDocumentMessage(
-                to=to,
-                document=DocumentContent(
-                    id=media_id,
-                    filename=filename,
-                    caption=caption,
-                ),
-            )
-        )
 
     async def download_media(
         self,

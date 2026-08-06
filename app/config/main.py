@@ -24,13 +24,21 @@ class Settings(BaseSettings):
     whatsapp_seller_allowlist: str = ""
     whatsapp_validate_credentials_on_startup: bool = True
 
+    # Preferred high-level switch. When omitted, the individual backend
+    # settings below remain authoritative for backward compatibility.
+    storage_mode: Literal["local", "azure_blob"] | None = None
+    workflow_mode: Literal[
+        "renewal_only",
+        "upgrade_comparison",
+        "scenario_comparison",
+    ] = "upgrade_comparison"
     rate_card_backend: Literal["local", "azure_blob"] = "local"
-    rate_card_local_path: Path = Path("docs/blob_storage.xlsx")
-    rate_card_sheet_name: str = "Outcome Sheet"
+    rate_card_local_path: Path = Path("docs/microsoft_sku_v5.xlsx")
+    rate_card_sheet_name: str = "Final Output Sheet"
     rate_card_storage_account_url: str | None = None
     rate_card_storage_connection_string: str | None = None
     rate_card_container_name: str = "pricing-workbooks"
-    rate_card_blob_name: str = "blob_storage.xlsx"
+    rate_card_blob_name: str = "active/Microsoft_SKU_Active.xlsx"
 
     workflow_store_backend: Literal["memory", "azure_blob"] = "memory"
     workflow_blob_container_name: str = "licensing-workflows"
@@ -69,6 +77,22 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_backends(self) -> "Settings":
+        if self.storage_mode == "local":
+            self.rate_card_backend = "local"
+            self.workflow_store_backend = "memory"
+        elif self.storage_mode == "azure_blob":
+            self.rate_card_backend = "azure_blob"
+            self.workflow_store_backend = "azure_blob"
+
+        if self.workflow_mode == "upgrade_comparison" and (
+            self.default_term_duration.casefold() != "p1y"
+            or self.default_billing_plan.casefold() != "annual"
+        ):
+            raise ValueError(
+                "Upgrade comparison requires DEFAULT_TERM_DURATION=P1Y and "
+                "DEFAULT_BILLING_PLAN=Annual."
+            )
+
         if self.rate_card_backend == "azure_blob" and not (
             self.rate_card_storage_connection_string
             or self.rate_card_storage_account_url

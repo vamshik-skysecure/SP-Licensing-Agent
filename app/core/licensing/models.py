@@ -25,8 +25,8 @@ class ScenarioType(StrEnum):
     def label(self) -> str:
         return {
             self.RENEW_AS_IS: "Renew As-Is",
-            self.ME3_COPILOT: "ME3 + Copilot",
-            self.ME5_COPILOT: "ME5 + Copilot",
+            self.ME3_COPILOT: "ME3",
+            self.ME5_COPILOT: "ME5",
             self.ME7: "ME7",
         }[self]
 
@@ -57,15 +57,27 @@ class RateCardItem(BaseModel):
     product_id: str
     sku_id: str
     sku_title: str
+    contract_type: str | None = None
     term_duration: str
     billing_plan: str
     segment: str | None = None
     erp_price: Money
     catalogue_price: Money
+    promo_name: str | None = None
     promo_percentage: Money = Decimal("0")
+    customer_eligibility: str | None = None
+    new_to_microsoft_required: str | None = None
+    minimum_seats: int | None = Field(default=None, ge=0)
+    maximum_seats: int | None = Field(default=None, ge=0)
+    geography: str | None = None
     net_to_ms: Money = Decimal("0")
     partner_price_with_promo: Money = Decimal("0")
     partner_price_without_promo: Money = Decimal("0")
+    distributor_landing_price: Money = Decimal("0")
+    partner_landing_price: Money = Decimal("0")
+    partner_cost: Money = Decimal("0")
+    partner_best_offer: Money = Decimal("0")
+    marketplace_price: Money = Decimal("0")
     initial_quote_with_promo: Money
     initial_quote_without_promo: Money
     initial_quote_with_promo_available: bool = True
@@ -204,7 +216,10 @@ class WorkflowStage(StrEnum):
     AWAITING_UPLOAD = "awaiting_upload"
     AWAITING_MATCH_CONFIRMATION = "awaiting_match_confirmation"
     AWAITING_SCENARIO = "awaiting_scenario"
+    AWAITING_INITIAL_VALIDATION = "awaiting_initial_validation"
     REVIEWING_SCENARIO = "reviewing_scenario"
+    AWAITING_FINAL_VALIDATION = "awaiting_final_validation"
+    FINALIZED = "finalized"
 
 
 class WorkflowSession(BaseModel):
@@ -229,6 +244,7 @@ class ComparisonRow(BaseModel):
     copilot: Money
     additional_or_retained: Money
     total_cost: Money
+    difference_from_renew_as_is: Money = Decimal("0")
 
 
 class CommercialComparison(BaseModel):

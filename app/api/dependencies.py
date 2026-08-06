@@ -105,18 +105,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         match_threshold=settings.sku_match_threshold,
     )
     migration_seeds = MigrationSeedCatalog.load(settings.migration_seed_path)
-    scenario_engine = ScenarioEngine(migration_seeds)
-    catalog = await rate_cards.get()
-    scenario_engine.validate_catalog(
-        catalog,
-        term_duration=settings.default_term_duration,
-        billing_plan=settings.default_billing_plan,
-        segment=settings.default_customer_segment,
+    scenario_engine = ScenarioEngine(
+        migration_seeds,
+        apply_bundle_rules=settings.workflow_mode == "scenario_comparison",
     )
+    catalog = await rate_cards.get()
+    if settings.workflow_mode in {"upgrade_comparison", "scenario_comparison"}:
+        scenario_engine.validate_catalog(
+            catalog,
+            term_duration=settings.default_term_duration,
+            billing_plan=settings.default_billing_plan,
+            segment=settings.default_customer_segment,
+        )
     logger.info(
-        "Outcome Sheet validated version=%s rows=%s migration_seed_rules=%s approved=%s",
+        "Rate card validated version=%s rows=%s workflow_mode=%s "
+        "migration_seed_rules=%s approved=%s",
         catalog.version,
         len(catalog.items),
+        settings.workflow_mode,
         len(migration_seeds.rules),
         sum(rule.approved for rule in migration_seeds.rules),
     )
@@ -143,6 +149,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             seller_allowlist=settings.seller_allowlist,
             max_document_bytes=settings.max_document_bytes,
             currency=settings.default_currency,
+            workflow_mode=settings.workflow_mode,
         ),
         intent_interpreter=intent_interpreter,
     )
