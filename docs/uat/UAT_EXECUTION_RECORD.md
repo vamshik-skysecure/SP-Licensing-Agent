@@ -27,8 +27,8 @@
 | UAT-06 | Mobile estate table image | Portrait PNG; full wrapped names; no horizontal scrolling or truncation | | |
 | UAT-07 | Estate PDF | PDF received as WhatsApp document with dates/flags | | |
 | UAT-08 | Automatic renewal | Renew As-Is prepared without bundle selection | | |
-| UAT-09 | Promo safety | Promo-only E3 price unavailable until eligibility confirmed | | |
-| UAT-10 | Initial seller validation gate | Edits/compare blocked until seller confirms refreshed analysis and pricing | | |
+| UAT-09 | Promo safety | Promo price is provisional and locked before seller validation | | |
+| UAT-10 | Initial seller validation gate | One approval attests estate/pricing accuracy and promotion eligibility; edits blocked before it | | |
 | UAT-11 | Natural quantity edit | `Change L1 to 120 licences` recalculates immediately | | |
 | UAT-12 | Natural add/remove/replace | Requested line changes applied or safely confirmed | | |
 | UAT-13 | Discount/adjustment | Five percent and -25,000 reflected in total | | |

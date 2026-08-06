@@ -80,17 +80,12 @@ Evidence is written under `artifacts/uat/`.
 3. Confirm the inline portrait table image is grouped by family, shows complete wrapped
    product names without truncation, and remains legible without horizontal scrolling.
    Confirm the estate PDF shows five exact matches and renewal dates.
-4. Confirm Renew As-Is is prepared automatically.
-5. Reply naturally:
+4. Confirm Renew As-Is is prepared automatically with provisional promotional pricing.
+5. Confirm the estate, pricing, and customer promotion eligibility together by choosing
+   `Confirm details` or replying `I confirm the analysis, pricing, and promotion eligibility`.
+   Verify edits remain blocked before this single approval.
 
-```text
-The customer is eligible for the new-to-Microsoft promotion.
-```
-
-6. Confirm the refreshed estate and Renew As-Is pricing by choosing `Confirm details` or
-   replying `I confirm the analysis and pricing`. Verify edits remain blocked before this.
-
-7. Exercise seller edits and immediate recalculation in natural language:
+6. Exercise seller edits and immediate recalculation in natural language:
 
 ```text
 Change L1 to 120 licences.
@@ -99,15 +94,15 @@ Subtract INR 25,000 as a commercial adjustment.
 Add the comment: Synthetic UAT only; final approval pending.
 ```
 
-8. Say `Compare the annual options`.
-9. Confirm Renew As-Is, ME3, ME5, and ME7 all use `P1Y` / `Annual`; each non-core add-on
+7. Say `Compare the annual options`.
+8. Confirm Renew As-Is, ME3, ME5, and ME7 all use `P1Y` / `Annual`; each non-core add-on
    is retained with no bundle-entitlement assumption; and the inline comparison table image
    shows each option's difference from Renew As-Is.
-10. Confirm `licensing-commercial-comparison.pdf` is received as a WhatsApp document.
-11. Select and edit any option if required, then say `Finalize the proposal`.
-12. Verify no final proposal PDF arrives yet. Review the validation summary and choose
+9. Confirm `licensing-commercial-comparison.pdf` is received as a WhatsApp document.
+10. Select and edit any option if required, then say `Finalize the proposal`.
+11. Verify no final proposal PDF arrives yet. Review the validation summary and choose
     `Confirm & finalize` or reply `Yes, finalize this proposal`.
-13. Confirm the final PDF arrives only after that approval, then record message IDs,
+12. Confirm the final PDF arrives only after that approval, then record message IDs,
     timestamps, totals and PDF hashes in the execution record.
 
 If a displayed line ID differs, use the line ID returned by the agent rather than

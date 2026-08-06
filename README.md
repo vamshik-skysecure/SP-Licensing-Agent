@@ -62,9 +62,10 @@ operational fallbacks but are not presented as the primary seller experience.
   provenance, but every seed remains `approved: false`; unapproved rows are displayed as
   suggestions and never auto-applied.
 - `Partner Best Offer` is the direct seller quote from Microsoft SKU V5.0. Promo-labelled
-  rows are available only after the seller confirms eligibility; they are never silently
-  treated as standard prices. `Price on Marketplace` is retained as workbook metadata and
-  is not substituted for the direct offer.
+  rows are shown provisionally inside the locked initial-review stage. The seller's single
+  `Confirm details` approval explicitly validates both the analysis and customer eligibility;
+  only then are edits and comparisons enabled. Promo prices are never treated as standard
+  prices. `Price on Marketplace` is retained as workbook metadata and is not substituted.
 - The workbook has no entitlement or migration-map columns. Therefore, the default mode
   retains all non-core add-ons, and ME7 never claims Copilot is bundled unless that fact is
   added to an authoritative future workbook schema.

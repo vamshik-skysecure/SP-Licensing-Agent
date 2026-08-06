@@ -23,13 +23,14 @@ exact ProductId/SkuId values from the maintained `Final Output Sheet`.
 This is intentional and should be presented as a commercial safety feature, not a defect.
 In Microsoft SKU V5.0, `Final Output Sheet` row 1,978 provides a promotional annual price
 for Microsoft 365 E3 but no standard non-promotional price. The ME5 and ME7 target rows are
-also promotion-only. The agent therefore refuses to invent a price or silently assume that
-the customer is eligible.
+also promotion-only. The agent shows this pricing provisionally inside a locked validation
+stage; the seller's single validation explicitly attests customer eligibility before any
+editing or comparison is enabled.
 
 Do not replace E3 in the synthetic file merely to hide this control. Removing the core-suite
 line would make the upgrade seat base ambiguous and would not remove the ME3/ME5/ME7
-promotion requirement. Instead, demonstrate that one seller confirmation immediately
-unlocks deterministic pricing for all four options.
+promotion requirement. Instead, demonstrate that one seller confirmation validates the
+estate, pricing, and promotion eligibility for all four options.
 
 ## Pre-demo checklist
 
@@ -80,22 +81,18 @@ CEO talk track:
 > calculates renewable quantities, presents a phone-friendly table, and creates a formal
 > PDF without the seller navigating the workbook.
 
-### 3. Demonstrate promotion governance
+### 3. Demonstrate provisional promotion governance
 
-Point out that E3 says eligibility is required rather than showing an invented zero-price
-commercial recommendation. Then send:
-
-```text
-The customer is eligible for the new-to-Microsoft promotion.
-```
-
-Show the revised table and populated E3 amount.
+Point out that the E3 promotional amount is already displayed, but the proposal remains in
+a locked seller-validation stage. The table is provisional and cannot yet be edited or
+compared.
 
 CEO talk track:
 
 > The maintained workbook has a promotional E3 quote but no standard quote. The advisor
-> stops for an explicit seller decision, then reprices immediately from the real row. The
-> language model never decides eligibility or calculates the amount.
+> can display that real row provisionally, but the seller must attest eligibility as part of
+> the initial validation before any operation is enabled. The language model never decides
+> eligibility or calculates the amount.
 
 ### 4. Record the initial seller validation
 
@@ -108,13 +105,14 @@ Apply a 5 percent discount.
 Show that the operation is blocked. Then choose `Confirm details` or send:
 
 ```text
-I confirm the uploaded licence details and initial pricing.
+I confirm the uploaded licence details, initial pricing, and promotion eligibility.
 ```
 
 CEO talk track:
 
 > Upload and automated pricing do not immediately grant permission to modify the proposal.
-> The seller explicitly validates the SKU matches, quantities, dates, prices, and total.
+> The seller explicitly validates the SKU matches, quantities, dates, prices, total, and
+> promotion eligibility in one approval.
 > That approval is persisted before editing and comparison are enabled.
 
 ### 5. Demonstrate immediate quantity recalculation
@@ -193,8 +191,8 @@ section, and totals.
 ## Extended controls journey
 
 Perform this section only when additional operational depth is useful. Begin with a fresh
-upload, repeat the promotion confirmation, and confirm the initial validation so the
-extended flow is isolated and easy to explain.
+upload and confirm the combined initial validation so the extended flow is isolated and
+easy to explain.
 
 ### 9. Add a new SKU by exact maintained title
 
@@ -250,14 +248,8 @@ Prepare ME5:
 Prepare the ME5 option with 25 Copilot licences.
 ```
 
-Because a newly prepared option is an independent proposal, confirm eligibility for that
-option when prompted:
-
-```text
-The customer is eligible for the new-to-Microsoft promotion.
-```
-
-Then send:
+The newly prepared option inherits the promotion eligibility already validated by the
+seller. Then send:
 
 ```text
 Set Copilot to 30 licences.

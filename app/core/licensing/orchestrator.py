@@ -134,7 +134,7 @@ class LicensingOrchestrator:
         *,
         base_quantity: int | None = None,
         copilot_quantity: int | None = None,
-        promo_eligible: bool = False,
+        promo_eligible: bool | None = None,
     ) -> CommercialScenario:
         catalog = await self._rate_cards.get()
         result: CommercialScenario | None = None
@@ -143,6 +143,13 @@ class LicensingOrchestrator:
             nonlocal result
             if session.estate is None:
                 raise ScenarioError("Upload a licence file before building a scenario.")
+            inherited_promo = (
+                session.scenarios[session.active_scenario].promo_eligible
+                if promo_eligible is None
+                and session.active_scenario is not None
+                and session.active_scenario in session.scenarios
+                else False
+            )
             result = self._scenarios.build(
                 estate=session.estate,
                 scenario_type=scenario_type,
@@ -150,7 +157,9 @@ class LicensingOrchestrator:
                 term_duration=self._default_term_duration,
                 billing_plan=self._default_billing_plan,
                 segment=self._default_segment,
-                promo_eligible=promo_eligible,
+                promo_eligible=(
+                    promo_eligible if promo_eligible is not None else inherited_promo
+                ),
                 base_quantity=base_quantity,
                 copilot_quantity=copilot_quantity,
             )

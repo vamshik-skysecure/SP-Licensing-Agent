@@ -67,8 +67,9 @@ Upload the customer's .csv or .xlsx licence file. I will return:
 3. An editable annual renewal proposal using the maintained pricebook.
 4. An annual comparison of Renew As-Is, ME3, ME5, and ME7 on request.
 
-I ask the seller to validate the uploaded estate and initial pricing before edits or
-comparisons are enabled. Finalization also requires a separate seller confirmation.
+I ask the seller to validate the uploaded estate, initial pricing, and promotion eligibility
+in one approval before edits or comparisons are enabled. Finalization requires a separate
+seller confirmation.
 
 Then speak naturally. Examples:
 - "Compare the annual ME3, ME5, and ME7 upgrades."
@@ -732,12 +733,16 @@ class WhatsAppWebhookService:
             scenario = await self._orchestrator.build_scenario(
                 sender,
                 ScenarioType.RENEW_AS_IS,
+                # The pricebook's enterprise-suite rows are promotion-only. Pricing is
+                # provisional until the explicit initial seller-validation gate below.
+                promo_eligible=True,
             )
             await self._orchestrator.request_initial_validation(sender)
             await self._send_text(
                 sender,
                 "I prepared the initial Renew As-Is analysis and pricing. Review the "
                 "SKU matches, quantities, renewal dates, prices, and annual total. "
+                "Promotional pricing is provisional until you confirm customer eligibility. "
                 "Seller validation is required before edits or comparisons are enabled.",
             )
             await self._send_scenario(sender, scenario)
@@ -1011,14 +1016,15 @@ class WhatsAppWebhookService:
         body = (
             "*Seller validation required*\n\n"
             "Review the uploaded SKUs, quantities, renewal dates, pricing, and annual "
-            "total. "
+            "total. By confirming, you also attest that the customer is eligible for "
+            "the displayed new-to-Microsoft promotional pricing. "
             + (
                 "Resolve every item marked as requiring eligibility or a seller decision "
                 "before confirming. "
                 if unresolved
                 else "No unresolved pricing decisions remain. "
             )
-            + "Confirm only when the displayed analysis is correct."
+            + "Confirm only when the analysis and promotion eligibility are correct."
         )
         await self._send_interactive(
             sender,
@@ -1052,7 +1058,8 @@ class WhatsAppWebhookService:
             await self._send_text(
                 sender,
                 "Seller validation recorded for the uploaded estate and initial "
-                "Renew As-Is pricing. Edits and annual comparisons are now enabled.",
+                "Renew As-Is pricing, including promotion eligibility. Edits and annual "
+                "comparisons are now enabled.",
             )
             await self._send_scenario(sender, scenario)
             return

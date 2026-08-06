@@ -16,7 +16,7 @@ from app.core.licensing.rate_card import (
     RateCardProvider,
     parse_rate_card,
 )
-from app.core.licensing.renderer import format_comparison, format_scenario
+from app.core.licensing.renderer import format_comparison
 from app.core.licensing.scenarios import ScenarioEngine
 from app.core.licensing.store import InMemoryWorkflowStore
 from app.core.whatsapp import WhatsAppMedia
@@ -233,32 +233,28 @@ class RenewalOnlyWhatsAppTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("licensing|validate_initial|confirm", validation_ids)
         self.assertIn("licensing|validate_initial|reject", validation_ids)
+        validation_bodies = [
+            message.interactive.body.text
+            for message in client.messages
+            if getattr(message, "type", None) == "interactive"
+            and getattr(getattr(message, "interactive", None), "type", None) == "button"
+            and any(
+                button.reply.id == "licensing|validate_initial|confirm"
+                for button in message.interactive.action.buttons
+            )
+        ]
+        self.assertTrue(
+            any("attest" in body and "promotional pricing" in body for body in validation_bodies)
+        )
 
         session = await orchestrator.get_session("911234567890")
         assert session is not None and session.active_scenario is not None
         self.assertEqual(session.active_scenario, ScenarioType.RENEW_AS_IS)
         initial = session.scenarios[ScenarioType.RENEW_AS_IS]
-        self.assertIn(
-            "L1: confirm promotion eligibility before pricing.",
-            initial.unresolved_decisions,
-        )
-        self.assertIn("Eligibility confirmation required", format_scenario(initial))
-        self.assertIn(
-            "promotional quote but no standard quote",
-            next(line for line in initial.lines if line.line_id == "L1").note,
-        )
-
-        interpreter.intent = _intent("set_promo", boolean_value="true")
-        await service._handle_text(
-            "911234567890",
-            "The customer is eligible for the new-to-Microsoft promotion",
-        )
-        session = await orchestrator.get_session("911234567890")
-        assert session is not None
-        eligible = session.scenarios[ScenarioType.RENEW_AS_IS]
-        self.assertTrue(eligible.promo_eligible)
-        self.assertEqual(eligible.unresolved_decisions, [])
-        before = eligible.total_value
+        self.assertTrue(initial.promo_eligible)
+        self.assertEqual(initial.unresolved_decisions, [])
+        self.assertFalse(next(line for line in initial.lines if line.line_id == "L1").price_unavailable)
+        before = initial.total_value
 
         interpreter.intent = _intent("set_discount", percentage=5)
         with self.assertRaisesRegex(ValueError, "Seller validation is required"):
@@ -348,6 +344,23 @@ class AnnualUpgradeComparisonTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.store.close()
         await self.provider.close()
+
+    async def test_later_scenario_inherits_validated_promotion_eligibility(self) -> None:
+        await self.orchestrator.build_scenario(
+            self.sender,
+            ScenarioType.RENEW_AS_IS,
+            promo_eligible=True,
+        )
+
+        me5 = await self.orchestrator.build_scenario(
+            self.sender,
+            ScenarioType.ME5_COPILOT,
+        )
+
+        self.assertTrue(me5.promo_eligible)
+        base = next(line for line in me5.lines if line.line_id == "BASE")
+        self.assertFalse(base.price_unavailable)
+        self.assertNotIn("BASE: confirm promotion eligibility before pricing.", me5.unresolved_decisions)
 
     async def test_comparison_retains_addons_without_bundle_inference(self) -> None:
         await self.orchestrator.build_scenario(
