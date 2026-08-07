@@ -362,7 +362,7 @@ class AnnualUpgradeComparisonTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(base.price_unavailable)
         self.assertNotIn("BASE: confirm promotion eligibility before pricing.", me5.unresolved_decisions)
 
-    async def test_comparison_retains_addons_without_bundle_inference(self) -> None:
+    async def test_comparison_preserves_independent_proposal_edits_without_bundle_inference(self) -> None:
         await self.orchestrator.build_scenario(
             self.sender,
             ScenarioType.RENEW_AS_IS,
@@ -385,10 +385,11 @@ class AnnualUpgradeComparisonTests(unittest.IsolatedAsyncioTestCase):
         for scenario in scenarios:
             self.assertEqual(scenario.term_duration, "P1Y")
             self.assertEqual(scenario.billing_plan, "Annual")
-            self.assertTrue(scenario.promo_eligible)
+        self.assertTrue(scenarios[0].promo_eligible)
+        self.assertTrue(all(not scenario.promo_eligible for scenario in scenarios[1:]))
         for scenario in scenarios[1:]:
             base = next(line for line in scenario.lines if line.line_id == "BASE")
-            self.assertEqual(base.proposed_quantity, 121)
+            self.assertNotEqual(base.proposed_quantity, 121)
             retained = [
                 line
                 for line in scenario.lines

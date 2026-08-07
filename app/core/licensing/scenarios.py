@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Literal
 from uuid import uuid4
 
 from .migration_rules import MigrationSeedCatalog
@@ -30,31 +31,37 @@ class ScenarioError(ValueError):
 def price_unavailability_message(
     item: RateCardItem,
     promo_eligible: bool,
+    price_basis: Literal["partner_best_offer", "marketplace"] = "partner_best_offer",
 ) -> str:
+    if price_basis == "marketplace":
+        return "The current licence price is blank; the line is not included in the total."
     if (
         not promo_eligible
         and item.initial_quote_with_promo_available
         and not item.initial_quote_without_promo_available
     ):
         return (
-            "Promotion eligibility confirmation required: the pricebook has a "
+            "Promotion eligibility confirmation required: the pricing data has a "
             "promotional quote but no standard quote."
         )
-    return "Selected pricebook quote is blank; price is unavailable."
+    return "The selected quote is blank; price is unavailable."
 
 
 def price_unavailability_decision(
     line_id: str,
     item: RateCardItem,
     promo_eligible: bool,
+    price_basis: Literal["partner_best_offer", "marketplace"] = "partner_best_offer",
 ) -> str:
+    if price_basis == "marketplace":
+        return f"{line_id}: the current licence price is unavailable."
     if (
         not promo_eligible
         and item.initial_quote_with_promo_available
         and not item.initial_quote_without_promo_available
     ):
         return f"{line_id}: confirm promotion eligibility before pricing."
-    return f"{line_id}: price is unavailable in the pricebook."
+    return f"{line_id}: price is unavailable in the current pricing data."
 
 
 @dataclass(frozen=True)
@@ -98,9 +105,11 @@ class ScenarioEngine:
         migration_seeds: MigrationSeedCatalog | None = None,
         *,
         apply_bundle_rules: bool = True,
+        price_basis: Literal["partner_best_offer", "marketplace"] = "partner_best_offer",
     ) -> None:
         self._migration_seeds = migration_seeds
         self._apply_bundle_rules = apply_bundle_rules
+        self._price_basis = price_basis
 
     def validate_catalog(
         self,
@@ -124,12 +133,16 @@ class ScenarioEngine:
                 billing_plan,
                 segment,
             )
-            if not (
-                item.initial_quote_with_promo_available
-                or item.initial_quote_without_promo_available
+            if (
+                item.marketplace_price <= 0
+                if self._price_basis == "marketplace"
+                else not (
+                    item.initial_quote_with_promo_available
+                    or item.initial_quote_without_promo_available
+                )
             ):
                 raise ScenarioError(
-                    f"The required pricebook price is blank for {title!r}."
+                    f"The required current price is blank for {title!r}."
                 )
 
     def build(
@@ -248,7 +261,7 @@ class ScenarioEngine:
             }
             if not available_segments:
                 raise ScenarioError(
-                    "The pricebook has no Segment column; segment cannot be changed."
+                    "The current pricing data has no Segment column; segment cannot be changed."
                 )
             if target_segment.casefold() not in available_segments:
                 choices = ", ".join(sorted(available_segments))
@@ -270,15 +283,17 @@ class ScenarioEngine:
                 target_segment,
             )
             unit, price_unavailable = self._unit_price(item, target_promo)
-            unavailable_note = price_unavailability_message(item, target_promo)
+            unavailable_note = price_unavailability_message(
+                item, target_promo, self._price_basis
+            )
             existing_note = (line.note or "").replace(
                 "Selected Outcome Sheet quote is blank; price is unavailable.",
                 "",
             ).replace(
-                "Selected pricebook quote is blank; price is unavailable.",
+                "The selected quote is blank; price is unavailable.",
                 "",
             ).replace(
-                "Promotion eligibility confirmation required: the pricebook has a "
+                "Promotion eligibility confirmation required: the pricing data has a "
                 "promotional quote but no standard quote.",
                 "",
             ).strip()
@@ -396,7 +411,7 @@ class ScenarioEngine:
             disposition=MigrationDisposition.ADD,
             decision_required=price_unavailable,
             note=(
-                f"Added by seller. {price_unavailability_message(item, scenario.promo_eligible)}"
+                f"Added by seller. {price_unavailability_message(item, scenario.promo_eligible, self._price_basis)}"
                 if price_unavailable
                 else "Added by seller"
             ),
@@ -514,6 +529,7 @@ class ScenarioEngine:
             rows.append(
                 ComparisonRow(
                     scenario_type=scenario.scenario_type,
+                    revision=scenario.revision,
                     base_licences=money(base),
                     copilot=money(copilot),
                     additional_or_retained=money(additional),
@@ -574,6 +590,8 @@ class ScenarioEngine:
         except ScenarioError:
             pass
         for source in estate.lines:
+            line_term = source.term_duration or term_duration
+            line_billing = source.billing_plan or billing_plan
             try:
                 item = self._select_price(
                     catalog,
@@ -582,13 +600,13 @@ class ScenarioEngine:
                         sku_id=source.sku_id,
                         sku_title=source.display_title,
                     ),
-                    term_duration,
-                    billing_plan,
+                    line_term,
+                    line_billing,
                     segment,
                 )
                 unit, price_unavailable = self._unit_price(item, promo_eligible)
                 note = (
-                    price_unavailability_message(item, promo_eligible)
+                    price_unavailability_message(item, promo_eligible, self._price_basis)
                     if price_unavailable
                     else None
                 )
@@ -598,6 +616,7 @@ class ScenarioEngine:
                             source.line_id,
                             item,
                             promo_eligible,
+                            self._price_basis,
                         )
                     )
             except ScenarioError as error:
@@ -625,8 +644,8 @@ class ScenarioEngine:
                     unit_price=unit,
                     extended_price=money(unit * source.renewal_quantity),
                     price_unavailable=price_unavailable,
-                    term_duration=item.term_duration if item else term_duration,
-                    billing_plan=item.billing_plan if item else billing_plan,
+                    term_duration=item.term_duration if item else line_term,
+                    billing_plan=item.billing_plan if item else line_billing,
                     expiration_date=source.expiration_date,
                     renewal_date=source.renewal_date,
                     category=category,
@@ -722,7 +741,7 @@ class ScenarioEngine:
                     if suggestion is None:
                         disposition = MigrationDisposition.NEEDS_DECISION
                         note = (
-                            "The pricebook contains no entitlement or migration mapping for "
+                            "The current licensing data contains no entitlement or migration mapping for "
                             "this SKU; retained and priced until the seller decides."
                         )
                     elif suggestion.approved:
@@ -789,13 +808,14 @@ class ScenarioEngine:
                     if price_unavailable:
                         note = (
                             f"{note or ''} "
-                            f"{price_unavailability_message(item, promo_eligible)}"
+                            f"{price_unavailability_message(item, promo_eligible, self._price_basis)}"
                         ).strip()
                         unresolved.append(
                             price_unavailability_decision(
                                 source.line_id,
                                 item,
                                 promo_eligible,
+                                self._price_basis,
                             )
                         )
                 except ScenarioError as error:
@@ -869,7 +889,9 @@ class ScenarioEngine:
         if base_price_unavailable:
             base_requires_confirmation = True
             unresolved.append(
-                price_unavailability_decision("BASE", base_item, promo_eligible)
+                price_unavailability_decision(
+                    "BASE", base_item, promo_eligible, self._price_basis
+                )
             )
         lines.append(
             ScenarioLine(
@@ -888,7 +910,7 @@ class ScenarioEngine:
                 disposition=MigrationDisposition.ADD,
                 decision_required=base_requires_confirmation,
                 note=(
-                    f"Target suite. {price_unavailability_message(base_item, promo_eligible)}"
+                    f"Target suite. {price_unavailability_message(base_item, promo_eligible, self._price_basis)}"
                     if base_price_unavailable
                     else "Target suite"
                 ),
@@ -940,6 +962,7 @@ class ScenarioEngine:
                         "COPILOT",
                         copilot_item,
                         promo_eligible,
+                        self._price_basis,
                     )
                 )
             lines.append(
@@ -960,7 +983,9 @@ class ScenarioEngine:
                     decision_required=copilot_requires_confirmation,
                     note=(
                         "Copilot quantity is independently editable. "
-                        + price_unavailability_message(copilot_item, promo_eligible)
+                        + price_unavailability_message(
+                            copilot_item, promo_eligible, self._price_basis
+                        )
                         if copilot_price_unavailable
                         else "Copilot quantity is independently editable."
                     ),
@@ -968,7 +993,7 @@ class ScenarioEngine:
             )
         else:
             assumptions.append(
-                "The pricebook has no field proving that Copilot is included with ME7; "
+                "The current licensing data has no field proving that Copilot is included with ME7; "
                 "Copilot is therefore not included or priced automatically."
             )
 
@@ -1013,14 +1038,14 @@ class ScenarioEngine:
         ]
         if not matches:
             raise ScenarioError(
-                f"The pricebook does not contain the required exact product {title!r}."
+                f"The approved catalogue does not contain the required exact product {title!r}."
             )
         if len(matches) > 1:
             identities = ", ".join(
                 f"{item.product_id}/{item.sku_id}" for item in matches
             )
             raise ScenarioError(
-                f"The pricebook contains multiple identities for {title!r}: "
+                f"The approved catalogue contains multiple identities for {title!r}: "
                 f"{identities}."
             )
         match = matches[0]
@@ -1065,15 +1090,19 @@ class ScenarioEngine:
             raise ScenarioError(
                 f"No {term_duration}/{billing_plan} price exists for {selector.sku_title}."
             )
-        prices = {
-            (
-                row.initial_quote_with_promo,
-                row.initial_quote_without_promo,
-                row.initial_quote_with_promo_available,
-                row.initial_quote_without_promo_available,
-            )
-            for row in rows
-        }
+        prices = (
+            {row.marketplace_price for row in rows}
+            if self._price_basis == "marketplace"
+            else {
+                (
+                    row.initial_quote_with_promo,
+                    row.initial_quote_without_promo,
+                    row.initial_quote_with_promo_available,
+                    row.initial_quote_without_promo_available,
+                )
+                for row in rows
+            }
+        )
         if len(prices) > 1:
             raise ScenarioError(
                 f"Multiple commercial prices exist for {selector.sku_title}; "
@@ -1081,11 +1110,15 @@ class ScenarioEngine:
             )
         return rows[0]
 
-    @staticmethod
     def _unit_price(
+        self,
         item: RateCardItem,
         promo_eligible: bool,
     ) -> tuple[Decimal, bool]:
+        if self._price_basis == "marketplace":
+            if item.marketplace_price > 0:
+                return money(item.marketplace_price), False
+            return Decimal("0.00"), True
         if promo_eligible and item.initial_quote_with_promo_available:
             return money(item.initial_quote_with_promo), False
         if item.initial_quote_without_promo_available:

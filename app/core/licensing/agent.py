@@ -32,6 +32,7 @@ AgentAction = Literal[
     "confirm_validation",
     "reject_validation",
     "compare",
+    "request_recommendation",
     "clarify",
 ]
 
@@ -102,13 +103,20 @@ Rules:
   explicitly asks to rebuild the current renewal proposal. Do not suggest bundle scenarios.
 - quantity is the optional base-suite quantity and copilot_quantity is independent.
 - Use -1 for any quantity that the seller did not state. Never guess a quantity.
-- For set_quantity/set_copilot/add_sku/replace_sku, a stated quantity is mandatory.
+- For set_quantity/set_copilot/add_sku, a stated quantity is mandatory. For replace_sku,
+  use -1 when no quantity is stated; the application will retain the selected source line's
+  existing quantity. Never guess it.
 - For disposition changes, a line ID is required; valid values are retain, remove, migrate,
   and included.
 - If an add/replace/edit request is ambiguous or missing a required value, use clarify and
-  ask one short question in clarification.
-- Use set_promo when the seller confirms or rejects promotion eligibility. boolean_value
-  must be true or false.
+  put one short, direct question in clarification without introductory wording.
+- In simple_pricing mode, never route to set_promo, set_discount, or set_adjustment.
+  Those internal commercial controls are not seller-facing.
+- All proposals use a one-year term with annual billing. If the seller asks for monthly
+  billing, route the stated request to set_billing with billing_plan Monthly so the
+  deterministic application rejects it. Never suggest monthly pricing or monthly details.
+- Do not explain or recommend promotional, partner-price, distributor-margin, or other
+  internal pricing-source logic.
 - Use set_discount for a seller-stated discount percentage and set_adjustment for a
   seller-stated positive or negative monetary adjustment.
 - Use set_term, set_billing, set_segment, and set_currency for those commercial settings.
@@ -127,6 +135,9 @@ Rules:
 - A bare "yes" means confirm_validation only when the current stage is one of the two
   validation stages. Otherwise use clarify.
 - Use help for capability questions and compare only for explicit requests.
+- Use request_recommendation when the seller asks for a better SKU or a recommendation
+  without naming a target. Do not choose a product. The application will ask for the
+  business capability, source line, and user count because authoritative rules are pending.
 - Fields irrelevant to the action must use "none", an empty string, -1, or -1.0.
 - If the seller has not selected every unresolved uploaded line, use clarify and ask for
   the remaining choices; never guess a SKU match.
@@ -143,6 +154,7 @@ Examples:
 - "I confirm the uploaded details and pricing" -> confirm_validation.
 - "Yes, finalize this proposal" while awaiting_final_validation -> confirm_validation.
 - "No, continue editing" -> reject_validation.
+- "Recommend a better SKU" -> request_recommendation.
 """
 
 
@@ -155,10 +167,12 @@ class OpenAIIntentInterpreter:
         api_key: str,
         model: str,
         reasoning_effort: Literal["none", "low", "medium", "high"] = "none",
+        workflow_mode: str = "scenario_comparison",
         client: Any | None = None,
     ) -> None:
         self._model = model
         self._reasoning_effort = reasoning_effort
+        self._workflow_mode = workflow_mode
         self._owns_client = client is None
         self._client = client or AsyncOpenAI(
             api_key=api_key,
@@ -203,10 +217,14 @@ class OpenAIIntentInterpreter:
         if self._owns_client:
             await self._client.close()
 
-    @staticmethod
-    def _context(session: WorkflowSession | None) -> dict[str, object]:
+    def _context(self, session: WorkflowSession | None) -> dict[str, object]:
         if session is None:
-            return {"stage": "awaiting_upload", "active_scenario": "none", "lines": []}
+            return {
+                "workflow_mode": self._workflow_mode,
+                "stage": "awaiting_upload",
+                "active_scenario": "none",
+                "lines": [],
+            }
         active = (
             session.scenarios.get(session.active_scenario)
             if session.active_scenario is not None
@@ -223,7 +241,18 @@ class OpenAIIntentInterpreter:
                 }
                 for line in active.lines[:80]
             ]
+        elif session.estate is not None:
+            lines = [
+                {
+                    "line_id": line.line_id,
+                    "title": line.display_title,
+                    "quantity": line.renewal_quantity,
+                    "disposition": "captured_requirement",
+                }
+                for line in session.estate.lines[:80]
+            ]
         return {
+            "workflow_mode": self._workflow_mode,
             "stage": session.stage.value,
             "active_scenario": (
                 session.active_scenario.value if session.active_scenario else "none"

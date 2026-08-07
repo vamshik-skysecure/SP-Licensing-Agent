@@ -103,6 +103,8 @@ class ParsedLicenseRow(BaseModel):
     renewal_quantity: int = Field(ge=0)
     expiration_date: date | None = None
     renewal_date: date | None = None
+    term_duration: str | None = None
+    billing_plan: str | None = None
 
 
 class NormalizedLicenseLine(BaseModel):
@@ -118,6 +120,8 @@ class NormalizedLicenseLine(BaseModel):
     renewal_quantity: int = Field(ge=0)
     expiration_date: date | None = None
     renewal_date: date | None = None
+    term_duration: str | None = None
+    billing_plan: str | None = None
     match_confidence: float | None = Field(default=None, ge=0, le=100)
     match_method: Literal["exact", "fuzzy", "seller_confirmed", "unresolved"]
     candidates: list[SkuMatchCandidate] = Field(default_factory=list)
@@ -194,9 +198,10 @@ class PendingSkuChange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
+    scope: Literal["requirement", "scenario"] = "scenario"
     action: Literal["add", "replace"]
-    scenario_type: ScenarioType
-    scenario_revision: int = Field(ge=1)
+    scenario_type: ScenarioType | None = None
+    scenario_revision: int | None = Field(default=None, ge=1)
     product_query: str
     quantity: int = Field(gt=0)
     source_line_id: str | None = None
@@ -209,6 +214,7 @@ class SkuChangeResult(BaseModel):
 
     state: Literal["applied", "confirmation_required"]
     scenario: CommercialScenario | None = None
+    estate: LicenseEstate | None = None
     confirmation: PendingSkuChange | None = None
 
 
@@ -232,6 +238,7 @@ class WorkflowSession(BaseModel):
     estate: LicenseEstate | None = None
     scenarios: dict[ScenarioType, CommercialScenario] = Field(default_factory=dict)
     active_scenario: ScenarioType | None = None
+    confirmed_as_is: CommercialScenario | None = None
     pending_sku_change: PendingSkuChange | None = None
     processed_message_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
@@ -240,6 +247,7 @@ class WorkflowSession(BaseModel):
 
 class ComparisonRow(BaseModel):
     scenario_type: ScenarioType
+    revision: int = Field(default=1, ge=1)
     base_licences: Money
     copilot: Money
     additional_or_retained: Money

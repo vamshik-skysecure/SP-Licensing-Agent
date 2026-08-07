@@ -6,6 +6,11 @@ from typing import Literal
 
 from app.config import get_logger
 from app.core.licensing.analysis import LicenseAnalysisError
+from app.core.licensing.capture import (
+    CapturedRequirement,
+    RequirementCaptureError,
+    RequirementExtractor,
+)
 from app.core.licensing.agent import (
     AgentIntent,
     IntentInterpretationError,
@@ -22,6 +27,7 @@ from app.core.licensing.mobile_tables import (
     render_comparison_table_images,
     render_estate_table_images,
     render_scenario_table_images,
+    render_simple_pricing_table_images,
 )
 from app.core.licensing.orchestrator import LicensingOrchestrator
 from app.core.licensing.renderer import (
@@ -33,16 +39,20 @@ from app.core.licensing.renderer import (
     render_comparison_pdf,
     render_estate_pdf,
     render_proposal_pdf,
+    render_simple_commercial_pdf,
 )
 from app.core.licensing.scenarios import ScenarioError
 from app.core.licensing.store import WorkflowConflictError
 from app.core.whatsapp import WhatsAppAPIError, WhatsAppClient
 from app.schema.whatsapp import (
     IncomingWhatsAppDocument,
+    IncomingWhatsAppAudio,
+    IncomingWhatsAppImage,
     IncomingWhatsAppMessage,
     InteractiveButton,
     InteractiveButtonAction,
     InteractiveButtons,
+    InteractiveFooter,
     InteractiveList,
     InteractiveListAction,
     InteractiveReply,
@@ -59,34 +69,26 @@ logger = get_logger(__name__)
 RESPONSIVE_MESSAGE_LIMIT = 900
 
 
-HELP_TEXT = """*SkySecure Microsoft Licensing Advisor*
-
-Upload the customer's .csv or .xlsx licence file. I will return:
-1. A readable licence table in this chat.
-2. A customer-ready estate PDF.
-3. An editable annual renewal proposal using the maintained pricebook.
-4. An annual comparison of Renew As-Is, ME3, ME5, and ME7 on request.
-
-I ask the seller to validate the uploaded estate, initial pricing, and promotion eligibility
-in one approval before edits or comparisons are enabled. Finalization requires a separate
-seller confirmation.
-
-Then speak naturally. Examples:
-- "Compare the annual ME3, ME5, and ME7 upgrades."
-- "Change L2 to 50 licences."
-- "Remove L3."
-- "Add 10 Power BI Pro licences."
-- "Set Copilot to 25 licences."
-- "The customer is eligible for the promotion."
-- "Apply a 5% discount."
-- "Add the comment: customer approval pending."
-- "Finalize the proposal."
-- "I confirm the analysis and pricing."
-- "Yes, finalize this proposal."
-
-All options use a one-year term and annual billing. Existing add-ons stay separately
-licensed unless the seller explicitly changes them; no bundle entitlement is assumed.
-I recalculate after every accepted change and deliver customer-ready PDFs."""
+HELP_TEXT = (
+    "*SkySecure Microsoft Licensing Advisor*\n\n"
+    "I turn customer licensing requirements into validated, decision-ready annual "
+    "commercial proposals.\n\n"
+    "*How I can assist*\n"
+    "• Capture requirements from Excel or CSV, Word or PDF, screenshots and photos, "
+    "voice notes, or a message in this chat.\n"
+    "• Identify and validate licence SKUs, quantities, terms, and renewal dates.\n"
+    "• Prepare the confirmed Renew As-Is annual value.\n"
+    "• Maintain Renew As-Is, ME3, ME5, and ME7 as independent proposals and recalculate "
+    "each accepted change immediately.\n"
+    "• Compare all four saved proposals, identify the recommended option, and prepare "
+    "customer-ready PDFs.\n\n"
+    "*Controlled review*\n"
+    "I pause for seller confirmation before pricing and again before finalization. An "
+    "uncertain SKU match is never applied without your approval.\n\n"
+    "*To begin*\n"
+    "Send or upload the customer's licensing requirement. I will guide the review from "
+    "there. No commands are required."
+)
 
 
 SCENARIO_ALIASES = {
@@ -104,8 +106,11 @@ SCENARIO_ALIASES = {
 class ServiceConfiguration:
     seller_allowlist: frozenset[str]
     max_document_bytes: int
+    max_image_bytes: int = 8 * 1024 * 1024
+    max_audio_bytes: int = 10 * 1024 * 1024
     currency: str = "INR"
     workflow_mode: Literal[
+        "simple_pricing",
         "renewal_only",
         "upgrade_comparison",
         "scenario_comparison",
@@ -120,11 +125,13 @@ class WhatsAppWebhookService:
         configuration: ServiceConfiguration,
         *,
         intent_interpreter: IntentInterpreter | None = None,
+        requirement_extractor: RequirementExtractor | None = None,
     ) -> None:
         self._whatsapp_client = whatsapp_client
         self._orchestrator = orchestrator
         self._configuration = configuration
         self._intent_interpreter = intent_interpreter
+        self._requirement_extractor = requirement_extractor
 
     async def handle(self, webhook: WhatsAppWebhookPayload) -> None:
         for entry in webhook.entry:
@@ -150,6 +157,10 @@ class WhatsAppWebhookService:
                 await self._handle_text(sender, message.text.body)
             elif message.type == "document" and message.document is not None:
                 await self._handle_document(sender, message.document)
+            elif message.type == "image" and message.image is not None:
+                await self._handle_image(sender, message.image)
+            elif message.type == "audio" and message.audio is not None:
+                await self._handle_audio(sender, message.audio)
             elif message.type == "interactive" and message.interactive is not None:
                 reply = message.interactive.list_reply or message.interactive.button_reply
                 if reply is None:
@@ -158,10 +169,15 @@ class WhatsAppWebhookService:
             else:
                 await self._send_text(
                     sender,
-                    "Send a .csv/.xlsx licence file, text command, or menu selection.",
+                    "Send a requirement as text, voice, image, or a supported document.",
                 )
             await self._orchestrator.mark_processed(sender, message.id)
-        except (LicenseAnalysisError, ScenarioError, ValueError) as error:
+        except (
+            LicenseAnalysisError,
+            RequirementCaptureError,
+            ScenarioError,
+            ValueError,
+        ) as error:
             logger.info("User-correctable workflow error type=%s", type(error).__name__)
             await self._send_text(sender, f"I could not apply that request: {error}")
             await self._orchestrator.mark_processed(sender, message.id)
@@ -182,8 +198,30 @@ class WhatsAppWebhookService:
         document: IncomingWhatsAppDocument,
     ) -> None:
         suffix = document.filename.lower().rsplit(".", 1)[-1]
-        if suffix not in {"csv", "xlsx"}:
-            raise LicenseAnalysisError("Upload a .csv or .xlsx licence file.")
+        supported_files = {
+            "csv",
+            "tsv",
+            "xls",
+            "xlsx",
+            "xlsm",
+            "xla",
+            "xlb",
+            "xlc",
+            "xlm",
+            "xlt",
+            "xlw",
+            "iif",
+            "pdf",
+            "doc",
+            "docx",
+            "rtf",
+            "odt",
+            "txt",
+        }
+        if suffix not in supported_files:
+            raise LicenseAnalysisError(
+                "Send CSV, TSV, Excel, Word, PDF, RTF, ODT, or plain text."
+            )
         media = await self._whatsapp_client.download_media(
             media_id=document.id,
             filename=document.filename,
@@ -193,11 +231,110 @@ class WhatsAppWebhookService:
             raise LicenseAnalysisError(
                 f"The file exceeds the {self._configuration.max_document_bytes // 1048576} MB limit."
             )
-        estate = await self._orchestrator.analyze_document(
-            sender=sender,
-            filename=media.filename,
-            content=media.content,
+        estate = None
+        if suffix in {"csv", "xlsx", "xlsm"}:
+            try:
+                estate = await self._orchestrator.analyze_document(
+                    sender=sender,
+                    filename=media.filename,
+                    content=media.content,
+                )
+            except LicenseAnalysisError:
+                if self._requirement_extractor is None:
+                    raise
+                logger.info(
+                    "Deterministic spreadsheet parser could not map the layout; "
+                    "using structured multimodal extraction"
+                )
+        if estate is None:
+            extractor = self._require_extractor(
+                "This file format or layout requires OpenAI requirement capture."
+            )
+            captured = await extractor.extract_file(
+                media.content,
+                filename=media.filename,
+                mime_type=media.content_type,
+            )
+            estate = await self._analyze_captured(sender, media.filename, captured)
+        await self._process_captured_estate(sender, estate)
+
+    async def _handle_image(
+        self,
+        sender: str,
+        incoming: IncomingWhatsAppImage,
+    ) -> None:
+        media = await self._whatsapp_client.download_media(
+            media_id=incoming.id,
+            filename="licensing-requirement-image",
+            content_type=incoming.mime_type,
         )
+        if len(media.content) > self._configuration.max_image_bytes:
+            raise RequirementCaptureError(
+                f"The image exceeds the {self._configuration.max_image_bytes // 1048576} MB limit."
+            )
+        suffix = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+        }.get(media.content_type.split(";", 1)[0].casefold(), ".jpg")
+        filename = f"licensing-requirement{suffix}"
+        extractor = self._require_extractor("Image capture requires OpenAI.")
+        captured = await extractor.extract_image(
+            media.content,
+            filename=filename,
+            mime_type=media.content_type,
+        )
+        estate = await self._analyze_captured(sender, filename, captured)
+        await self._process_captured_estate(sender, estate)
+
+    async def _handle_audio(
+        self,
+        sender: str,
+        incoming: IncomingWhatsAppAudio,
+    ) -> None:
+        media = await self._whatsapp_client.download_media(
+            media_id=incoming.id,
+            filename="licensing-requirement-voice.ogg",
+            content_type=incoming.mime_type,
+        )
+        if len(media.content) > self._configuration.max_audio_bytes:
+            raise RequirementCaptureError(
+                f"The voice note exceeds the {self._configuration.max_audio_bytes // 1048576} MB limit."
+            )
+        extractor = self._require_extractor("Voice capture requires OpenAI transcription.")
+        captured = await extractor.extract_audio(
+            media.content,
+            filename=media.filename,
+            mime_type=media.content_type,
+        )
+        if captured.transcript:
+            await self._send_text(
+                sender,
+                "*Voice transcript used for extraction*\n" + captured.transcript[:3000],
+            )
+        estate = await self._analyze_captured(sender, media.filename, captured)
+        await self._process_captured_estate(sender, estate)
+
+    async def _analyze_captured(
+        self,
+        sender: str,
+        source_name: str,
+        captured: CapturedRequirement,
+    ):
+        if captured.extraction.warnings:
+            await self._send_text(
+                sender,
+                "*Extraction notes*\n"
+                + "\n".join(f"- {item}" for item in captured.extraction.warnings[:10]),
+            )
+        return await self._orchestrator.analyze_extracted(
+            sender=sender,
+            source_file=source_name,
+            rows=captured.extraction.to_parsed_rows(),
+        )
+
+    async def _process_captured_estate(self, sender: str, estate) -> None:
         await self._send_estate_table(sender, estate)
         await self._send_estate_report(sender, estate)
         if estate.pending_lines:
@@ -205,20 +342,41 @@ class WhatsAppWebhookService:
         else:
             await self._continue_after_estate(sender)
 
+    def _require_extractor(self, message: str) -> RequirementExtractor:
+        if self._requirement_extractor is None:
+            raise RequirementCaptureError(message)
+        return self._requirement_extractor
+
     async def _send_estate_report(self, sender: str, estate) -> None:
         comparison_mode = self._configuration.workflow_mode == "scenario_comparison"
+        simple_mode = self._configuration.workflow_mode == "simple_pricing"
         pdf = render_estate_pdf(
             estate,
             include_migration_review=comparison_mode,
+            report_title=(
+                "Captured Licensing Requirement"
+                if simple_mode
+                else "Customer Licence Estate"
+            ),
         )
         try:
             await self._whatsapp_client.send_document(
                 to=sender,
                 content=pdf,
-                filename="customer-licence-estate.pdf",
+                filename=(
+                    "captured-licensing-requirement.pdf"
+                    if simple_mode
+                    else "customer-licence-estate.pdf"
+                ),
                 content_type="application/pdf",
                 caption=(
-                    "Customer licence estate grouped by product family, with expiry and "
+                    (
+                        "Captured licensing requirement grouped by product family, with "
+                        "term, billing, and "
+                        if simple_mode
+                        else "Customer licence estate grouped by product family, with "
+                        "expiry and "
+                    )
                     + ("migration-review flags" if comparison_mode else "SKU-match flags")
                 ),
             )
@@ -232,7 +390,15 @@ class WhatsAppWebhookService:
 
     async def _send_estate_table(self, sender: str, estate) -> None:
         try:
-            images = render_estate_table_images(estate)
+            simple_mode = self._configuration.workflow_mode == "simple_pricing"
+            images = render_estate_table_images(
+                estate,
+                title=(
+                    "Captured licensing requirement"
+                    if simple_mode
+                    else "Customer licence estate"
+                ),
+            )
             for index, content in enumerate(images, start=1):
                 await self._whatsapp_client.send_image(
                     to=sender,
@@ -240,7 +406,8 @@ class WhatsAppWebhookService:
                     filename=f"licence-estate-table-{index}.png",
                     content_type="image/png",
                     caption=(
-                        f"Licence estate table • {len(estate.lines)} SKU lines • "
+                        f"{'Requirement' if simple_mode else 'Licence estate'} table • "
+                        f"{len(estate.lines)} SKU lines • "
                         f"Page {index}/{len(images)}"
                     ),
                 )
@@ -264,6 +431,41 @@ class WhatsAppWebhookService:
         if lowered in {"/help", "/start", "/about", "/analyze"}:
             await self._send_text(sender, HELP_TEXT)
             return
+        if self._requests_monthly_billing(lowered):
+            await self._send_text(
+                sender,
+                "Monthly billing is not available in this release. Every proposal uses "
+                "a one-year term with annual billing.",
+            )
+            return
+        if self._requests_restricted_pricing(lowered):
+            await self._send_text(
+                sender,
+                "Promotional eligibility and partner-price requests are not applied in "
+                "this release. The saved proposal remains unchanged.",
+            )
+            return
+        if (
+            self._configuration.workflow_mode == "simple_pricing"
+            and not lowered.startswith("/")
+        ):
+            session = await self._orchestrator.get_session(sender)
+            if session is None or session.estate is None:
+                extractor = self._require_extractor(
+                    "Manual natural-language capture requires OpenAI. Use the standard "
+                    "CSV/XLSX template in offline mode."
+                )
+                captured = await extractor.extract_text(
+                    command,
+                    source_name="whatsapp-message.txt",
+                )
+                estate = await self._analyze_captured(
+                    sender,
+                    "whatsapp-message.txt",
+                    captured,
+                )
+                await self._process_captured_estate(sender, estate)
+                return
         if lowered in {"/validate", "/confirm-details"}:
             await self._confirm_validation(sender)
             return
@@ -302,6 +504,70 @@ class WhatsAppWebhookService:
                 else "There is no pending SKU change to cancel.",
             )
             return
+        session = await self._orchestrator.get_session(sender)
+        if (
+            self._configuration.workflow_mode == "simple_pricing"
+            and session is not None
+            and session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION
+        ):
+            if lowered.startswith("/set "):
+                line_id, quantity = self._line_quantity(command[5:])
+                estate = await self._orchestrator.edit_requirement_quantity(
+                    sender, line_id, quantity
+                )
+                await self._send_updated_requirement(sender, estate)
+                return
+        if self._configuration.workflow_mode == "simple_pricing" and lowered.startswith(
+            ("/promo ", "/discount ", "/adjust ")
+        ):
+            raise ValueError(
+                "Discount, margin, adjustment, and promotion controls are not seller-facing "
+                "in this release."
+            )
+        if (
+            self._configuration.workflow_mode == "simple_pricing"
+            and session is not None
+            and session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION
+        ):
+            if lowered.startswith("/add "):
+                product, quantity = self._product_quantity(command[5:])
+                result = await self._orchestrator.add_requirement_sku(
+                    sender, product, quantity
+                )
+                await self._send_sku_change_result(sender, result)
+                return
+            if lowered.startswith("/replace "):
+                line_id, product, quantity = self._replacement(command[9:])
+                result = await self._orchestrator.replace_requirement_sku(
+                    sender, line_id, product, quantity
+                )
+                await self._send_sku_change_result(sender, result)
+                return
+            if lowered.startswith("/remove "):
+                line_id = command[8:].strip()
+                estate = await self._orchestrator.remove_requirement_line(
+                    sender, line_id
+                )
+                await self._send_updated_requirement(sender, estate)
+                return
+            if lowered.startswith("/term "):
+                term_duration = self._required_text(command[6:], "contract term")
+                self._validate_annual_contract(term_duration=term_duration)
+                estate = await self._orchestrator.edit_requirement_contract(
+                    sender,
+                    term_duration=term_duration,
+                )
+                await self._send_updated_requirement(sender, estate)
+                return
+            if lowered.startswith("/billing "):
+                billing_plan = self._required_text(command[9:], "billing plan")
+                self._validate_annual_contract(billing_plan=billing_plan)
+                estate = await self._orchestrator.edit_requirement_contract(
+                    sender,
+                    billing_plan=billing_plan,
+                )
+                await self._send_updated_requirement(sender, estate)
+                return
         if lowered.startswith("/"):
             await self._ensure_operation_allowed(sender, direct_command=lowered)
         if lowered.startswith("/scenario "):
@@ -312,7 +578,7 @@ class WhatsAppWebhookService:
             ):
                 raise ValueError(
                     "Bundle scenarios are disabled until authoritative bundling rules "
-                    "are supplied. The current renewal proposal remains editable."
+                    "are supplied. The Renew As-Is proposal remains editable."
                 )
             scenario = await self._orchestrator.build_scenario(
                 sender,
@@ -320,17 +586,26 @@ class WhatsAppWebhookService:
                 base_quantity=base,
                 copilot_quantity=copilot,
             )
-            await self._send_scenario(sender, scenario)
+            if self._configuration.workflow_mode == "simple_pricing":
+                await self._send_simple_revised(sender, scenario)
+            else:
+                await self._send_scenario(sender, scenario)
             return
         if lowered.startswith("/set "):
             line_id, quantity = self._line_quantity(command[5:])
             scenario = await self._orchestrator.edit_quantity(sender, line_id, quantity)
-            await self._send_scenario(sender, scenario)
+            if self._configuration.workflow_mode == "simple_pricing":
+                await self._send_simple_revised(sender, scenario)
+            else:
+                await self._send_scenario(sender, scenario)
             return
         if lowered.startswith("/copilot "):
             quantity = self._positive_or_zero(command[9:].strip(), "Copilot quantity")
             scenario = await self._orchestrator.edit_quantity(sender, "COPILOT", quantity)
-            await self._send_scenario(sender, scenario)
+            if self._configuration.workflow_mode == "simple_pricing":
+                await self._send_simple_revised(sender, scenario)
+            else:
+                await self._send_scenario(sender, scenario)
             return
         if lowered.startswith("/promo "):
             value = command[7:].strip().casefold()
@@ -382,7 +657,7 @@ class WhatsAppWebhookService:
             configured = self._configuration.currency.upper()
             if requested != configured:
                 raise ValueError(
-                    "Currency conversion is unavailable because the pricebook has no "
+                    "Currency conversion is unavailable because the current pricing data has no "
                     f"Currency or FX-rate column. Current currency: {configured}."
                 )
             await self._send_text(
@@ -474,9 +749,9 @@ class WhatsAppWebhookService:
             question = intent.clarification.strip()
             await self._send_text(
                 sender,
-                f"I need one more detail: {question[:500]}"
+                question[:500]
                 if question
-                else "I need the exact scenario, line, or quantity before changing the proposal.",
+                else "Which proposal, line, or quantity would you like to change?",
             )
             return
         if intent.action == "confirm_validation":
@@ -485,6 +760,77 @@ class WhatsAppWebhookService:
         if intent.action == "reject_validation":
             await self._reject_validation(sender)
             return
+        if intent.action == "request_recommendation":
+            await self._send_text(
+                sender,
+                "I can prepare a safe recommendation once you provide: (1) the line or "
+                "existing SKU to change, (2) the capability or target SKU, and (3) the "
+                "number of users. Example: ‘Replace L1 with Microsoft 365 E3 for 120 "
+                "users’. The authoritative promotion and eligibility rule sheet is not "
+                "loaded yet, so I will not invent or auto-apply an entitlement decision.",
+            )
+            return
+        session = await self._orchestrator.get_session(sender)
+        if (
+            self._configuration.workflow_mode == "simple_pricing"
+            and session is not None
+            and session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION
+        ):
+            if intent.action == "set_quantity":
+                estate = await self._orchestrator.edit_requirement_quantity(
+                    sender,
+                    self._required_text(intent.line_id, "line ID"),
+                    self._required_quantity(intent.quantity, allow_zero=False),
+                )
+                await self._send_updated_requirement(sender, estate)
+                return
+            if intent.action == "add_sku":
+                result = await self._orchestrator.add_requirement_sku(
+                    sender,
+                    self._required_text(intent.product_query, "product"),
+                    self._required_quantity(intent.quantity, allow_zero=False),
+                )
+                await self._send_sku_change_result(sender, result)
+                return
+            if intent.action == "replace_sku":
+                line_id = self._required_text(intent.line_id, "line ID")
+                result = await self._orchestrator.replace_requirement_sku(
+                    sender,
+                    line_id,
+                    self._required_text(intent.product_query, "replacement product"),
+                    await self._resolve_replace_quantity(
+                        sender, line_id, intent.quantity
+                    ),
+                )
+                await self._send_sku_change_result(sender, result)
+                return
+            if intent.action == "set_disposition" and intent.disposition == "remove":
+                estate = await self._orchestrator.remove_requirement_line(
+                    sender,
+                    self._required_text(intent.line_id, "line ID"),
+                )
+                await self._send_updated_requirement(sender, estate)
+                return
+            if intent.action == "set_term":
+                term_duration = self._required_text(
+                    intent.term_duration, "contract term"
+                )
+                self._validate_annual_contract(term_duration=term_duration)
+                estate = await self._orchestrator.edit_requirement_contract(
+                    sender,
+                    term_duration=term_duration,
+                )
+                await self._send_updated_requirement(sender, estate)
+                return
+            if intent.action == "set_billing":
+                billing_plan = self._required_text(intent.billing_plan, "billing plan")
+                self._validate_annual_contract(billing_plan=billing_plan)
+                estate = await self._orchestrator.edit_requirement_contract(
+                    sender,
+                    billing_plan=billing_plan,
+                )
+                await self._send_updated_requirement(sender, estate)
+                return
         await self._ensure_operation_allowed(sender, agent_action=intent.action)
         if intent.action == "build_scenario":
             if intent.scenario == "none":
@@ -549,13 +895,19 @@ class WhatsAppWebhookService:
         if intent.action == "replace_sku":
             line_id = self._required_text(intent.line_id, "line ID")
             product = self._required_text(intent.product_query, "replacement product")
-            quantity = self._required_quantity(intent.quantity, allow_zero=False)
+            quantity = await self._resolve_replace_quantity(
+                sender, line_id, intent.quantity
+            )
             result = await self._orchestrator.replace_sku(
                 sender, line_id, product, quantity
             )
             await self._send_sku_change_result(sender, result)
             return
         if intent.action == "set_promo":
+            if self._configuration.workflow_mode == "simple_pricing":
+                raise ValueError(
+                    "Promotion eligibility is not seller-facing in this release."
+                )
             if intent.boolean_value == "none":
                 raise ValueError("Confirm whether the customer is promotion eligible.")
             scenario = await self._orchestrator.reconfigure_pricing(
@@ -565,6 +917,10 @@ class WhatsAppWebhookService:
             await self._send_scenario(sender, scenario)
             return
         if intent.action == "set_discount":
+            if self._configuration.workflow_mode == "simple_pricing":
+                raise ValueError(
+                    "Discount selection is not seller-facing in this release."
+                )
             scenario = await self._orchestrator.set_discount(
                 sender,
                 Decimal(str(intent.percentage)),
@@ -572,6 +928,10 @@ class WhatsAppWebhookService:
             await self._send_scenario(sender, scenario)
             return
         if intent.action == "set_adjustment":
+            if self._configuration.workflow_mode == "simple_pricing":
+                raise ValueError(
+                    "Commercial adjustments are not seller-facing in this release."
+                )
             scenario = await self._orchestrator.set_adjustment(
                 sender,
                 Decimal(str(intent.amount)),
@@ -611,7 +971,7 @@ class WhatsAppWebhookService:
             configured = self._configuration.currency.upper()
             if requested != configured:
                 raise ValueError(
-                    "Currency conversion is unavailable because the pricebook has no "
+                    "Currency conversion is unavailable because the current pricing data has no "
                     f"currency or FX-rate table. Current currency: {configured}."
                 )
             await self._send_text(
@@ -695,6 +1055,23 @@ class WhatsAppWebhookService:
             else:
                 await self._reject_validation(sender)
             return
+        if action == "recommend":
+            if value == "yes":
+                await self._send_text(
+                    sender,
+                    "Please let me know which changes you would like to evaluate. You may "
+                    "update a quantity, add or remove a licence, replace a selected SKU, "
+                    "or prepare an ME3, ME5, or ME7 option. I will validate the request, "
+                    "seek confirmation for any uncertain SKU match, and present the "
+                    "recalculated annual value.",
+                )
+            else:
+                await self._send_text(
+                    sender,
+                    "No recommendation changes were applied. You can finalize the as-is "
+                    "configuration whenever you are ready.",
+                )
+            return
         await self._ensure_operation_allowed(sender)
         if action == "scenario":
             try:
@@ -726,6 +1103,45 @@ class WhatsAppWebhookService:
         raise ValueError("Unknown commercial workflow action.")
 
     async def _continue_after_estate(self, sender: str) -> None:
+        if self._configuration.workflow_mode == "simple_pricing":
+            estate = await self._orchestrator.request_requirement_validation(sender)
+            await self._send_text(
+                sender,
+                "*Seller confirmation required*\n\nReview the captured SKU names, "
+                "quantities, subscription terms, and dates. Correct any line before "
+                "continuing. Pricing will only be calculated after you confirm.",
+            )
+            await self._send_interactive(
+                sender,
+                InteractiveButtons(
+                    body=InteractiveText(
+                        text=(
+                            f"Confirm the captured requirement: {len(estate.lines)} SKU "
+                            f"line(s), {estate.total_renewal_quantity:,} licences?"
+                        )
+                    ),
+                    footer=InteractiveFooter(
+                        text="Use natural language to correct a SKU or quantity first."
+                    ),
+                    action=InteractiveButtonAction(
+                        buttons=[
+                            InteractiveButton(
+                                reply=InteractiveReply(
+                                    id="licensing|validate_initial|confirm",
+                                    title="Confirm requirement",
+                                )
+                            ),
+                            InteractiveButton(
+                                reply=InteractiveReply(
+                                    id="licensing|validate_initial|reject",
+                                    title="Make corrections",
+                                )
+                            ),
+                        ]
+                    ),
+                ),
+            )
+            return
         if self._configuration.workflow_mode in {
             "renewal_only",
             "upgrade_comparison",
@@ -733,7 +1149,7 @@ class WhatsAppWebhookService:
             scenario = await self._orchestrator.build_scenario(
                 sender,
                 ScenarioType.RENEW_AS_IS,
-                # The pricebook's enterprise-suite rows are promotion-only. Pricing is
+                # The enterprise-suite rows are promotion-only. Pricing is
                 # provisional until the explicit initial seller-validation gate below.
                 promo_eligible=True,
             )
@@ -755,7 +1171,7 @@ class WhatsAppWebhookService:
                 id=f"licensing|scenario|{scenario.value}",
                 title=scenario.label,
                 description={
-                    ScenarioType.RENEW_AS_IS: "Retain and price the current estate",
+                    ScenarioType.RENEW_AS_IS: "Retain and price the uploaded requirement",
                     ScenarioType.ME3_COPILOT: "Annual ME3; Copilot remains independent",
                     ScenarioType.ME5_COPILOT: "Annual ME5; Copilot remains independent",
                     ScenarioType.ME7: "Annual ME7; no add-on bundle assumptions",
@@ -776,7 +1192,155 @@ class WhatsAppWebhookService:
             ),
         )
 
+    async def _send_updated_requirement(self, sender: str, estate) -> None:
+        await self._send_text(
+            sender,
+            "Requirement updated. Review the refreshed table and confirm when correct.",
+        )
+        await self._send_estate_table(sender, estate)
+        await self._continue_after_estate(sender)
+
+    async def _send_simple_as_is(self, sender: str, scenario) -> None:
+        images = render_simple_pricing_table_images(
+            scenario,
+            title="Renew As-Is cost",
+            currency=self._configuration.currency,
+        )
+        for index, content in enumerate(images, start=1):
+            await self._whatsapp_client.send_image(
+                to=sender,
+                content=content,
+                filename=f"as-is-cost-{index}.png",
+                content_type="image/png",
+                caption=f"Confirmed Renew As-Is cost • Page {index}/{len(images)}",
+            )
+        estate, current, _revised = await self._orchestrator.simple_review(sender)
+        pdf = render_simple_commercial_pdf(
+            estate,
+            current,
+            currency=self._configuration.currency,
+        )
+        await self._whatsapp_client.send_document(
+            to=sender,
+            content=pdf,
+            filename="as-is-commercial.pdf",
+            content_type="application/pdf",
+            caption="Confirmed Renew As-Is commercial review",
+        )
+
+    async def _send_recommendation_prompt(self, sender: str) -> None:
+        prompt = (
+            "Would you like me to evaluate any upgrades, replacements, additions, "
+            "removals, or quantity changes?"
+        )
+        try:
+            await self._send_interactive(
+                sender,
+                InteractiveButtons(
+                    body=InteractiveText(text=prompt),
+                    action=InteractiveButtonAction(
+                        buttons=[
+                            InteractiveButton(
+                                reply=InteractiveReply(
+                                    id="licensing|recommend|yes",
+                                    title="Yes, revise",
+                                )
+                            ),
+                            InteractiveButton(
+                                reply=InteractiveReply(
+                                    id="licensing|recommend|no",
+                                    title="No changes",
+                                )
+                            ),
+                            InteractiveButton(
+                                reply=InteractiveReply(
+                                    id="licensing|finalize|active",
+                                    title="Finalize as-is",
+                                )
+                            ),
+                        ]
+                    ),
+                ),
+            )
+        except WhatsAppAPIError as error:
+            logger.warning(
+                "Recommendation buttons unavailable; using text fallback status=%s",
+                error.status_code,
+            )
+            await self._send_text(
+                sender,
+                prompt
+                + " Please describe the required change, or reply “No changes” to retain "
+                "the Renew As-Is configuration.",
+            )
+
+    async def _send_simple_revised(self, sender: str, scenario) -> None:
+        pricing_images = render_simple_pricing_table_images(
+            scenario,
+            title=f"{scenario.scenario_type.label} · Revision {scenario.revision}",
+            currency=self._configuration.currency,
+        )
+        for index, content in enumerate(pricing_images, start=1):
+            await self._whatsapp_client.send_image(
+                to=sender,
+                content=content,
+                filename=f"revised-cost-{index}.png",
+                content_type="image/png",
+                caption=(
+                    f"{scenario.scenario_type.label} proposal • Revision "
+                    f"{scenario.revision} • Page {index}/{len(pricing_images)}"
+                ),
+            )
+        if scenario.status != ScenarioStatus.FINAL:
+            await self._send_interactive(
+                sender,
+                InteractiveButtons(
+                    body=InteractiveText(
+                        text=(
+                            f"{scenario.scenario_type.label} revision {scenario.revision} "
+                            "was recalculated and saved independently. Continue editing, "
+                            "compare all four proposals, or finalize this option."
+                        )
+                    ),
+                    action=InteractiveButtonAction(
+                        buttons=[
+                            InteractiveButton(
+                                reply=InteractiveReply(
+                                    id="licensing|compare|all",
+                                    title="Get comparison PDF",
+                                )
+                            ),
+                            InteractiveButton(
+                                reply=InteractiveReply(
+                                    id="licensing|finalize|active",
+                                    title="Finalize",
+                                )
+                            ),
+                        ]
+                    ),
+                ),
+            )
+
+    async def _send_simple_commercial_pdf(self, sender: str) -> None:
+        estate, current, revised = await self._orchestrator.simple_review(sender)
+        pdf = render_simple_commercial_pdf(
+            estate,
+            current,
+            revised,
+            currency=self._configuration.currency,
+        )
+        await self._whatsapp_client.send_document(
+            to=sender,
+            content=pdf,
+            filename="renew-as-is-vs-selected.pdf",
+            content_type="application/pdf",
+            caption="Confirmed Renew As-Is vs selected proposal",
+        )
+
     async def _send_scenario(self, sender: str, scenario) -> None:
+        if self._configuration.workflow_mode == "simple_pricing":
+            await self._send_simple_revised(sender, scenario)
+            return
         await self._send_scenario_table(sender, scenario)
         session = await self._orchestrator.get_session(sender)
         if session is not None and session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION:
@@ -897,9 +1461,13 @@ class WhatsAppWebhookService:
         result: SkuChangeResult,
     ) -> None:
         if result.state == "applied":
-            if result.scenario is None:
-                raise RuntimeError("Applied SKU change did not return a scenario.")
-            await self._send_scenario(sender, result.scenario)
+            if result.estate is not None:
+                await self._send_updated_requirement(sender, result.estate)
+                return
+            if result.scenario is not None:
+                await self._send_scenario(sender, result.scenario)
+                return
+            raise RuntimeError("Applied SKU change returned no updated state.")
             return
         pending = result.confirmation
         if pending is None:
@@ -951,25 +1519,35 @@ class WhatsAppWebhookService:
             await self._send_text(
                 sender,
                 "Bundle comparison is not enabled because no authoritative bundling "
-                "rules are available. I will provide the current renewal proposal instead.",
+                "rules are available. I will provide the Renew As-Is proposal instead.",
             )
             await self._send_active_proposal_pdf(sender)
             return
         estate, scenarios, comparison = await self._orchestrator.comparison(sender)
+        if self._configuration.workflow_mode == "simple_pricing":
+            await self._send_text(
+                sender,
+                "Four annual proposals are ready. Each option uses its latest saved "
+                "revision, and seller changes remain attached only to the option where "
+                "they were made.",
+            )
         await self._send_comparison_table(sender, comparison)
         pdf = render_comparison_pdf(
             estate,
             scenarios,
             comparison,
             currency=self._configuration.currency,
+            include_internal_commercial_fields=(
+                self._configuration.workflow_mode != "simple_pricing"
+            ),
         )
         try:
             await self._whatsapp_client.send_document(
                 to=sender,
                 content=pdf,
-                filename="licensing-commercial-comparison.pdf",
+                filename="annual-licensing-comparison.pdf",
                 content_type="application/pdf",
-                caption="Customer-ready licensing commercial comparison",
+                caption="Four-option annual licensing comparison",
             )
         except WhatsAppAPIError as error:
             logger.error(
@@ -1054,6 +1632,22 @@ class WhatsAppWebhookService:
         if session is None:
             raise ValueError("Upload a licence file before confirming validation.")
         if session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION:
+            if self._configuration.workflow_mode == "simple_pricing":
+                await self._orchestrator.confirm_requirement(sender)
+                scenario = await self._orchestrator.build_scenario(
+                    sender,
+                    ScenarioType.RENEW_AS_IS,
+                    promo_eligible=False,
+                )
+                await self._orchestrator.save_confirmed_as_is(sender, scenario)
+                await self._send_text(
+                    sender,
+                    "Requirement confirmed. I calculated the Renew As-Is annual cost "
+                    "from the approved SKU configuration.",
+                )
+                await self._send_simple_as_is(sender, scenario)
+                await self._send_recommendation_prompt(sender)
+                return
             scenario = await self._orchestrator.confirm_initial_validation(sender)
             await self._send_text(
                 sender,
@@ -1073,6 +1667,14 @@ class WhatsAppWebhookService:
         if session is None:
             raise ValueError("Upload a licence file before responding to validation.")
         if session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION:
+            if self._configuration.workflow_mode == "simple_pricing":
+                await self._send_text(
+                    sender,
+                    "Requirement confirmation was not recorded. Please specify the SKU or "
+                    "quantity corrections you would like me to apply. I will validate the "
+                    "changes and present an updated confirmation table before pricing.",
+                )
+                return
             await self._send_text(
                 sender,
                 "Initial validation was not recorded. Re-upload a corrected customer "
@@ -1093,6 +1695,39 @@ class WhatsAppWebhookService:
 
     async def _request_finalization(self, sender: str) -> None:
         scenario = await self._orchestrator.request_finalization(sender)
+        if self._configuration.workflow_mode == "simple_pricing":
+            await self._send_interactive(
+                sender,
+                InteractiveButtons(
+                    body=InteractiveText(
+                        text=(
+                            "*Final seller validation required*\n\n"
+                            f"Proposal: {scenario.scenario_type.label}\n"
+                            f"Revision: {scenario.revision}\n"
+                            f"Annual value: {format_money(scenario.total_value, self._configuration.currency)}\n\n"
+                            "Confirm that the SKU configuration, quantities, terms, and "
+                            "commercial values are correct."
+                        )
+                    ),
+                    action=InteractiveButtonAction(
+                        buttons=[
+                            InteractiveButton(
+                                reply=InteractiveReply(
+                                    id="licensing|validate_final|confirm",
+                                    title="Confirm & finalize",
+                                )
+                            ),
+                            InteractiveButton(
+                                reply=InteractiveReply(
+                                    id="licensing|validate_final|reject",
+                                    title="Continue editing",
+                                )
+                            ),
+                        ]
+                    ),
+                ),
+            )
+            return
         discount_amount = (
             scenario.subtotal * scenario.discount_percentage / Decimal("100")
         )
@@ -1138,6 +1773,10 @@ class WhatsAppWebhookService:
             sender,
             "Final seller validation recorded. The proposal is now finalized.",
         )
+        if self._configuration.workflow_mode == "simple_pricing":
+            await self._send_simple_revised(sender, scenario)
+            await self._send_simple_commercial_pdf(sender)
+            return
         await self._send_scenario(sender, scenario)
         if self._configuration.workflow_mode in {
             "renewal_only",
@@ -1182,8 +1821,6 @@ class WhatsAppWebhookService:
         term_duration: str | None = None,
         billing_plan: str | None = None,
     ) -> None:
-        if self._configuration.workflow_mode != "upgrade_comparison":
-            return
         if term_duration is not None and term_duration.casefold() != "p1y":
             raise ValueError(
                 "This workflow is fixed to a one-year term (P1Y) for every option."
@@ -1192,6 +1829,25 @@ class WhatsAppWebhookService:
             raise ValueError(
                 "This workflow is fixed to annual billing for every option."
             )
+
+    @staticmethod
+    def _requests_monthly_billing(message: str) -> bool:
+        monthly_terms = ("monthly", "month-to-month", "per month", "p1m")
+        return any(value in message for value in monthly_terms)
+
+    @staticmethod
+    def _requests_restricted_pricing(message: str) -> bool:
+        restricted_terms = (
+            "promo",
+            "promotion",
+            "promotional",
+            "partner best",
+            "partner-best",
+            "best offer",
+            "best price",
+            "distributor margin",
+        )
+        return any(value in message for value in restricted_terms)
 
     async def _send_active_proposal_pdf(self, sender: str) -> None:
         session = await self._orchestrator.get_session(sender)
@@ -1228,6 +1884,38 @@ class WhatsAppWebhookService:
                 error.network_error,
             )
             raise
+
+    async def _resolve_replace_quantity(
+        self,
+        sender: str,
+        line_id: str,
+        requested: int,
+    ) -> int:
+        if requested >= 0:
+            return self._required_quantity(requested, allow_zero=False)
+        session = await self._orchestrator.get_session(sender)
+        if session is None:
+            raise ValueError("Provide a replacement quantity.")
+        normalized_id = line_id.upper()
+        if session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION and session.estate:
+            line = next(
+                (item for item in session.estate.lines if item.line_id == normalized_id),
+                None,
+            )
+            if line is not None:
+                return line.renewal_quantity
+        if session.active_scenario is not None:
+            scenario = session.scenarios.get(session.active_scenario)
+            if scenario is not None:
+                line = next(
+                    (item for item in scenario.lines if item.line_id == normalized_id),
+                    None,
+                )
+                if line is not None:
+                    return line.proposed_quantity or line.existing_quantity
+        raise ValueError(
+            f"Line {normalized_id} was not found; provide an explicit replacement quantity."
+        )
 
     async def _send_text(self, sender: str, body: str) -> None:
         try:

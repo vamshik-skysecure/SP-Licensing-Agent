@@ -16,6 +16,7 @@ from app.core.dispatch import (
 )
 from app.core.licensing.agent import IntentInterpreter, OpenAIIntentInterpreter
 from app.core.licensing.analysis import LicenseAnalyzer
+from app.core.licensing.capture import OpenAIRequirementExtractor, RequirementExtractor
 from app.core.licensing.migration_rules import MigrationSeedCatalog
 from app.core.licensing.orchestrator import LicensingOrchestrator
 from app.core.licensing.rate_card import (
@@ -103,14 +104,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     analyzer = LicenseAnalyzer(
         rate_cards,
         match_threshold=settings.sku_match_threshold,
+        default_term_duration=settings.default_term_duration,
+        default_billing_plan=settings.default_billing_plan,
     )
     migration_seeds = MigrationSeedCatalog.load(settings.migration_seed_path)
     scenario_engine = ScenarioEngine(
         migration_seeds,
         apply_bundle_rules=settings.workflow_mode == "scenario_comparison",
+        price_basis=(
+            "marketplace"
+            if settings.workflow_mode == "simple_pricing"
+            else "partner_best_offer"
+        ),
     )
     catalog = await rate_cards.get()
-    if settings.workflow_mode in {"upgrade_comparison", "scenario_comparison"}:
+    if settings.workflow_mode == "simple_pricing" and not any(
+        item.marketplace_price > 0 for item in catalog.items
+    ):
+        raise ValueError(
+            "The simple pricing workflow requires a populated current-price column."
+        )
+    if settings.workflow_mode in {
+        "simple_pricing",
+        "upgrade_comparison",
+        "scenario_comparison",
+    }:
         scenario_engine.validate_catalog(
             catalog,
             term_duration=settings.default_term_duration,
@@ -141,6 +159,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             api_key=settings.openai_api_key,
             model=settings.openai_model,
             reasoning_effort=settings.openai_reasoning_effort,
+            workflow_mode=settings.workflow_mode,
+        )
+    requirement_extractor: RequirementExtractor | None = None
+    if settings.requirement_capture_backend == "openai":
+        requirement_extractor = OpenAIRequirementExtractor(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            transcription_model=settings.openai_transcription_model,
+            max_audio_seconds=settings.max_audio_seconds,
+            reasoning_effort=settings.openai_reasoning_effort,
         )
     webhook_service = WhatsAppWebhookService(
         whatsapp_client=whatsapp_client,
@@ -148,10 +176,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configuration=ServiceConfiguration(
             seller_allowlist=settings.seller_allowlist,
             max_document_bytes=settings.max_document_bytes,
+            max_image_bytes=settings.max_image_bytes,
+            max_audio_bytes=settings.max_audio_bytes,
             currency=settings.default_currency,
             workflow_mode=settings.workflow_mode,
         ),
         intent_interpreter=intent_interpreter,
+        requirement_extractor=requirement_extractor,
     )
 
     dispatcher: WebhookDispatcher
@@ -184,6 +215,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await rate_cards.close()
         if intent_interpreter is not None:
             await intent_interpreter.close()
+        if requirement_extractor is not None:
+            await requirement_extractor.close()
         await whatsapp_http_client.aclose()
         logger.info("Application shutdown completed")
 

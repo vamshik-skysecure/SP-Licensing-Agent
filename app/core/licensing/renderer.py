@@ -25,7 +25,7 @@ def format_estate(
     include_migration_review: bool = True,
 ) -> str:
     lines = [
-        "*Current licence estate*",
+        "*Captured licensing requirement*",
         f"Source: {estate.source_file}",
         f"SKU lines: {len(estate.lines)}",
         f"Total licences: {sum(item.total_licenses for item in estate.lines):,}",
@@ -44,6 +44,8 @@ def format_estate(
                     f"Total: {item.total_licenses:,} | Assigned: "
                     f"{item.assigned_licenses:,} | Expired: {item.expired_licenses:,}",
                     f"Renewal quantity: {item.renewal_quantity:,}",
+                    f"Term/billing: {item.term_duration or '-'} / "
+                    f"{item.billing_plan or '-'}",
                     f"Renewal/expiration: {_date(date_value)}",
                 )
             )
@@ -53,9 +55,9 @@ def format_estate(
             f"{len(estate.pending_lines)} SKU matches require confirmation before pricing."
         )
     else:
-        lines.extend(("", "All uploaded SKUs matched the maintained pricebook."))
+        lines.extend(("", "All captured SKUs matched the approved catalogue."))
         if include_migration_review:
-            lines.append("Choose a commercial scenario to prepare.")
+            lines.append("Confirm the requirement to continue.")
     return "\n".join(lines).strip()
 
 
@@ -71,8 +73,8 @@ def format_pending_matches(estate: LicenseEstate) -> str:
     lines.extend(
         (
             "",
-            "Reply naturally with every choice, for example:",
-            "“For L1 choose option 1, and for L2 choose option 2.”",
+            "Please confirm one candidate for each unresolved line using the displayed "
+            "line and option numbers.",
         )
     )
     return "\n".join(lines)
@@ -146,6 +148,7 @@ def estate_line_flags(
 def render_estate_pdf(
     estate: LicenseEstate,
     *,
+    report_title: str = "Customer Licence Estate",
     as_of: date | None = None,
     near_expiry_days: int = 90,
     include_migration_review: bool = True,
@@ -182,7 +185,7 @@ def render_estate_pdf(
         leftMargin=10 * mm,
         topMargin=10 * mm,
         bottomMargin=10 * mm,
-        title="Customer Licence Estate",
+        title=report_title,
     )
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
@@ -192,13 +195,11 @@ def render_estate_pdf(
         textColor=colors.HexColor("#17365D"),
     )
     story: list[object] = [
-        Paragraph("Customer Licence Estate", title_style),
+        Paragraph(escape(report_title), title_style),
         Spacer(1, 3 * mm),
-        Paragraph(f"Source file: {escape(estate.source_file)}", styles["Normal"]),
         Paragraph(f"Report date: {report_date.isoformat()}", styles["Normal"]),
         Paragraph(
-            f"Near-expiry window: {near_expiry_days} days | "
-            f"Rate-card version: {escape(estate.rate_card_version)}",
+            f"Near-expiry review window: {near_expiry_days} days",
             styles["Normal"],
         ),
         Spacer(1, 4 * mm),
@@ -227,6 +228,7 @@ def render_estate_pdf(
             "Expired",
             "Renew",
             "Assigned",
+            "Term / billing",
             "Renewal / expiry",
             "Migration review" if include_migration_review else "Match status",
         ]]
@@ -244,6 +246,7 @@ def render_estate_pdf(
                 str(line.expired_licenses),
                 str(line.renewal_quantity),
                 str(line.assigned_licenses),
+                f"{line.term_duration or '-'} / {line.billing_plan or '-'}",
                 _date(line.renewal_date or line.expiration_date),
                 Paragraph(
                     escape(
@@ -261,7 +264,18 @@ def render_estate_pdf(
         story.extend([
             _table(
                 data,
-                [12 * mm, 35 * mm, 65 * mm, 15 * mm, 15 * mm, 15 * mm, 18 * mm, 28 * mm, 43 * mm],
+                [
+                    12 * mm,
+                    32 * mm,
+                    52 * mm,
+                    13 * mm,
+                    13 * mm,
+                    13 * mm,
+                    15 * mm,
+                    31 * mm,
+                    28 * mm,
+                    43 * mm,
+                ],
             ),
             Spacer(1, 4 * mm),
         ])
@@ -400,7 +414,7 @@ def format_comparison(
         lines.extend(
             (
                 "",
-                f"*{row.scenario_type.label}*",
+                f"*{row.scenario_type.label} · Revision {row.revision}*",
                 f"Annual total: *{format_money(row.total_cost, currency)}*",
                 "Difference: "
                 + _comparison_difference(
@@ -488,11 +502,8 @@ def render_proposal_pdf(
     story: list[object] = [
         Paragraph("SP/SSP Licensing Renewal Proposal", title_style),
         Spacer(1, 3 * mm),
-        Paragraph(f"Source file: {escape(estate.source_file)}", styles["Normal"]),
-        Paragraph(f"Rate-card version: {escape(estate.rate_card_version)}", styles["Normal"]),
         Paragraph(
-            f"Revision: {scenario.revision} | Status: {scenario.status.value} | "
-            f"Term: {escape(scenario.term_duration)} | "
+            f"Status: {scenario.status.value} | Term: {escape(scenario.term_duration)} | "
             f"Billing: {escape(scenario.billing_plan)} | "
             f"Segment: {escape(scenario.segment)}",
             styles["Normal"],
@@ -594,12 +605,211 @@ def render_proposal_pdf(
     return output.getvalue()
 
 
+def render_simple_commercial_pdf(
+    estate: LicenseEstate,
+    current: CommercialScenario,
+    revised: CommercialScenario | None = None,
+    *,
+    currency: str = "INR",
+    pricing_source: str = "Applicable annual licence price",
+) -> bytes:
+    """Customer-facing v1 PDF that intentionally omits internal commercial fields."""
+
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+
+    output = io.BytesIO()
+    document = SimpleDocTemplate(
+        output,
+        pagesize=landscape(A4),
+        rightMargin=10 * mm,
+        leftMargin=10 * mm,
+        topMargin=10 * mm,
+        bottomMargin=10 * mm,
+        title="Microsoft Licensing Commercial Review",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "SimpleCommercialTitle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#17365D"),
+    )
+    cell_style = ParagraphStyle(
+        "SimpleCommercialCell",
+        parent=styles["BodyText"],
+        fontSize=7,
+        leading=8,
+    )
+    story: list[object] = [
+        Paragraph("Microsoft Licensing Commercial Review", title_style),
+        Spacer(1, 3 * mm),
+        Paragraph(f"Pricing basis: {escape(pricing_source)}", styles["Normal"]),
+        Paragraph(
+            "Pricing logic: the exact approved SKU identity and submitted term/billing are "
+            "used; applicable unit prices are multiplied by confirmed quantities.",
+            styles["Normal"],
+        ),
+        Spacer(1, 5 * mm),
+    ]
+
+    def add_configuration(title: str, scenario: CommercialScenario) -> None:
+        story.append(Paragraph(title, styles["Heading2"]))
+        data: list[list[object]] = [[
+            "Line",
+            "SKU",
+            "Quantity",
+            "Billing term",
+            "Unit price",
+            "Total price",
+            "Price status",
+        ]]
+        for line in scenario.lines:
+            status = (
+                "PRICE UNAVAILABLE - excluded from total"
+                if line.price_unavailable
+                else "Priced"
+            )
+            data.append([
+                line.line_id,
+                Paragraph(escape(line.sku_title), cell_style),
+                str(line.proposed_quantity),
+                f"{line.term_duration} / {line.billing_plan}",
+                format_money(line.unit_price, currency),
+                format_money(line.extended_price, currency),
+                Paragraph(escape(status), cell_style),
+            ])
+        story.extend([
+            _table(
+                data,
+                [16 * mm, 82 * mm, 22 * mm, 42 * mm, 32 * mm, 34 * mm, 47 * mm],
+                font_size=7,
+                cell_padding=3,
+            ),
+            Spacer(1, 3 * mm),
+            _table(
+                [["Overall requirement value", format_money(scenario.total_value, currency)]],
+                [75 * mm, 55 * mm],
+            ),
+        ])
+        if scenario.unresolved_decisions:
+            story.append(Paragraph("Pricing warnings", styles["Heading3"]))
+            for decision in scenario.unresolved_decisions:
+                story.append(Paragraph(f"- {escape(decision)}", styles["Normal"]))
+
+    add_configuration("Confirmed Renew As-Is configuration", current)
+    if revised is not None:
+        story.extend([PageBreak()])
+        add_configuration("Recommended / revised configuration", revised)
+        difference = revised.total_value - current.total_value
+        story.extend([
+            Spacer(1, 4 * mm),
+            Paragraph("Commercial comparison", styles["Heading2"]),
+            _table(
+                [
+                    ["Configuration", "Value"],
+                    ["Confirmed Renew As-Is", format_money(current.total_value, currency)],
+                    [
+                        revised.scenario_type.label,
+                        format_money(revised.total_value, currency),
+                    ],
+                    ["Difference", _signed_money(difference, currency)],
+                ],
+                [80 * mm, 60 * mm],
+            ),
+            Spacer(1, 4 * mm),
+            Paragraph("Replacement / addition details", styles["Heading3"]),
+        ])
+        for change in _simple_configuration_changes(current, revised):
+            story.append(Paragraph(f"- {escape(change)}", styles["Normal"]))
+        story.extend([
+            Spacer(1, 3 * mm),
+            Paragraph(
+                "Promotion eligibility and best-price rules are not applied until the "
+                "business rule sheet is approved and integrated.",
+                styles["Normal"],
+            ),
+        ])
+
+    document.build(story)
+    return output.getvalue()
+
+
+def _signed_money(value: Decimal, currency: str) -> str:
+    if value > 0:
+        return f"+{format_money(value, currency)}"
+    if value < 0:
+        return f"-{format_money(abs(value), currency)}"
+    return format_money(value, currency)
+
+
+def _simple_configuration_changes(
+    current: CommercialScenario,
+    revised: CommercialScenario,
+) -> list[str]:
+    current_by_source = {
+        (line.source_line_id or line.line_id): line for line in current.lines
+    }
+    revised_by_source = {
+        (line.source_line_id or line.line_id): line for line in revised.lines
+    }
+    changes: list[str] = []
+    consumed_additions: set[str] = set()
+    for key, old in current_by_source.items():
+        new = revised_by_source.get(key)
+        if new is None or new.proposed_quantity == 0:
+            replacement_prefix = "Replaced by seller with "
+            if new is not None and (new.note or "").startswith(replacement_prefix):
+                target_title = (new.note or "")[len(replacement_prefix) :]
+                added = next(
+                    (
+                        (added_key, item)
+                        for added_key, item in revised_by_source.items()
+                        if added_key not in current_by_source
+                        and item.sku_title.casefold() == target_title.casefold()
+                        and item.proposed_quantity > 0
+                    ),
+                    None,
+                )
+                if added is not None:
+                    consumed_additions.add(added[0])
+                    changes.append(
+                        f"Replaced {old.sku_title} with {added[1].sku_title} "
+                        f"({added[1].proposed_quantity} licences)."
+                    )
+                    continue
+            changes.append(f"Removed {old.sku_title} ({old.proposed_quantity} licences).")
+        elif (old.product_id, old.sku_id) != (new.product_id, new.sku_id):
+            changes.append(
+                f"Replaced {old.sku_title} with {new.sku_title} "
+                f"({new.proposed_quantity} licences)."
+            )
+        elif old.proposed_quantity != new.proposed_quantity:
+            changes.append(
+                f"Changed {old.sku_title} quantity from {old.proposed_quantity} "
+                f"to {new.proposed_quantity}."
+            )
+    for key, new in revised_by_source.items():
+        if (
+            key not in current_by_source
+            and key not in consumed_additions
+            and new.proposed_quantity > 0
+        ):
+            changes.append(f"Added {new.sku_title} ({new.proposed_quantity} licences).")
+    return changes or ["No SKU or quantity changes were made."]
+
+
 def render_comparison_pdf(
     estate: LicenseEstate,
     scenarios: list[CommercialScenario],
     comparison: CommercialComparison,
     *,
     currency: str = "INR",
+    include_internal_commercial_fields: bool = True,
 ) -> bytes:
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER
@@ -648,9 +858,6 @@ def render_comparison_pdf(
             styles["Heading2"],
         ),
         Paragraph(escape(comparison.recommendation_rationale), styles["Normal"]),
-        Spacer(1, 3 * mm),
-        Paragraph(f"Source file: {estate.source_file}", styles["Normal"]),
-        Paragraph(f"Rate-card version: {estate.rate_card_version}", styles["Normal"]),
         Spacer(1, 5 * mm),
     ]
 
@@ -668,14 +875,14 @@ def render_comparison_pdf(
         )
     story.extend(
         [
-            Paragraph("Current licence estate", styles["Heading2"]),
+            Paragraph("Confirmed licensing requirement", styles["Heading2"]),
             _table(estate_data, [42 * mm, 95 * mm, 20 * mm, 20 * mm, 20 * mm, 36 * mm]),
             Spacer(1, 6 * mm),
         ]
     )
 
     comparison_data = [[
-        "Scenario",
+        "Proposal",
         "Base",
         "Copilot",
         "Additional / Retained",
@@ -704,7 +911,15 @@ def render_comparison_pdf(
     )
 
     for scenario in scenarios:
-        story.extend((PageBreak(), Paragraph(scenario.scenario_type.label, title_style)))
+        story.extend(
+            (
+                PageBreak(),
+                Paragraph(
+                    scenario.scenario_type.label,
+                    title_style,
+                ),
+            )
+        )
         detail = [[
             "SKU",
             "Action",
@@ -746,17 +961,23 @@ def render_comparison_pdf(
                     Paragraph(escape(line.note or "-"), detail_cell_style),
                 ]
             )
-        discount_amount = (
-            scenario.subtotal * scenario.discount_percentage / Decimal("100")
-        )
-        financial_summary = [
-            ["Commercial field", "Value"],
-            ["Subtotal", format_money(scenario.subtotal, currency)],
-            ["Discount percentage", f"{scenario.discount_percentage:,.2f}%"],
-            ["Discount amount", format_money(discount_amount, currency)],
-            ["Adjustment amount", format_money(scenario.adjustment_amount, currency)],
-            ["Final total", format_money(scenario.total_value, currency)],
-        ]
+        if include_internal_commercial_fields:
+            discount_amount = (
+                scenario.subtotal * scenario.discount_percentage / Decimal("100")
+            )
+            financial_summary = [
+                ["Commercial field", "Value"],
+                ["Subtotal", format_money(scenario.subtotal, currency)],
+                ["Discount percentage", f"{scenario.discount_percentage:,.2f}%"],
+                ["Discount amount", format_money(discount_amount, currency)],
+                ["Adjustment amount", format_money(scenario.adjustment_amount, currency)],
+                ["Final total", format_money(scenario.total_value, currency)],
+            ]
+        else:
+            financial_summary = [
+                ["Commercial field", "Value"],
+                ["Overall annual value", format_money(scenario.total_value, currency)],
+            ]
         story.extend(
             [
                 Spacer(1, 4 * mm),

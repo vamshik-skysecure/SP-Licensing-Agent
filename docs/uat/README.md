@@ -26,6 +26,7 @@ business-demonstration file. Use `synthetic_enterprise_estate.csv` for complete 
 |---|---|
 | `synthetic_enterprise_estate.csv` | Canonical synthetic WhatsApp upload |
 | `synthetic_enterprise_estate.xlsx` | Formatted Excel version of the same estate |
+| `input_formats/` | Equivalent CSV, Excel, Word, PDF, image, text, and voice UAT inputs |
 | `customer_license_upload_template.csv` | Blank integration template |
 | `migration_seed_business_review.csv` | Row-by-row licensing approval worksheet |
 | `UAT_EXECUTION_RECORD.md` | Tester evidence and sign-off record |

@@ -4,7 +4,7 @@
 
 The draft PRD's domain boundaries are retained, but the seven-agent supervisor design is replaced by a deterministic persisted workflow.
 
-This workflow is commercial software: SKU identity, quantities, prices, discounts, and totals must be reproducible and auditable. The official OpenAI Python SDK and Responses API translate natural language into one validated action, but the model is not an authority for commercial state changes. Deterministic command handlers remain available as operational fallbacks.
+This workflow is commercial software: SKU identity, quantities, Marketplace prices, and totals must be reproducible and auditable. The official OpenAI Python SDK provides structured natural-language intent, multimodal requirement extraction, and bounded voice transcription, but the model is not an authority for SKU matching, price selection, calculations, or commercial state changes. Deterministic command handlers remain available as operational fallbacks.
 
 The linked `ssp-v2-boilerplate` repository was assessed and is not used as a code base. Its own guide identifies it as an early scaffold with empty prompts/tools, an invalid model wrapper, no graph, no WhatsApp route, no tests, and no production wiring. Its data-contract and acceptance-criteria ideas informed this implementation.
 
@@ -20,7 +20,9 @@ FastAPI webhook -- signature + allowlist + size/type checks
 Azure Service Bus queue -- duplicate detection, retries, DLQ
         |
         v
-OpenAI Responses API intent adapter (free-form messages only)
+OpenAI structured capture/intent adapters
+  |-- Responses API: text, files, and screenshots
+  +-- Audio Transcriptions API: bounded voice notes
         |
         v
 Deterministic licensing workflow
@@ -47,8 +49,10 @@ Azure Blob Storage -> maintained Excel workbook -> Final Output Sheet cache
 - The rate-card workbook is read directly, so the business can update the Final Output Sheet without coordinating changes with hidden Phase 1 code.
 
 The intent adapter uses a strict JSON Schema and receives only the seller message plus a
-bounded workflow summary. It never receives the workbook or uploaded file bytes. Its output
-is validated again before the same deterministic operations used by buttons and commands run.
+bounded workflow summary. The capture adapter receives an individual seller-supplied file,
+image, or transcript only when deterministic spreadsheet parsing cannot handle the input.
+Neither adapter receives the pricing workbook. Both outputs are validated, matched against
+the deterministic catalogue, and shown to the seller for confirmation before pricing.
 
 LangGraph can still be introduced later if genuine long-running human interrupts require it. If introduced, use a deterministic `StateGraph` and an appropriate durable checkpointer; do not move pricing or migration decisions into model nodes.
 
@@ -73,13 +77,17 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 ### Excel-only commercial authority
 
 - `Final Output Sheet` is the licensing catalogue and pricing source.
-- `Partner Best Offer` is the direct seller quote. Promotional rows require explicit
-  seller confirmation of promotion eligibility; they are not reused as standard prices.
-- `WORKFLOW_MODE=upgrade_comparison` is the default. It automatically prepares Renew As-Is,
-  then compares annual P1Y/Annual ME3, ME5, and ME7 upgrades on request.
-- In `upgrade_comparison`, the requested core-suite upgrade is automatic, but every non-core
-  add-on remains separately licensed and priced until the seller explicitly edits it. No
-  migration seed or bundle entitlement is applied.
+- `Price on Marketplace` is the sole price basis for `WORKFLOW_MODE=simple_pricing`, the
+  current default. Partner Best Offer, distributor price, margin, and promotion columns are
+  not used or exposed in this workflow.
+- The three-step state machine is capture/reconfirm, show the as-is cost, then optionally
+  revise SKUs/quantities and compare the revised value with the immutable as-is snapshot.
+- Seller-directed ME3, ME5, ME7, Copilot, add, replace, remove, and quantity changes are
+  priceable without asserting that an add-on is bundled. Generic recommendation requests
+  ask for a capability/target and user count until the authoritative rule sheet exists.
+- Promotion and best-eligible-price logic is deliberately inactive until the separately
+  maintained business rule sheet is approved and integrated.
+- `WORKFLOW_MODE=upgrade_comparison` remains available for the prior four-option workflow.
 - `WORKFLOW_MODE=scenario_comparison` is reserved for a future approved bundling dataset.
 - The required workflow options identify E3, E5, E7, and standalone Copilot by exact title;
   their ProductId, SkuId, term, billing plan, and prices are resolved from the current sheet.
@@ -89,7 +97,7 @@ LangGraph can still be introduced later if genuine long-running human interrupts
   rows remain `approved=false`; provenance improves review context but cannot change a
   disposition. An authorized business reviewer can promote an individual row to explicit
   configuration by setting `approved=true`. No model-generated mapping is accepted at runtime.
-- Exact E3/E5/E7 core-suite rows can safely feed the target base quantity. In the default
+- Exact E3/E5/E7 core-suite rows can safely feed the target base quantity. In comparison
   mode, every other existing SKU is retained and priced. The seller can explicitly remove,
   replace, or reclassify it; no inferred mapping blocks the comparison.
 - The current sheet contains no field proving that ME7 includes Copilot, so the application
@@ -117,11 +125,10 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 
 ## Workbook boundary
 
-No further reference-licensing dataset is required. The customer licence upload is still
-required per opportunity because it supplies the customer's current quantities and renewal
-dates. The application deliberately does not automate entitlement-level decisions that the
-workbook cannot support: it preserves and prices those licences and presents the seller with
-the required retain, migrate, include, or remove controls.
+No further reference-licensing dataset is required for as-is Marketplace pricing. A seller
+can provide each opportunity as text, voice, image, spreadsheet, Word document, or PDF.
+The application deliberately does not automate entitlement-level or promotion decisions
+that the workbook/rule sheet cannot support; it asks for a seller-directed target instead.
 
 If the business later wants automatic add-on entitlement decisions or an assertion that ME7
 includes Copilot, those facts must first be added as maintained columns or a maintained sheet

@@ -9,7 +9,7 @@ class StorageModeSettingsTests(unittest.TestCase):
     def test_default_local_workflow_uses_v5_final_output(self) -> None:
         settings = Settings(_env_file=None)
 
-        self.assertEqual(settings.workflow_mode, "upgrade_comparison")
+        self.assertEqual(settings.workflow_mode, "simple_pricing")
         self.assertEqual(
             settings.rate_card_local_path.as_posix(),
             "docs/microsoft_sku_v5.xlsx",

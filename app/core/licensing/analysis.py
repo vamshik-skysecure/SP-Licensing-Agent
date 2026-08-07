@@ -23,24 +23,37 @@ class LicenseAnalysisError(ValueError):
 _HEADER_ALIASES = {
     "producttitle": "product_title",
     "productname": "product_title",
+    "sku": "product_title",
+    "skuname": "product_title",
+    "licensename": "product_title",
+    "licencename": "product_title",
     "productid": "product_id",
     "skuid": "sku_id",
     "skupartnumber": "sku_id",
     "totallicenses": "total_licenses",
     "totalquantity": "total_licenses",
+    "quantity": "total_licenses",
+    "qty": "total_licenses",
+    "licensequantity": "total_licenses",
+    "licencequantity": "total_licenses",
     "expiredlicenses": "expired_licenses",
     "assignedlicenses": "assigned_licenses",
     "consumedlicenses": "assigned_licenses",
     "expirationdate": "expiration_date",
     "expirydate": "expiration_date",
     "renewaldate": "renewal_date",
+    "termduration": "term_duration",
+    "subscriptionterm": "term_duration",
+    "licenceterm": "term_duration",
+    "licenseterm": "term_duration",
+    "billingplan": "billing_plan",
+    "billingterm": "billing_plan",
+    "billingfrequency": "billing_plan",
 }
 
 _REQUIRED = {
     "product_title",
     "total_licenses",
-    "expired_licenses",
-    "assigned_licenses",
 }
 
 
@@ -50,9 +63,13 @@ class LicenseAnalyzer:
         rate_cards: RateCardProvider,
         *,
         match_threshold: float = 90.0,
+        default_term_duration: str = "P1Y",
+        default_billing_plan: str = "Annual",
     ) -> None:
         self._rate_cards = rate_cards
         self._match_threshold = match_threshold
+        self._default_term_duration = default_term_duration
+        self._default_billing_plan = default_billing_plan
 
     async def analyze(
         self,
@@ -63,6 +80,36 @@ class LicenseAnalyzer:
     ) -> LicenseEstate:
         catalog = await self._rate_cards.get()
         parsed = parse_customer_file(content, filename)
+        return self._analyze_parsed(
+            thread_id=thread_id,
+            source_file=filename,
+            parsed=parsed,
+            catalog=catalog,
+        )
+
+    async def analyze_parsed(
+        self,
+        *,
+        thread_id: str,
+        source_file: str,
+        parsed: list[ParsedLicenseRow],
+    ) -> LicenseEstate:
+        catalog = await self._rate_cards.get()
+        return self._analyze_parsed(
+            thread_id=thread_id,
+            source_file=source_file,
+            parsed=parsed,
+            catalog=catalog,
+        )
+
+    def _analyze_parsed(
+        self,
+        *,
+        thread_id: str,
+        source_file: str,
+        parsed: list[ParsedLicenseRow],
+        catalog: RateCardCatalog,
+    ) -> LicenseEstate:
         lines = [self._match_row(row, catalog) for row in parsed]
         lines = _aggregate_resolved_lines(lines)
         pending = any(line.match_method == "unresolved" for line in lines)
@@ -70,7 +117,7 @@ class LicenseAnalyzer:
         return LicenseEstate(
             id=thread_id,
             thread_id=thread_id,
-            source_file=Path(filename).name,
+            source_file=Path(source_file).name,
             status=(
                 EstateStatus.AWAITING_MATCH_CONFIRMATION
                 if pending
@@ -175,6 +222,8 @@ class LicenseAnalyzer:
             renewal_quantity=row.renewal_quantity,
             expiration_date=row.expiration_date,
             renewal_date=row.renewal_date,
+            term_duration=row.term_duration or self._default_term_duration,
+            billing_plan=row.billing_plan or self._default_billing_plan,
             match_confidence=selected.confidence if selected else None,
             match_method=method,  # type: ignore[arg-type]
             candidates=[] if selected else candidates,
@@ -185,10 +234,10 @@ def parse_customer_file(content: bytes, filename: str) -> list[ParsedLicenseRow]
     suffix = Path(filename).suffix.casefold()
     if suffix == ".csv":
         rows = _csv_rows(content)
-    elif suffix == ".xlsx":
+    elif suffix in {".xlsx", ".xlsm"}:
         rows = _xlsx_rows(content)
     else:
-        raise LicenseAnalysisError("Upload a .csv or .xlsx licence file.")
+        raise LicenseAnalysisError("Upload a .csv, .xlsx, or .xlsm licence file.")
     return _parse_rows(rows)
 
 
@@ -216,11 +265,24 @@ def _header_key(value: object) -> str:
 
 
 def _parse_rows(rows: Iterable[Sequence[object]]) -> list[ParsedLicenseRow]:
-    iterator = iter(rows)
-    try:
-        raw_headers = next(iterator)
-    except StopIteration as error:
-        raise LicenseAnalysisError("The uploaded licence file is empty.") from error
+    materialized = list(rows)
+    if not materialized:
+        raise LicenseAnalysisError("The uploaded licence file is empty.")
+
+    header_index = -1
+    raw_headers: Sequence[object] = ()
+    for index, candidate_headers in enumerate(materialized[:25]):
+        fields = {
+            _HEADER_ALIASES.get(_header_key(header)) for header in candidate_headers
+        }
+        if _REQUIRED.issubset(fields):
+            header_index = index
+            raw_headers = candidate_headers
+            break
+    if header_index < 0:
+        raise LicenseAnalysisError(
+            "Could not find a header row containing SKU/Product Name and Quantity."
+        )
 
     columns: dict[int, str] = {}
     for index, header in enumerate(raw_headers):
@@ -234,7 +296,10 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[ParsedLicenseRow]:
         )
 
     parsed: list[ParsedLicenseRow] = []
-    for row_number, values in enumerate(iterator, start=2):
+    for row_number, values in enumerate(
+        materialized[header_index + 1 :],
+        start=header_index + 2,
+    ):
         record = {
             field: values[index] if index < len(values) else None
             for index, field in columns.items()
@@ -245,10 +310,10 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[ParsedLicenseRow]:
         if not title:
             raise LicenseAnalysisError(f"Row {row_number}: Product Title is empty.")
         total = _quantity(record.get("total_licenses"), row_number, "Total Licenses")
-        expired = _quantity(
+        expired = _optional_quantity(
             record.get("expired_licenses"), row_number, "Expired Licenses"
         )
-        assigned = _quantity(
+        assigned = _optional_quantity(
             record.get("assigned_licenses"), row_number, "Assigned Licenses"
         )
         if expired > total:
@@ -271,6 +336,8 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[ParsedLicenseRow]:
                 renewal_quantity=total - expired,
                 expiration_date=_date(record.get("expiration_date"), row_number),
                 renewal_date=_date(record.get("renewal_date"), row_number),
+                term_duration=_optional_text(record.get("term_duration")),
+                billing_plan=_optional_text(record.get("billing_plan")),
             )
         )
     if not parsed:
@@ -292,6 +359,12 @@ def _quantity(value: object, row_number: int, name: str) -> int:
     if result < 0:
         raise LicenseAnalysisError(f"Row {row_number}: {name} cannot be negative.")
     return result
+
+
+def _optional_quantity(value: object, row_number: int, name: str) -> int:
+    if value in (None, ""):
+        return 0
+    return _quantity(value, row_number, name)
 
 
 def _optional_text(value: object) -> str | None:
@@ -347,6 +420,8 @@ def _aggregate_resolved_lines(
                 "expired_licenses": current.expired_licenses + line.expired_licenses,
                 "assigned_licenses": current.assigned_licenses + line.assigned_licenses,
                 "renewal_quantity": current.renewal_quantity + line.renewal_quantity,
+                "term_duration": current.term_duration or line.term_duration,
+                "billing_plan": current.billing_plan or line.billing_plan,
             }
         )
         grouped[key] = (merged, result_index)

@@ -1,0 +1,7 @@
+VOICE NOTE UAT SCRIPT - synthetic data only
+
+Read the following aloud as one WhatsApp voice note:
+
+Please capture this one-year licensing requirement with annual billing: 120 Microsoft 365 E3 licences; 30 Power BI Pro licences; 120 Enterprise Mobility + Security E3 licences; 60 Microsoft Teams Phone Standard licences; 120 Microsoft Defender for Office 365 (Plan 1) licences. Present the extracted requirement for my confirmation before calculating the cost.
+
+Expected behavior: the agent displays the transcript, extracts five SKU lines, and pauses for seller confirmation.

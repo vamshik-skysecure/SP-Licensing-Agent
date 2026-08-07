@@ -405,8 +405,7 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
     has_final_offer = "partner_best_offer" in available_fields
     if not has_legacy_quotes and not has_final_offer:
         raise RateCardError(
-            "Missing rate-card price columns: provide Initial Quote With/Without "
-            "Promo or Partner Best Offer."
+            "Missing rate-card price columns: provide a supported commercial-price field."
         )
 
     items: list[RateCardItem] = []
@@ -426,7 +425,7 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
                 raise RateCardError(f"Rate-card row {row_number} has an empty {field}.")
 
         # Microsoft SKU V5.0 makes the maintained Final Output Sheet authoritative.
-        # Its Partner Best Offer is the direct seller quote. Promotional rows are
+        # Its direct seller offer is the quoted commercial value. Promotional rows are
         # deliberately not exposed as a non-promotional price: the seller must first
         # confirm eligibility, while standard rows remain usable in either mode.
         if has_final_offer and not has_legacy_quotes:

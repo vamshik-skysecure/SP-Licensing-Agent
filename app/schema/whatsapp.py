@@ -44,7 +44,11 @@ class WhatsAppImageMessage(BaseModel):
 
 
 class InteractiveText(BaseModel):
-    text: str
+    text: str = Field(max_length=1024)
+
+
+class InteractiveFooter(BaseModel):
+    text: str = Field(max_length=60)
 
 
 class InteractiveRow(BaseModel):
@@ -66,7 +70,7 @@ class InteractiveListAction(BaseModel):
 class InteractiveList(BaseModel):
     type: Literal["list"] = "list"
     body: InteractiveText
-    footer: InteractiveText | None = None
+    footer: InteractiveFooter | None = None
     action: InteractiveListAction
 
 
@@ -87,7 +91,7 @@ class InteractiveButtonAction(BaseModel):
 class InteractiveButtons(BaseModel):
     type: Literal["button"] = "button"
     body: InteractiveText
-    footer: InteractiveText | None = None
+    footer: InteractiveFooter | None = None
     action: InteractiveButtonAction
 
 
@@ -104,6 +108,18 @@ class IncomingWhatsAppDocument(BaseModel):
     filename: str = "document"
     mime_type: str = "application/octet-stream"
     caption: str | None = None
+
+
+class IncomingWhatsAppImage(BaseModel):
+    id: str
+    mime_type: str = "image/jpeg"
+    caption: str | None = None
+
+
+class IncomingWhatsAppAudio(BaseModel):
+    id: str
+    mime_type: str = "audio/ogg"
+    voice: bool = False
 
 
 class IncomingInteractiveReply(BaseModel):
@@ -126,6 +142,8 @@ class IncomingWhatsAppMessage(BaseModel):
     type: str
     text: TextContent | None = None
     document: IncomingWhatsAppDocument | None = None
+    image: IncomingWhatsAppImage | None = None
+    audio: IncomingWhatsAppAudio | None = None
     interactive: IncomingInteractive | None = None
 
 

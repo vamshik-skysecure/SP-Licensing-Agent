@@ -28,10 +28,11 @@ class Settings(BaseSettings):
     # settings below remain authoritative for backward compatibility.
     storage_mode: Literal["local", "azure_blob"] | None = None
     workflow_mode: Literal[
+        "simple_pricing",
         "renewal_only",
         "upgrade_comparison",
         "scenario_comparison",
-    ] = "upgrade_comparison"
+    ] = "simple_pricing"
     rate_card_backend: Literal["local", "azure_blob"] = "local"
     rate_card_local_path: Path = Path("docs/microsoft_sku_v5.xlsx")
     rate_card_sheet_name: str = "Final Output Sheet"
@@ -50,8 +51,10 @@ class Settings(BaseSettings):
     service_bus_queue_name: str = "whatsapp-inbound"
 
     ai_intent_backend: Literal["disabled", "openai"] = "disabled"
+    requirement_capture_backend: Literal["disabled", "openai"] = "disabled"
     openai_api_key: str = ""
     openai_model: str = "gpt-5.6-luna"
+    openai_transcription_model: str = "gpt-transcribe"
     openai_reasoning_effort: Literal["none", "low", "medium", "high"] = "none"
 
     default_term_duration: str = "P1Y"
@@ -61,6 +64,9 @@ class Settings(BaseSettings):
     sku_match_threshold: float = Field(default=90.0, ge=0, le=100)
     migration_seed_path: Path = Path("config/migration_seed.json")
     max_document_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    max_image_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
+    max_audio_bytes: int = Field(default=10 * 1024 * 1024, gt=0, le=25 * 1024 * 1024)
+    max_audio_seconds: int = Field(default=300, ge=1, le=30 * 60)
     session_ttl_hours: int = Field(default=24, ge=1, le=24 * 30)
 
     log_level: str = "INFO"
@@ -119,6 +125,8 @@ class Settings(BaseSettings):
             )
         if self.ai_intent_backend == "openai" and not self.openai_api_key:
             raise ValueError("OpenAI intent routing requires OPENAI_API_KEY.")
+        if self.requirement_capture_backend == "openai" and not self.openai_api_key:
+            raise ValueError("OpenAI multimodal requirement capture requires OPENAI_API_KEY.")
         if self.environment == "production":
             missing_whatsapp = [
                 name
@@ -154,5 +162,9 @@ class Settings(BaseSettings):
             if self.ai_intent_backend != "openai":
                 raise ValueError(
                     "Production requires AI_INTENT_BACKEND=openai."
+                )
+            if self.requirement_capture_backend != "openai":
+                raise ValueError(
+                    "Production requires REQUIREMENT_CAPTURE_BACKEND=openai."
                 )
         return self
