@@ -4,7 +4,7 @@ from typing import Any
 
 from httpx import AsyncClient, HTTPStatusError, RequestError
 
-from app.config import get_logger
+from app.config import get_logger, opaque_identifier
 from app.schema.whatsapp import (
     DocumentContent,
     ImageContent,
@@ -111,10 +111,9 @@ class WhatsAppClient:
             if self._is_auth_error(error.response):
                 self._credentials_valid = False
             logger.warning(
-                "WhatsApp API send request rejected status=%d duration_ms=%.1f response=%s",
+                "WhatsApp API send request rejected status=%d duration_ms=%.1f",
                 error.response.status_code,
                 (perf_counter() - started_at) * 1000,
-                error.response.text[:2000],
             )
             raise WhatsAppAPIError(
                 "WhatsApp Cloud API rejected the message request.",
@@ -251,7 +250,8 @@ class WhatsAppClient:
         content_type: str = "application/octet-stream",
     ) -> WhatsAppMedia:
         started_at = perf_counter()
-        logger.info("WhatsApp media metadata request started media_id=%s", media_id)
+        media_ref = opaque_identifier(media_id)
+        logger.info("WhatsApp media metadata request started media_ref=%s", media_ref)
         try:
             metadata_response = await self._http_client.get(
                 f"{self._api_url}{media_id}",
@@ -267,16 +267,15 @@ class WhatsAppClient:
             if not isinstance(media_url, str):
                 raise WhatsAppAPIError("WhatsApp Cloud API did not return a media URL.")
 
-            logger.info("WhatsApp media content download started media_id=%s", media_id)
+            logger.info("WhatsApp media content download started media_ref=%s", media_ref)
             media_response = await self._http_client.get(media_url, headers=self._headers)
             media_response.raise_for_status()
         except HTTPStatusError as error:
             logger.warning(
-                "WhatsApp media request rejected media_id=%s status=%d duration_ms=%.1f response=%s",
-                media_id,
+                "WhatsApp media request rejected media_ref=%s status=%d duration_ms=%.1f",
+                media_ref,
                 error.response.status_code,
                 (perf_counter() - started_at) * 1000,
-                error.response.text[:2000],
             )
             raise WhatsAppAPIError(
                 "WhatsApp Cloud API rejected the media download request.",
@@ -285,17 +284,18 @@ class WhatsAppClient:
             ) from error
         except RequestError as error:
             logger.error(
-                "WhatsApp media request failed media_id=%s duration_ms=%.1f error=%s",
-                media_id,
+                "WhatsApp media request failed media_ref=%s duration_ms=%.1f "
+                "error_type=%s",
+                media_ref,
                 (perf_counter() - started_at) * 1000,
-                error,
+                type(error).__name__,
             )
             raise WhatsAppAPIError(
                 "Unable to download media from the WhatsApp Cloud API.",
                 network_error=True,
             ) from error
         except ValueError as error:
-            logger.error("WhatsApp media metadata was invalid media_id=%s", media_id)
+            logger.error("WhatsApp media metadata was invalid media_ref=%s", media_ref)
             raise WhatsAppAPIError(
                 "WhatsApp Cloud API returned invalid media metadata.",
                 status_code=metadata_response.status_code,
@@ -303,8 +303,8 @@ class WhatsAppClient:
             ) from error
 
         logger.info(
-            "WhatsApp media content download completed media_id=%s status=%d bytes=%d duration_ms=%.1f",
-            media_id,
+            "WhatsApp media content download completed media_ref=%s status=%d bytes=%d duration_ms=%.1f",
+            media_ref,
             media_response.status_code,
             len(media_response.content),
             (perf_counter() - started_at) * 1000,

@@ -139,6 +139,7 @@ class IncomingWhatsAppMessage(BaseModel):
 
     id: str
     sender: str = Field(alias="from")
+    timestamp: str | None = None
     type: str
     text: TextContent | None = None
     document: IncomingWhatsAppDocument | None = None

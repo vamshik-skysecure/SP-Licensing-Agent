@@ -1,4 +1,5 @@
 import logging
+from hashlib import sha256
 
 _LOGGER_NAME = "ssp_licensing_agent"
 _configured = False
@@ -28,3 +29,8 @@ def configure_logging(level: str = "INFO") -> logging.Logger:
 
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"{_LOGGER_NAME}.{name}")
+
+
+def opaque_identifier(value: str, *, length: int = 12) -> str:
+    """Return a stable log correlation value without exposing the source identifier."""
+    return sha256(value.encode("utf-8")).hexdigest()[:length]

@@ -17,7 +17,7 @@ WhatsApp Cloud API
 FastAPI webhook -- signature + allowlist + size/type checks
         |
         v
-Azure Service Bus queue -- duplicate detection, retries, DLQ
+Azure Blob webhook inbox -- persistence, leases, retries, dead-letter prefix
         |
         v
 OpenAI structured capture/intent adapters
@@ -44,7 +44,7 @@ Azure Blob Storage -> maintained Excel workbook -> Final Output Sheet cache
 - A handoff-only LLM supervisor is unnecessary for a four-option state machine.
 - Seven agents create more model calls, latency, failure paths, prompt/version management, and trace volume without improving deterministic calculations.
 - The edit operation must recalculate and persist atomically. That belongs in one application transaction, not a conversation between agents.
-- Service Bus is added because FastAPI background tasks are not durable across process restarts or deployments.
+- The existing workflow Blob container provides durable webhook ingress because FastAPI background tasks are not durable across process restarts or deployments. This satisfies the manager's no-new-service constraint.
 - Managed Identity is the production default for Azure data services.
 - The rate-card workbook is read directly, so the business can update the Final Output Sheet without coordinating changes with hidden Phase 1 code.
 
@@ -65,12 +65,14 @@ LangGraph can still be introduced later if genuine long-running human interrupts
   workflow sessions. The high-level switch is authoritative when set.
 
 - One maintained `.xlsx` workbook in the private `pricing-workbooks` container, with
-  the reviewed active version published as `active/Microsoft_SKU_Active.xlsx`.
+  the reviewed V5 version published as `active/Microsoft_SKU_V5.0.xlsx`. The older
+  `Microsoft_SKU_Active.xlsx` remains unchanged for Phase 1 rollback.
 - Current local workbook: `docs/microsoft_sku_v5.xlsx`.
 - Configured worksheet: `Final Output Sheet`.
 - Application caches the parsed catalog for five minutes and records the Blob ETag/content digest as the rate-card version.
 - A separate private workflow container in the same Storage account holds one JSON blob per hashed seller thread.
 - Blob ETags and `If-Match` conditional writes provide optimistic concurrency and prevent lost updates.
+- The same container holds a leased `webhook-queue` inbox. Signed requests are persisted before acknowledgement, processed sequentially on the single B1 instance, retried, and moved to a dead-letter prefix after repeated failures.
 - Expired sessions are ignored by the application; a prefix-scoped lifecycle rule deletes old session blobs.
 - Raw customer uploads are never persisted. Only normalized estate and proposal state are stored.
 
@@ -108,17 +110,17 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 - Verify `X-Hub-Signature-256` before parsing or queuing a webhook.
 - Enforce the configured seller phone-number allowlist.
 - Use App Service/Container App Managed Identity with these data-plane roles:
-  - Storage Blob Data Contributor scoped to the pricing and workflow containers
-  - Azure Service Bus Data Sender/Receiver
-- Store the Meta app secret, access token, and OpenAI API key as Key Vault references.
+  - Storage Blob Data Reader scoped to the pricing container
+  - Storage Blob Data Contributor scoped to the workflow container
+- Under the approved no-new-resource constraint, store the Meta app secret, access token, and OpenAI API key as encrypted App Service settings. Access is limited by Azure RBAC, but this is less isolated than Key Vault and is an accepted constraint.
 - Do not log raw webhook bodies, uploaded bytes, full normalized estates, access tokens, or rate-card contents.
 - Apply storage firewall/private endpoints according to the organization's network policy.
 
 ## Reliability and operations
 
-- Configure Service Bus Standard or Premium with duplicate detection, Peek-Lock receive mode, dead lettering, and an alert on DLQ depth.
+- Monitor the Blob webhook pending/dead-letter prefixes and validate restart recovery and duplicate delivery during UAT.
 - Configure App Service health checks against `/health/ready`.
-- Enable two or more application instances only with Blob workflow persistence and Service Bus enabled.
+- Keep one application instance on the existing B1 plan; the Blob inbox intentionally processes sequentially. Reassess the dispatch design before any future scale-out.
 - Alert on webhook signature failures, queue age, processing failures, rate-card refresh failures, Blob conditional-write conflicts, and outbound Meta failures.
 - Back up and version the rate-card Blob.
 - Configure and verify a lifecycle deletion rule scoped to the workflow-container/session prefix.

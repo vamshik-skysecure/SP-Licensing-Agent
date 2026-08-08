@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
-from app.config import get_logger
+from app.config import get_logger, opaque_identifier
 from app.core.licensing.analysis import LicenseAnalysisError
 from app.core.licensing.capture import (
     CapturedRequirement,
@@ -141,6 +141,7 @@ class WhatsAppWebhookService:
 
     async def _handle_message(self, message: IncomingWhatsAppMessage) -> None:
         sender = message.sender.lstrip("+")
+        message_ref = opaque_identifier(message.id)
         if (
             self._configuration.seller_allowlist
             and sender not in self._configuration.seller_allowlist
@@ -149,7 +150,7 @@ class WhatsAppWebhookService:
             await self._send_text(sender, "This WhatsApp number is not authorized.")
             return
         if await self._orchestrator.has_processed(sender, message.id):
-            logger.info("Duplicate WhatsApp message ignored message_id=%s", message.id)
+            logger.info("Duplicate WhatsApp message ignored message_ref=%s", message_ref)
             return
 
         try:
@@ -182,10 +183,10 @@ class WhatsAppWebhookService:
             await self._send_text(sender, f"I could not apply that request: {error}")
             await self._orchestrator.mark_processed(sender, message.id)
         except WorkflowConflictError:
-            logger.warning("Workflow concurrency conflict message_id=%s", message.id)
+            logger.warning("Workflow concurrency conflict message_ref=%s", message_ref)
             await self._send_text(sender, "The proposal changed concurrently. Please retry.")
         except Exception:
-            logger.exception("Unexpected workflow failure message_id=%s", message.id)
+            logger.exception("Unexpected workflow failure message_ref=%s", message_ref)
             await self._send_text(
                 sender,
                 "I could not complete that operation. It is safe to retry the same message.",

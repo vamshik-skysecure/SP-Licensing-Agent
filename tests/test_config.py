@@ -63,6 +63,91 @@ class StorageModeSettingsTests(unittest.TestCase):
                 default_billing_plan="Annual",
             )
 
+    def test_production_rejects_storage_connection_string_by_default(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Production connection strings are disabled",
+        ):
+            Settings(
+                _env_file=None,
+                environment="production",
+                storage_mode="azure_blob",
+                rate_card_storage_connection_string="not-a-real-secret",
+                message_dispatch_backend="azure_blob",
+                ai_intent_backend="openai",
+                requirement_capture_backend="openai",
+                openai_validate_models_on_startup=True,
+                openai_api_key="not-a-real-secret",
+                whatsapp_access_token="not-a-real-secret",
+                whatsapp_phone_number_id="123",
+                whatsapp_webhook_verify_token="not-a-real-secret",
+                whatsapp_app_secret="not-a-real-secret",
+                whatsapp_seller_allowlist="919999999999",
+            )
+
+    def test_production_accepts_managed_identity_resource_urls(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            environment="production",
+            storage_mode="azure_blob",
+            rate_card_storage_account_url="https://storage.example.invalid",
+            message_dispatch_backend="azure_blob",
+            ai_intent_backend="openai",
+            requirement_capture_backend="openai",
+            openai_validate_models_on_startup=True,
+            openai_api_key="not-a-real-secret",
+            whatsapp_access_token="not-a-real-secret",
+            whatsapp_phone_number_id="123",
+            whatsapp_webhook_verify_token="not-a-real-secret",
+            whatsapp_app_secret="not-a-real-secret",
+            whatsapp_seller_allowlist="919999999999",
+        )
+
+        self.assertFalse(settings.allow_connection_strings_in_production)
+
+    def test_production_requires_openai_startup_model_validation(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "OPENAI_VALIDATE_MODELS_ON_STARTUP=true",
+        ):
+            Settings(
+                _env_file=None,
+                environment="production",
+                storage_mode="azure_blob",
+                rate_card_storage_account_url="https://storage.example.invalid",
+                message_dispatch_backend="azure_blob",
+                ai_intent_backend="openai",
+                requirement_capture_backend="openai",
+                openai_api_key="not-a-real-secret",
+                whatsapp_access_token="not-a-real-secret",
+                whatsapp_phone_number_id="123",
+                whatsapp_webhook_verify_token="not-a-real-secret",
+                whatsapp_app_secret="not-a-real-secret",
+                whatsapp_seller_allowlist="919999999999",
+            )
+
+    def test_production_rejects_non_durable_direct_dispatch(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "MESSAGE_DISPATCH_BACKEND=azure_blob",
+        ):
+            Settings(
+                _env_file=None,
+                environment="production",
+                storage_mode="azure_blob",
+                rate_card_storage_account_url="https://storage.example.invalid",
+                message_dispatch_backend="direct",
+                ai_intent_backend="openai",
+                requirement_capture_backend="openai",
+                openai_validate_models_on_startup=True,
+                openai_api_key="not-a-real-secret",
+                whatsapp_access_token="not-a-real-secret",
+                whatsapp_phone_number_id="123",
+                whatsapp_webhook_verify_token="not-a-real-secret",
+                whatsapp_app_secret="not-a-real-secret",
+                whatsapp_seller_allowlist="919999999999",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

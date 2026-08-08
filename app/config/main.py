@@ -39,16 +39,17 @@ class Settings(BaseSettings):
     rate_card_storage_account_url: str | None = None
     rate_card_storage_connection_string: str | None = None
     rate_card_container_name: str = "pricing-workbooks"
-    rate_card_blob_name: str = "active/Microsoft_SKU_Active.xlsx"
+    rate_card_blob_name: str = "active/Microsoft_SKU_V5.0.xlsx"
 
     workflow_store_backend: Literal["memory", "azure_blob"] = "memory"
     workflow_blob_container_name: str = "licensing-workflows"
     workflow_blob_prefix: str = "sessions"
 
-    message_dispatch_backend: Literal["direct", "service_bus"] = "direct"
-    service_bus_fully_qualified_namespace: str | None = None
-    service_bus_connection_string: str | None = None
-    service_bus_queue_name: str = "whatsapp-inbound"
+    message_dispatch_backend: Literal["direct", "azure_blob"] = "direct"
+    webhook_blob_prefix: str = "webhook-queue"
+    webhook_blob_poll_seconds: float = Field(default=1.0, ge=0.1, le=60)
+    webhook_max_delivery_count: int = Field(default=5, ge=1, le=100)
+    allow_connection_strings_in_production: bool = False
 
     ai_intent_backend: Literal["disabled", "openai"] = "disabled"
     requirement_capture_backend: Literal["disabled", "openai"] = "disabled"
@@ -56,6 +57,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-5.6-luna"
     openai_transcription_model: str = "gpt-transcribe"
     openai_reasoning_effort: Literal["none", "low", "medium", "high"] = "none"
+    openai_validate_models_on_startup: bool = False
 
     default_term_duration: str = "P1Y"
     default_billing_plan: str = "Annual"
@@ -115,19 +117,18 @@ class Settings(BaseSettings):
                 "Azure Blob workflow storage requires RATE_CARD_STORAGE_ACCOUNT_URL "
                 "or RATE_CARD_STORAGE_CONNECTION_STRING."
             )
-        if self.message_dispatch_backend == "service_bus" and not (
-            self.service_bus_connection_string
-            or self.service_bus_fully_qualified_namespace
-        ):
-            raise ValueError(
-                "Service Bus dispatch requires SERVICE_BUS_FULLY_QUALIFIED_NAMESPACE "
-                "or SERVICE_BUS_CONNECTION_STRING."
-            )
         if self.ai_intent_backend == "openai" and not self.openai_api_key:
             raise ValueError("OpenAI intent routing requires OPENAI_API_KEY.")
         if self.requirement_capture_backend == "openai" and not self.openai_api_key:
             raise ValueError("OpenAI multimodal requirement capture requires OPENAI_API_KEY.")
         if self.environment == "production":
+            if not self.allow_connection_strings_in_production and (
+                self.rate_card_storage_connection_string
+            ):
+                raise ValueError(
+                    "Production connection strings are disabled. Use the App Service "
+                    "managed identity with resource URLs instead."
+                )
             missing_whatsapp = [
                 name
                 for name, value in {
@@ -155,9 +156,9 @@ class Settings(BaseSettings):
                 )
             if self.rate_card_backend != "azure_blob":
                 raise ValueError("Production requires RATE_CARD_BACKEND=azure_blob.")
-            if self.message_dispatch_backend != "service_bus":
+            if self.message_dispatch_backend != "azure_blob":
                 raise ValueError(
-                    "Production requires MESSAGE_DISPATCH_BACKEND=service_bus."
+                    "Production requires MESSAGE_DISPATCH_BACKEND=azure_blob."
                 )
             if self.ai_intent_backend != "openai":
                 raise ValueError(
@@ -166,5 +167,9 @@ class Settings(BaseSettings):
             if self.requirement_capture_backend != "openai":
                 raise ValueError(
                     "Production requires REQUIREMENT_CAPTURE_BACKEND=openai."
+                )
+            if not self.openai_validate_models_on_startup:
+                raise ValueError(
+                    "Production requires OPENAI_VALIDATE_MODELS_ON_STARTUP=true."
                 )
         return self

@@ -25,15 +25,16 @@ The application reads the cached formula results from `Final Output Sheet` using
 | SkuTitle | Exact-title fallback and customer display name |
 | Contract Type / TermDuration / BillingPlan / Segment | Commercial variant selection |
 | ERP / Catalogue Price | Audit metadata |
-| Promo Name / Promo % / Customer Eligibility / New-to-Microsoft Required | Promotion eligibility control |
+| Promo Name / Promo % / Customer Eligibility / New-to-Microsoft Required | Parsed audit metadata; inactive in V1 |
 | Minimum / Maximum Seats | Parsed eligibility metadata |
 | Geography | Parsed commercial metadata |
 | Distributor / Partner landing and cost columns | Parsed audit metadata |
-| Partner Best Offer | Direct seller quote used by the agent |
-| Price on Marketplace | Parsed audit metadata; not substituted for the direct quote |
+| Partner Best Offer | Parsed audit metadata; not used or displayed in V1 |
+| Price on Marketplace | Sole deterministic V1 unit-price basis |
 
-Promo-labelled rows expose `Partner Best Offer` only when the seller explicitly
-confirms promotion eligibility. Standard rows remain available without that confirmation.
+V1 does not ask promotion-eligibility questions and does not select a promotional or
+partner-best price. Blank/zero Marketplace prices are explicitly marked unavailable and
+excluded from totals.
 
 ## Observed data profile
 
@@ -44,7 +45,8 @@ confirms promotion eligibility. Standard rows remain available without that conf
 | Unique ProductId + SkuId + title identities | 1,302 |
 | Promotion-labelled rows | 139 |
 | Standard rows | 3,891 |
-| Zero `Partner Best Offer` rows | 254 |
+| Positive `Price on Marketplace` rows | 3,776 |
+| Zero `Price on Marketplace` rows | 254 |
 | Rows with placeholder ProductId/SkuId `0/0` | 233 |
 | Rows with `TermDuration=0` | 233 |
 | Rows with `BillingPlan=None` | 58 |
@@ -60,21 +62,25 @@ explicitly established as a genuine no-charge offer. They are not silently assum
 
 ## Current workflow decision
 
-`WORKFLOW_MODE=upgrade_comparison` is the default. Upload automatically prepares Renew
-As-Is, and the seller can request a one-year/annual comparison with ME3, ME5, and ME7.
-The only automatic replacement is an existing core-suite line with the selected target
-suite. Every non-core add-on is retained and priced unchanged unless the seller explicitly
-edits it. No migration seed or bundle entitlement is applied in this mode.
+`WORKFLOW_MODE=simple_pricing` is the default. The seller confirms the captured requirement
+before the application calculates its annual Marketplace cost. The confirmed configuration
+becomes the Renew As-Is baseline; seller-directed SKU/quantity changes create a revised
+configuration and a current-versus-revised comparison.
 
-`WORKFLOW_MODE=scenario_comparison` remains an optional future mode for explicitly approved
-business migration rules.
+No promotion, discount, margin, partner-price, automatic migration, or bundle-entitlement
+rule is applied in this mode. A generic recommendation request asks the seller for the
+source line, required capability/target, and user count instead of inventing a licensing
+decision.
+
+`upgrade_comparison` and `scenario_comparison` remain inactive optional modes for future
+business-approved releases.
 
 ## Business follow-ups
 
-- Confirm whether any of the 254 zero-price rows are intentionally free; otherwise supply prices.
+- Confirm whether any of the 254 zero-Marketplace-price rows are intentionally free;
+  otherwise supply prices. V1 treats every one as unavailable meanwhile.
 - Populate Maximum Seats if seat-cap enforcement is required.
 - Confirm how perpetual `TermDuration=0` and `BillingPlan=None` rows should be presented
   when mixed with subscription renewals.
-- Confirm whether direct quotes should continue using `Partner Best Offer` or switch to
-  `Price on Marketplace` for a particular sales channel. The implementation currently
-  follows the workbook wording and uses `Partner Best Offer`.
+- Supply and approve the separate commercial rule sheet before promotions, eligibility,
+  best-price selection, or automated entitlement recommendations are introduced.

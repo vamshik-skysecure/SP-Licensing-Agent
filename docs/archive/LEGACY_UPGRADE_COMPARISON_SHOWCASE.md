@@ -1,3 +1,9 @@
+# Archived: upgrade-comparison CEO showcase
+
+> This script predates the CEO-approved V1 `simple_pricing` journey. It is retained only
+> as historical evidence for the optional `upgrade_comparison` mode. Do not use it for
+> current UAT, production acceptance, pricing-source decisions, or seller training.
+
 # SkySecure Microsoft Licensing Advisor — CEO Showcase
 
 ## Product identity

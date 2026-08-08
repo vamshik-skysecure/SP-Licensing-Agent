@@ -1,4 +1,4 @@
-name: pricing-agent-whatsapp-bot
+name: skysecure-ssp-licensing-agent
 
 services:
   bot:

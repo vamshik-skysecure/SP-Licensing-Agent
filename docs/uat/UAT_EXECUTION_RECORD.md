@@ -1,4 +1,4 @@
-# SkySecure Microsoft Licensing Advisor UAT Execution Record
+# SkySecure Microsoft Licensing Advisor UAT execution record
 
 ## Execution details
 
@@ -8,68 +8,64 @@
 | Date/time and timezone | |
 | Tester | |
 | Git commit | |
-| Storage mode | `local` |
-| Workflow mode | `upgrade_comparison` |
-| Workbook SHA-256 | |
-| ngrok URL | |
-| Meta test-number Phone Number ID (last 4 only) | |
-| Seller test number (last 4 only) | |
+| Environment (`local`/Azure candidate) | |
+| Storage mode | |
+| Workflow mode | `simple_pricing` |
+| Active workbook ETag/SHA-256 | |
+| Public callback host | |
+| Meta Phone Number ID (last 4 only) | |
+| Seller number (last 4 only) | |
+
+Never paste credentials, full phone numbers, raw webhook bodies, or customer data here.
 
 ## Test results
 
 | ID | Check | Expected evidence | Pass/Fail | Evidence/reference |
 |---|---|---|---|---|
-| UAT-01 | Health/readiness | HTTP 200, 4,030 price rows, local/memory | | |
-| UAT-02 | Webhook verification | Meta GET callback returns challenge/200 | | |
-| UAT-03 | Signature validation | Live POST logs signature validated | | |
-| UAT-04 | Allowlist | Authorized sender accepted; unauthorized sender rejected | | |
-| UAT-05 | CSV upload | Five exact SKU matches | | |
-| UAT-06 | Mobile estate table image | Portrait PNG; full wrapped names; no horizontal scrolling or truncation | | |
-| UAT-07 | Estate PDF | PDF received as WhatsApp document with dates/flags | | |
-| UAT-08 | Automatic renewal | Renew As-Is prepared without bundle selection | | |
-| UAT-09 | Promo safety | Promo price is provisional and locked before seller validation | | |
-| UAT-10 | Initial seller validation gate | One approval attests estate/pricing accuracy and promotion eligibility; edits blocked before it | | |
-| UAT-11 | Natural quantity edit | `Change L1 to 120 licences` recalculates immediately | | |
-| UAT-12 | Natural add/remove/replace | Requested line changes applied or safely confirmed | | |
-| UAT-13 | Discount/adjustment | Five percent and -25,000 reflected in total | | |
-| UAT-14 | Commercial settings | Term, billing, segment and currency validated | | |
-| UAT-15 | Comment | Seller comment persists into final output | | |
-| UAT-16 | Final validation gate | Finalize request sends summary; no final status/PDF before seller confirms | | |
-| UAT-17 | Final proposal PDF | PDF received only after explicit final confirmation | | |
-| UAT-18 | Annual options | Renew, ME3, ME5 and ME7 use P1Y/Annual | | |
-| UAT-19 | No bundle inference | Every non-core add-on is retained/priced in each upgrade | | |
-| UAT-20 | Annual difference | Comparison shows amount versus Renew As-Is | | |
-| UAT-21 | Mobile comparison table image | All four options and recommendation visible in an inline portrait PNG | | |
-| UAT-22 | Comparison PDF | Four-scenario PDF received as WhatsApp document | | |
-| UAT-23 | Image delivery fallback | Forced image failure returns full-name responsive text, not an ASCII table | | |
-| UAT-24 | Restart behavior | Session is lost after local server restart | | |
+| UAT-01 | Health/readiness | HTTP 200; positive current-price rows; expected storage/dispatch backends | | |
+| UAT-02 | Webhook verification | Live Meta GET callback returns the challenge with HTTP 200 | | |
+| UAT-03 | Signature validation | Live signed POST accepted; invalid signature rejected | | |
+| UAT-04 | Seller allowlist | Named tester accepted; unauthorized sender rejected | | |
+| UAT-05 | Manual text capture | SKU, quantity and annual term extracted; no price before confirmation | | |
+| UAT-06 | Standard CSV/XLSX | Deterministic capture with full names and quantities | | |
+| UAT-07 | Arbitrary Excel/Word/PDF/image/voice | Structured capture shown for seller confirmation | | |
+| UAT-08 | Mobile capture table | Portrait image; full wrapped names; no horizontal scrolling | | |
+| UAT-09 | Capture PDF | PDF received as a WhatsApp document | | |
+| UAT-10 | Pre-confirmation correction | Seller can add/replace/remove/change quantity before pricing | | |
+| UAT-11 | Initial validation gate | No pricing until explicit seller confirmation | | |
+| UAT-12 | As-is pricing | SKU, quantity, annual term, unit price, line total and overall value | | |
+| UAT-13 | V1 commercial boundary | No discount, margin, promotion, partner-price or internal calculation output | | |
+| UAT-14 | Revised SKU/quantity | Seller-directed change recalculates immediately | | |
+| UAT-15 | Fuzzy-match safety | Sub-100 match requires explicit candidate selection before mutation | | |
+| UAT-16 | Recommendation safety | Generic request asks for capability/target/users; no invented entitlement | | |
+| UAT-17 | Current-versus-revised comparison | Renew As-Is, revised total and difference are clearly separated | | |
+| UAT-18 | Final validation gate | No final status/PDF before seller confirmation | | |
+| UAT-19 | Final PDF | Customer-ready PDF received only after final confirmation | | |
+| UAT-20 | Unsupported currency/billing | Unsupported request is rejected without silently repricing | | |
+| UAT-21 | Zero/blank price | Visible unavailable warning; line excluded from total, never called free | | |
+| UAT-22 | Duplicate webhook | Same Meta message ID does not apply an edit twice | | |
+| UAT-23 | Session ordering | Two rapid edits from one seller are processed in order | | |
+| UAT-24 | Restart behavior | Local session is lost; Azure Blob session resumes after restart | | |
+| UAT-25 | Logging hygiene | No raw message, phone, file content, workbook row or secret in telemetry | | |
 
 ## Commercial evidence
 
-| Proposal revision | Subtotal | Discount | Adjustment | Final total | Unresolved decisions |
-|---|---:|---:|---:|---:|---:|
-| Renew As-Is — initial | | | | | |
-| Renew As-Is — final | | | | | |
+| Configuration | SKU lines | Overall value | Difference vs Renew As-Is | Unavailable-price lines |
+|---|---:|---:|---:|---:|
+| Renew As-Is | | | `0.00` | |
+| Revised | | | | |
 
-| ME3 annual | | | | | |
-| ME5 annual | | | | | |
-| ME7 annual | | | | | |
+## Document evidence
 
-## PDF evidence
-
-| Document | WhatsApp message ID | Bytes | Pages | SHA-256 |
-|---|---|---:|---:|---|
-| Estate PDF | | | | |
-| Renewal proposal PDF | | | | |
-| Annual comparison PDF | | | | |
-
-## Mobile table-image evidence
-
-| Image | WhatsApp message ID | Pixels | Bytes | SHA-256 |
-|---|---|---:|---:|---|
-| Estate table PNG | | | | |
-| Scenario table PNG | | | | |
-| Annual comparison PNG | | | | |
+| Document/image | WhatsApp message ID hash/ref | Bytes | Pages/pixels | SHA-256 |
+|---|---|---:|---|---|
+| Capture table PNG | | | | |
+| Capture PDF | | | | |
+| As-is price PNG | | | | |
+| As-is PDF | | | | |
+| Comparison PNG | | | | |
+| Comparison PDF | | | | |
+| Final PDF | | | | |
 
 ## Defects and observations
 
@@ -79,8 +75,9 @@
 
 ## Sign-off
 
-| Role | Name | Decision | Date | Comments |
+| Role | Name | Decision | Date/time | Reference |
 |---|---|---|---|---|
-| Technical owner | | | | |
-| Licensing/business reviewer | | | | |
-| UAT owner | | | | |
+| Engineering | | | | |
+| Licensing/business | | | | |
+| Privacy/security | | | | |
+| Product owner | | | | |

@@ -159,6 +159,11 @@ class OpenAIRequirementExtractor:
             max_retries=2,
         )
 
+    async def validate_model_access(self) -> None:
+        """Verify extraction and transcription model access without inference."""
+        await self._client.models.retrieve(self._model)
+        await self._client.models.retrieve(self._transcription_model)
+
     async def extract_text(self, text: str, *, source_name: str) -> CapturedRequirement:
         value = text.strip()
         if not value:

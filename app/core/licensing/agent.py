@@ -180,6 +180,10 @@ class OpenAIIntentInterpreter:
             max_retries=2,
         )
 
+    async def validate_model_access(self) -> None:
+        """Verify model access without running an inference."""
+        await self._client.models.retrieve(self._model)
+
     async def interpret(
         self,
         message: str,

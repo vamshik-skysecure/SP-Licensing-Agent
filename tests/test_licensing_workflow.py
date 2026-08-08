@@ -103,8 +103,8 @@ class ParsingTests(unittest.TestCase):
         root = Path(__file__).parents[1]
         seeds = MigrationSeedCatalog.load(root / "config" / "migration_seed.json")
         items = parse_rate_card(
-            (root / "docs" / "blob_storage.xlsx").read_bytes(),
-            "blob_storage.xlsx",
+            (root / "tests" / "fixtures" / "legacy_outcome_sheet.xlsx").read_bytes(),
+            "legacy_outcome_sheet.xlsx",
             "Outcome Sheet",
         )
         titles = [normalize_product_title(item.sku_title) for item in items]
@@ -243,7 +243,12 @@ prod-free,sku-free,Free Product,P1Y,Annual,0,0,0,0,0,0,0,0
         self.assertEqual(scenario.lines[1].unit_price, Decimal("0.00"))
 
     def test_real_outcome_sheet_contains_every_required_scenario_product(self) -> None:
-        workbook = Path(__file__).parents[1] / "docs" / "blob_storage.xlsx"
+        workbook = (
+            Path(__file__).parents[1]
+            / "tests"
+            / "fixtures"
+            / "legacy_outcome_sheet.xlsx"
+        )
         items = parse_rate_card(
             workbook.read_bytes(),
             workbook.name,
@@ -374,7 +379,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unapproved_migration_seed_is_suggestion_only(self) -> None:
         root = Path(__file__).parents[1]
-        workbook = root / "docs" / "blob_storage.xlsx"
+        workbook = root / "tests" / "fixtures" / "legacy_outcome_sheet.xlsx"
         catalog = RateCardCatalog(
             parse_rate_card(workbook.read_bytes(), workbook.name, "Outcome Sheet"),
             "seed-test",

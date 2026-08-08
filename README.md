@@ -7,7 +7,7 @@ The active workflow is self-contained. It does not call the legacy Phase 1 prici
 ## Runtime flow
 
 1. Meta sends a signed WhatsApp webhook.
-2. Production ingress writes the webhook to Azure Service Bus; local development uses an in-process dispatcher.
+2. Production ingress persists the webhook in the existing workflow Blob container before acknowledgement; local development uses an in-process dispatcher.
 3. The application accepts natural-language text, voice notes, screenshots/images, or common spreadsheet/document uploads and normalizes them into one strict requirement schema.
 4. The `Final Output Sheet` is loaded from Microsoft SKU V5.0 locally or from the configured Blob workbook.
 5. The official OpenAI Python SDK and Responses API provide structured intent routing and bounded multimodal extraction; the Audio Transcriptions API handles voice notes.
@@ -73,6 +73,7 @@ state. Standard CSV/XLSX layouts are parsed deterministically without an OpenAI 
   added to an authoritative future workbook schema.
 
 See [Production architecture](docs/PRODUCTION_ARCHITECTURE.md).
+Follow [Production deployment runbook](docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md) for the verified Azure estate.
 Use [V1 Simple Pricing UAT](docs/uat/V1_SIMPLE_PRICING_UAT.md) for the current seller journey.
 
 ## Local development
@@ -116,7 +117,7 @@ Run verification:
 Production should set `STORAGE_MODE=azure_blob`.
 
 Before switching modes, publish the reviewed V5 workbook to
-`pricing-workbooks/active/Microsoft_SKU_Active.xlsx` and confirm its
+`pricing-workbooks/active/Microsoft_SKU_V5.0.xlsx` and confirm its
 `Final Output Sheet` checksum/version. This implementation does not modify that Blob during
 local UAT.
 
@@ -124,11 +125,13 @@ local UAT.
 
 - the rate card uses Azure Blob Storage;
 - workflow state uses Azure Blob Storage with conditional ETag writes;
-- webhook dispatch uses Azure Service Bus; and
+- webhook dispatch uses the durable Azure Blob inbox; and
 - a WhatsApp seller allowlist is configured; and
 - OpenAI structured intent routing is configured.
 - OpenAI multimodal requirement capture is configured.
+- configured OpenAI extraction/transcription models are validated at startup.
 
-The pricebook and workflow state use one Azure Storage account, normally in separate
-private containers. Prefer Managed Identity for Blob and Service Bus. Connection strings
-exist only as local-development fallbacks; store the OpenAI API key in Key Vault.
+The pricebook, workflow state, and durable webhook inbox use the existing Azure Storage
+account in separate private paths/containers. Prefer the existing App Service managed
+identity. Connection strings are an explicitly gated fallback. Under the manager-approved
+no-new-resource deployment, OpenAI and Meta secrets are encrypted App Service settings.

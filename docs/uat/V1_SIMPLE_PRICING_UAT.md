@@ -24,8 +24,8 @@ Use synthetic licensing data only. The active configuration must show
 10. Send `Replace L1 with Microsoft 365 E3`. Confirm the existing quantity is retained
     when no new quantity is stated and the replacement/addition is explained.
 11. Send `Compare the current and revised configuration`. Confirm WhatsApp receives the
-    final PDF as a document and that the PDF identifies the pricing source as
-    `FYD Final Output Sheet - Price on Marketplace`.
+    final PDF as a document and uses the customer-safe basis
+    `Applicable annual licence price` without exposing workbook/file names or internal columns.
 12. Send `Finalize the revised configuration`, review the final seller-validation gate,
     and confirm. Verify the final PDF is sent only after this approval.
 

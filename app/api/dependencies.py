@@ -6,12 +6,13 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
+from openai import OpenAIError
 
 from app.api.whatsapp.service import ServiceConfiguration, WhatsAppWebhookService
 from app.config import Settings, configure_logging, get_logger
 from app.core.dispatch import (
+    AzureBlobWebhookDispatcher,
     DirectWebhookDispatcher,
-    ServiceBusWebhookDispatcher,
     WebhookDispatcher,
 )
 from app.core.licensing.agent import IntentInterpreter, OpenAIIntentInterpreter
@@ -170,6 +171,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             max_audio_seconds=settings.max_audio_seconds,
             reasoning_effort=settings.openai_reasoning_effort,
         )
+    if settings.openai_validate_models_on_startup:
+        try:
+            if intent_interpreter is not None:
+                await intent_interpreter.validate_model_access()
+            if requirement_extractor is not None:
+                await requirement_extractor.validate_model_access()
+        except OpenAIError:
+            logger.exception("OpenAI model access validation failed")
+            if intent_interpreter is not None:
+                await intent_interpreter.close()
+            if requirement_extractor is not None:
+                await requirement_extractor.close()
+            await workflow_store.close()
+            await rate_cards.close()
+            await whatsapp_http_client.aclose()
+            raise
+        logger.info("OpenAI model access validation completed")
     webhook_service = WhatsAppWebhookService(
         whatsapp_client=whatsapp_client,
         orchestrator=orchestrator,
@@ -186,11 +204,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     dispatcher: WebhookDispatcher
-    if settings.message_dispatch_backend == "service_bus":
-        dispatcher = ServiceBusWebhookDispatcher(
-            queue_name=settings.service_bus_queue_name,
-            fully_qualified_namespace=settings.service_bus_fully_qualified_namespace,
-            connection_string=settings.service_bus_connection_string,
+    if settings.message_dispatch_backend == "azure_blob":
+        dispatcher = AzureBlobWebhookDispatcher(
+            container_name=settings.workflow_blob_container_name,
+            prefix=settings.webhook_blob_prefix,
+            account_url=settings.rate_card_storage_account_url,
+            connection_string=settings.rate_card_storage_connection_string,
+            poll_seconds=settings.webhook_blob_poll_seconds,
+            max_delivery_count=settings.webhook_max_delivery_count,
         )
     else:
         dispatcher = DirectWebhookDispatcher()

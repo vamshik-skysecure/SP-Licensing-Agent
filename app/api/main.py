@@ -4,7 +4,12 @@ from fastapi.responses import HTMLResponse
 from app.api.dependencies import lifespan
 from app.api.router import api_router
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="SkySecure Microsoft Licensing Advisor",
+    description="Signed WhatsApp workflow for auditable Microsoft licensing capture and pricing.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/health", tags=["health"])
@@ -43,21 +48,21 @@ async def privacy_policy() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pricing Agent Bot Privacy Policy</title>
+  <title>Microsoft Licensing Advisor Privacy Notice</title>
 </head>
 <body>
   <main>
-    <h1>Pricing Agent Bot Privacy Policy</h1>
-    <p>Effective date: July 31, 2026</p>
-    <p>Pricing Agent Bot processes WhatsApp messages and documents you send to provide Microsoft licensing analysis and pricing quotes.</p>
+    <h1>Microsoft Licensing Advisor Privacy Notice</h1>
+    <p>Effective date: August 8, 2026</p>
+    <p>The Microsoft Licensing Advisor processes WhatsApp messages and files you submit to capture licensing requirements and prepare pricing proposals.</p>
     <h2>Information We Process</h2>
-    <p>We process your WhatsApp phone number, message content, and documents you submit. Documents may contain tenant licensing information.</p>
+    <p>We process your WhatsApp phone number, message content, voice notes, images, and documents you submit. These inputs may contain customer licensing information.</p>
     <h2>How We Use Information</h2>
-    <p>We use this information only to respond to your request, analyze submitted tenant documents, and generate pricing quotes.</p>
-    <h2>Sharing</h2>
-    <p>Messages are handled through Meta's WhatsApp Cloud API. When natural-language routing is enabled, the seller's text and a limited workflow summary are processed by the OpenAI API to identify the requested action. Uploaded file bytes and the pricing workbook are not sent to the language model.</p>
+    <p>We use this information to capture and confirm licensing requirements, interpret seller-directed changes, calculate prices from the maintained catalogue, and generate proposal outputs.</p>
+    <h2>Service Providers and AI Processing</h2>
+    <p>Messages and attachments are transported through Meta's WhatsApp Cloud API. Seller text and a bounded workflow summary may be processed by the OpenAI API for structured intent routing. Voice notes are processed for transcription. Images, PDFs, Word documents, and spreadsheet layouts that the deterministic parser cannot map may be processed by the OpenAI API for structured requirement extraction. Standard supported spreadsheet layouts are parsed locally. The maintained pricing workbook is never sent to OpenAI, and all SKU matching, price selection, calculations, and workflow mutations are performed deterministically by this application.</p>
     <h2>Retention</h2>
-    <p>Submitted source documents are processed in memory and discarded after analysis. Normalized licence records, seller decisions, proposal revisions, and generated commercial scenarios may be retained by the providing business according to its configured retention policy.</p>
+    <p>Submitted source files are processed transiently and are not persisted by the application. Normalized licensing records, seller decisions, proposal revisions, and processed-message identifiers are retained for the configured workflow-session period and then expire. Application logging is designed not to record raw message bodies, uploaded file contents, pricing rows, phone numbers, access tokens, or API keys.</p>
     <h2>Your Choices</h2>
     <p>You may stop using the bot at any time. To request deletion of data associated with a request, contact the business that provided this bot.</p>
     <h2>Changes</h2>

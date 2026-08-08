@@ -11,5 +11,12 @@ __pycache__/
 .mypy_cache/
 .coverage
 htmlcov/
+artifacts/
+infra/
+scripts/
+tests/
+.github/
+docs/*
+!docs/microsoft_sku_v5.xlsx
 build/
 dist/
