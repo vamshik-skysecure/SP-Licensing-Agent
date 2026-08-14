@@ -106,6 +106,7 @@ SCENARIO_ALIASES = {
 class ServiceConfiguration:
     seller_allowlist: frozenset[str]
     max_document_bytes: int
+    allow_all_sellers: bool = False
     max_image_bytes: int = 8 * 1024 * 1024
     max_audio_bytes: int = 10 * 1024 * 1024
     currency: str = "INR"
@@ -143,7 +144,7 @@ class WhatsAppWebhookService:
         sender = message.sender.lstrip("+")
         message_ref = opaque_identifier(message.id)
         if (
-            self._configuration.seller_allowlist
+            not self._configuration.allow_all_sellers
             and sender not in self._configuration.seller_allowlist
         ):
             logger.warning("Unauthorized WhatsApp sender rejected")

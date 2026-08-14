@@ -41,7 +41,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = Settings()
     configure_logging(settings.log_level)
     logger.info(
-        "Application startup environment=%s rate_card=%s workflow_store=%s dispatch=%s",
+        "Application startup profile=%s environment=%s rate_card=%s "
+        "workflow_store=%s dispatch=%s",
+        settings.effective_runtime_profile,
         settings.environment,
         settings.rate_card_backend,
         settings.workflow_store_backend,
@@ -70,7 +72,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await whatsapp_client.validate_credentials()
         except WhatsAppAPIError:
             logger.exception("WhatsApp credential validation failed")
-            if settings.environment == "production":
+            if (
+                settings.environment == "production"
+                or settings.runtime_profile == "local_demo"
+            ):
                 await whatsapp_http_client.aclose()
                 raise
 
@@ -194,6 +199,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configuration=ServiceConfiguration(
             seller_allowlist=settings.seller_allowlist,
             max_document_bytes=settings.max_document_bytes,
+            allow_all_sellers=settings.whatsapp_allow_all_sellers,
             max_image_bytes=settings.max_image_bytes,
             max_audio_bytes=settings.max_audio_bytes,
             currency=settings.default_currency,

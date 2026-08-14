@@ -34,6 +34,7 @@ async def readiness(request: Request) -> dict[str, str | int]:
     )
     return {
         "status": "ready",
+        "runtime_profile": settings.effective_runtime_profile,
         "rate_card_version": catalog.version,
         "price_rows": len(catalog.items),
         "workflow_store": request.app.state.settings.workflow_store_backend,

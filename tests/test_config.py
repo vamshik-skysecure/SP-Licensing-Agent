@@ -6,6 +6,100 @@ from app.config.main import Settings
 
 
 class StorageModeSettingsTests(unittest.TestCase):
+    def test_local_demo_profile_selects_safe_demo_backends(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            runtime_profile="local_demo",
+            environment="production",
+            storage_mode="azure_blob",
+            rate_card_backend="azure_blob",
+            workflow_store_backend="azure_blob",
+            message_dispatch_backend="azure_blob",
+            ai_intent_backend="disabled",
+            requirement_capture_backend="disabled",
+            openai_validate_models_on_startup=True,
+            openai_api_key="not-a-real-secret",
+            whatsapp_access_token="not-a-real-secret",
+            whatsapp_phone_number_id="123",
+            whatsapp_webhook_verify_token="not-a-real-secret",
+            whatsapp_app_secret="not-a-real-secret",
+            whatsapp_seller_allowlist="919999999999",
+        )
+
+        self.assertEqual(settings.effective_runtime_profile, "local_demo")
+        self.assertEqual(settings.environment, "development")
+        self.assertEqual(settings.rate_card_backend, "local")
+        self.assertEqual(settings.workflow_store_backend, "memory")
+        self.assertEqual(settings.message_dispatch_backend, "direct")
+        self.assertEqual(settings.ai_intent_backend, "openai")
+        self.assertEqual(settings.requirement_capture_backend, "openai")
+        self.assertFalse(settings.openai_validate_models_on_startup)
+
+    def test_local_demo_profile_requires_whatsapp_and_allowlist(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Local demo WhatsApp configuration is incomplete",
+        ):
+            Settings(
+                _env_file=None,
+                runtime_profile="local_demo",
+                openai_api_key="not-a-real-secret",
+            )
+
+    def test_production_profile_selects_durable_backends(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            runtime_profile="production",
+            rate_card_storage_account_url="https://storage.example.invalid",
+            openai_api_key="not-a-real-secret",
+            whatsapp_access_token="not-a-real-secret",
+            whatsapp_phone_number_id="123",
+            whatsapp_webhook_verify_token="not-a-real-secret",
+            whatsapp_app_secret="not-a-real-secret",
+            whatsapp_seller_allowlist="919999999999",
+        )
+
+        self.assertEqual(settings.effective_runtime_profile, "production")
+        self.assertEqual(settings.environment, "production")
+        self.assertEqual(settings.rate_card_backend, "azure_blob")
+        self.assertEqual(settings.workflow_store_backend, "azure_blob")
+        self.assertEqual(settings.message_dispatch_backend, "azure_blob")
+        self.assertTrue(settings.openai_validate_models_on_startup)
+
+    def test_production_profile_allows_explicit_public_whatsapp_access(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            runtime_profile="production",
+            rate_card_storage_account_url="https://storage.example.invalid",
+            openai_api_key="not-a-real-secret",
+            whatsapp_access_token="not-a-real-secret",
+            whatsapp_phone_number_id="123",
+            whatsapp_webhook_verify_token="not-a-real-secret",
+            whatsapp_app_secret="not-a-real-secret",
+            whatsapp_seller_allowlist="",
+            whatsapp_allow_all_sellers=True,
+        )
+
+        self.assertTrue(settings.whatsapp_allow_all_sellers)
+        self.assertEqual(settings.seller_allowlist, frozenset())
+
+    def test_production_rejects_empty_allowlist_without_public_access(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "WHATSAPP_ALLOW_ALL_SELLERS=true",
+        ):
+            Settings(
+                _env_file=None,
+                runtime_profile="production",
+                rate_card_storage_account_url="https://storage.example.invalid",
+                openai_api_key="not-a-real-secret",
+                whatsapp_access_token="not-a-real-secret",
+                whatsapp_phone_number_id="123",
+                whatsapp_webhook_verify_token="not-a-real-secret",
+                whatsapp_app_secret="not-a-real-secret",
+                whatsapp_seller_allowlist="",
+            )
+
     def test_default_local_workflow_uses_v5_final_output(self) -> None:
         settings = Settings(_env_file=None)
 

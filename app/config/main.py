@@ -12,6 +12,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # Optional high-level profile for safe, one-setting runtime selection. When it is
+    # omitted, the existing individual settings remain authoritative for backward
+    # compatibility with deployed environments.
+    runtime_profile: Literal["local_demo", "production"] | None = None
     environment: Literal["development", "test", "production"] = "development"
 
     whatsapp_access_token: str = ""
@@ -22,6 +26,7 @@ class Settings(BaseSettings):
     whatsapp_webhook_verify_token: str = ""
     whatsapp_app_secret: str = ""
     whatsapp_seller_allowlist: str = ""
+    whatsapp_allow_all_sellers: bool = False
     whatsapp_validate_credentials_on_startup: bool = True
 
     # Preferred high-level switch. When omitted, the individual backend
@@ -83,8 +88,32 @@ class Settings(BaseSettings):
             if value.strip()
         )
 
+    @computed_field
+    @property
+    def effective_runtime_profile(self) -> str:
+        if self.runtime_profile is not None:
+            return self.runtime_profile
+        return "production" if self.environment == "production" else "custom"
+
     @model_validator(mode="after")
     def validate_backends(self) -> "Settings":
+        if self.runtime_profile == "local_demo":
+            self.environment = "development"
+            self.storage_mode = "local"
+            self.message_dispatch_backend = "direct"
+            self.ai_intent_backend = "openai"
+            self.requirement_capture_backend = "openai"
+            self.openai_validate_models_on_startup = False
+            self.whatsapp_validate_credentials_on_startup = True
+        elif self.runtime_profile == "production":
+            self.environment = "production"
+            self.storage_mode = "azure_blob"
+            self.message_dispatch_backend = "azure_blob"
+            self.ai_intent_backend = "openai"
+            self.requirement_capture_backend = "openai"
+            self.openai_validate_models_on_startup = True
+            self.whatsapp_validate_credentials_on_startup = True
+
         if self.storage_mode == "local":
             self.rate_card_backend = "local"
             self.workflow_store_backend = "memory"
@@ -121,6 +150,24 @@ class Settings(BaseSettings):
             raise ValueError("OpenAI intent routing requires OPENAI_API_KEY.")
         if self.requirement_capture_backend == "openai" and not self.openai_api_key:
             raise ValueError("OpenAI multimodal requirement capture requires OPENAI_API_KEY.")
+        if self.runtime_profile == "local_demo":
+            missing_demo_settings = [
+                name
+                for name, value in {
+                    "WHATSAPP_ACCESS_TOKEN": self.whatsapp_access_token,
+                    "WHATSAPP_PHONE_NUMBER_ID": self.whatsapp_phone_number_id,
+                    "WHATSAPP_WEBHOOK_VERIFY_TOKEN": self.whatsapp_webhook_verify_token,
+                    "WHATSAPP_APP_SECRET": self.whatsapp_app_secret,
+                }.items()
+                if not value
+            ]
+            if not self.whatsapp_allow_all_sellers and not self.seller_allowlist:
+                missing_demo_settings.append("WHATSAPP_SELLER_ALLOWLIST")
+            if missing_demo_settings:
+                raise ValueError(
+                    "Local demo WhatsApp configuration is incomplete: "
+                    + ", ".join(missing_demo_settings)
+                )
         if self.environment == "production":
             if not self.allow_connection_strings_in_production and (
                 self.rate_card_storage_connection_string
@@ -148,8 +195,11 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Production requires WHATSAPP_VALIDATE_CREDENTIALS_ON_STARTUP=true."
                 )
-            if not self.seller_allowlist:
-                raise ValueError("Production requires WHATSAPP_SELLER_ALLOWLIST.")
+            if not self.whatsapp_allow_all_sellers and not self.seller_allowlist:
+                raise ValueError(
+                    "Production requires WHATSAPP_SELLER_ALLOWLIST unless "
+                    "WHATSAPP_ALLOW_ALL_SELLERS=true is explicitly configured."
+                )
             if self.workflow_store_backend != "azure_blob":
                 raise ValueError(
                     "Production requires WORKFLOW_STORE_BACKEND=azure_blob."

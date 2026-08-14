@@ -14,7 +14,7 @@ The linked `ssp-v2-boilerplate` repository was assessed and is not used as a cod
 WhatsApp Cloud API
         |
         v
-FastAPI webhook -- signature + allowlist + size/type checks
+FastAPI webhook -- signature + explicit access mode + size/type checks
         |
         v
 Azure Blob webhook inbox -- persistence, leases, retries, dead-letter prefix
@@ -60,9 +60,15 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 
 ### Blob Storage
 
+- `RUNTIME_PROFILE=local_demo` selects the complete local demonstration stack as one
+  safe unit: development environment, checked-in workbook, in-memory sessions, direct
+  webhook handling, and OpenAI-assisted capture/routing. `RUNTIME_PROFILE=production`
+  selects the Azure Blob and durable-ingress stack. Azure App Service settings and the
+  process-scoped local launcher keep the two profiles isolated.
 - `STORAGE_MODE=local` selects the checked-in workbook plus in-memory workflow state
   for local testing. `STORAGE_MODE=azure_blob` selects Blob for both pricing and
-  workflow sessions. The high-level switch is authoritative when set.
+  workflow sessions. These lower-level settings remain available for backward-compatible
+  custom configurations when `RUNTIME_PROFILE` is unset.
 
 - One maintained `.xlsx` workbook in the private `pricing-workbooks` container, with
   the reviewed V5 version published as `active/Microsoft_SKU_V5.0.xlsx`. The older
@@ -108,7 +114,9 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 ## Production security
 
 - Verify `X-Hub-Signature-256` before parsing or queuing a webhook.
-- Enforce the configured seller phone-number allowlist.
+- Keep Meta `X-Hub-Signature-256` verification mandatory for every inbound request.
+- Seller access is fail-closed by default. This deployment explicitly enables public access
+  with `WHATSAPP_ALLOW_ALL_SELLERS=true`; an allowlist can be restored without changing code.
 - Use App Service/Container App Managed Identity with these data-plane roles:
   - Storage Blob Data Reader scoped to the pricing container
   - Storage Blob Data Contributor scoped to the workflow container

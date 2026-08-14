@@ -267,6 +267,65 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self.store.close()
         await self.provider.close()
 
+    async def test_explicit_public_access_accepts_sender_outside_allowlist(self) -> None:
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                seller_allowlist=frozenset(),
+                max_document_bytes=10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "public-help",
+                    "from": "911111111111",
+                    "type": "text",
+                    "text": {"body": "/help"},
+                }
+            )
+        )
+
+        self.assertEqual(len(client.messages), 1)
+        self.assertIn(
+            "SkySecure Microsoft Licensing Advisor",
+            client.messages[0].text.body,  # type: ignore[attr-defined]
+        )
+
+    async def test_default_access_rejects_sender_outside_allowlist(self) -> None:
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                seller_allowlist=frozenset(),
+                max_document_bytes=10 * 1024 * 1024,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "blocked-help",
+                    "from": "911111111111",
+                    "type": "text",
+                    "text": {"body": "/help"},
+                }
+            )
+        )
+
+        self.assertEqual(len(client.messages), 1)
+        self.assertEqual(
+            client.messages[0].text.body,  # type: ignore[attr-defined]
+            "This WhatsApp number is not authorized.",
+        )
+
     async def test_confirmation_precedes_marketplace_pricing_and_revision(self) -> None:
         client = FakeWhatsAppClient(
             WhatsAppMedia(CUSTOMER.read_bytes(), CUSTOMER.name, "text/csv")
@@ -277,6 +336,7 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ServiceConfiguration(
                 frozenset(),
                 10 * 1024 * 1024,
+                allow_all_sellers=True,
                 workflow_mode="simple_pricing",
             ),
         )
@@ -619,6 +679,7 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ServiceConfiguration(
                 frozenset(),
                 10 * 1024 * 1024,
+                allow_all_sellers=True,
                 workflow_mode="simple_pricing",
             ),
             requirement_extractor=extractor,

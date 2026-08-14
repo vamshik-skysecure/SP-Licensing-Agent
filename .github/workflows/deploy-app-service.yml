@@ -39,3 +39,33 @@ jobs:
         with:
           app-name: ${{ vars.AZURE_WEBAPP_NAME }}
           package: release.zip
+
+      - name: Apply approved public WhatsApp access mode
+        shell: bash
+        run: |
+          az webapp config appsettings set \
+            --resource-group rg-skysecure-microsoft-pricing-agent-dev \
+            --name "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --settings WHATSAPP_ALLOW_ALL_SELLERS=true \
+            --output none
+          az webapp config appsettings delete \
+            --resource-group rg-skysecure-microsoft-pricing-agent-dev \
+            --name "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --setting-names WHATSAPP_SELLER_ALLOWLIST \
+            --output none
+
+      - name: Restart and verify application health
+        shell: bash
+        run: |
+          az webapp restart \
+            --resource-group rg-skysecure-microsoft-pricing-agent-dev \
+            --name "${{ vars.AZURE_WEBAPP_NAME }}"
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error \
+              "https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net/health/ready"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Application readiness did not succeed within five minutes." >&2
+          exit 1

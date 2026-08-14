@@ -981,7 +981,9 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         service = WhatsAppWebhookService(
             client,  # type: ignore[arg-type]
             orchestrator,
-            ServiceConfiguration(frozenset(), 1024 * 1024),
+            ServiceConfiguration(
+                frozenset(), 1024 * 1024, allow_all_sellers=True
+            ),
         )
         sender = "911234567890"
         await orchestrator.analyze_document(
@@ -1027,7 +1029,9 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         service = WhatsAppWebhookService(
             client,  # type: ignore[arg-type]
             orchestrator,
-            ServiceConfiguration(frozenset(), 1024 * 1024),
+            ServiceConfiguration(
+                frozenset(), 1024 * 1024, allow_all_sellers=True
+            ),
         )
         webhook = WhatsAppWebhookPayload.model_validate(
             {
@@ -1080,7 +1084,9 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         service = WhatsAppWebhookService(
             client,  # type: ignore[arg-type]
             orchestrator,
-            ServiceConfiguration(frozenset(), 1024 * 1024),
+            ServiceConfiguration(
+                frozenset(), 1024 * 1024, allow_all_sellers=True
+            ),
             intent_interpreter=FakeIntentInterpreter(),
         )
         upload = WhatsAppWebhookPayload.model_validate(
@@ -1138,7 +1144,9 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         service = WhatsAppWebhookService(
             client,  # type: ignore[arg-type]
             orchestrator,
-            ServiceConfiguration(frozenset(), 1024 * 1024),
+            ServiceConfiguration(
+                frozenset(), 1024 * 1024, allow_all_sellers=True
+            ),
             intent_interpreter=interpreter,
         )
         sender = "911234567890"

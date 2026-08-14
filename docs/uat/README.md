@@ -40,6 +40,7 @@ five synthetic add-ons and is not the primary current business-demo file.
 ## Local configuration
 
 ```dotenv
+RUNTIME_PROFILE=local_demo
 ENVIRONMENT=development
 STORAGE_MODE=local
 WORKFLOW_MODE=simple_pricing
@@ -52,8 +53,10 @@ OPENAI_MODEL=gpt-5.6-luna
 WHATSAPP_VALIDATE_CREDENTIALS_ON_STARTUP=true
 ```
 
-Local mode intentionally loses session state when the process restarts. Production uses
-Blob-backed sessions with ETag concurrency and a leased, retrying Blob webhook inbox.
+Start this profile with `scripts/start_local_demo.cmd`; its environment override is limited
+to the local process and does not change Azure. Local mode intentionally loses session state
+when the process restarts. Production uses Blob-backed sessions with ETag concurrency and a
+leased, retrying Blob webhook inbox.
 
 ## Automated regression
 

@@ -198,6 +198,7 @@ class RenewalOnlyWhatsAppTests(unittest.IsolatedAsyncioTestCase):
             ServiceConfiguration(
                 frozenset(),
                 10 * 1024 * 1024,
+                allow_all_sellers=True,
                 workflow_mode="renewal_only",
             ),
             intent_interpreter=interpreter,

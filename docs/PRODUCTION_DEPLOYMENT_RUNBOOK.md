@@ -115,15 +115,16 @@ Portal > App Service > Environment variables:
 
 1. Add the complete new setting set.
 2. Enter the OpenAI and Meta values directly in the portal.
-3. Confirm `MESSAGE_DISPATCH_BACKEND=azure_blob`.
-4. Confirm `STORAGE_MODE=azure_blob` and `ALLOW_CONNECTION_STRINGS_IN_PRODUCTION=false` when
+3. Confirm `RUNTIME_PROFILE=production`.
+4. Confirm `MESSAGE_DISPATCH_BACKEND=azure_blob`.
+5. Confirm `STORAGE_MODE=azure_blob` and `ALLOW_CONNECTION_STRINGS_IN_PRODUCTION=false` when
    managed identity access is available.
-5. Remove Phase 1-only environment variables only after the backup timestamp has been recorded.
-6. Save a names-only screenshot of the final settings; do not expose values.
+6. Remove Phase 1-only environment variables only after the backup timestamp has been recorded.
+7. Save a names-only screenshot of the final settings; do not expose values.
 
-The application intentionally refuses production startup when Meta credentials, the seller
-allowlist, Blob configuration, durable dispatch, OpenAI configuration, or startup model validation
-is missing.
+The application intentionally refuses production startup when Meta credentials, an explicit
+seller access mode, Blob configuration, durable dispatch, OpenAI configuration, or startup model
+validation is missing.
 
 ## 7. Controlled code replacement
 
@@ -177,7 +178,9 @@ When the production Meta number and system-user token are available:
    `https://skysecure-microsoft-pricing-agent-dev.azurewebsites.net/api/whatsapp/webhook`.
 2. Enter the same webhook verify token stored in App Service settings.
 3. Verify and save, then subscribe to `messages`.
-4. Add only approved seller numbers to `WHATSAPP_SELLER_ALLOWLIST`.
+4. For the approved public-access deployment, set
+   `WHATSAPP_ALLOW_ALL_SELLERS=true` and leave `WHATSAPP_SELLER_ALLOWLIST` empty.
+   Meta webhook signature verification remains mandatory.
 5. Run text, spreadsheet, image, PDF/Word, and voice capture using synthetic data.
 6. Confirm correction, seller validation, as-is pricing, optional recommendations/changes,
    revised pricing, final validation, and customer-ready PDF delivery.
@@ -204,7 +207,7 @@ If readiness or UAT fails:
 - managed-identity Blob role evidence or an approved connection-string exception;
 - workbook backup, ETag, and last-modified time;
 - `/health/ready` output;
-- Meta signature and seller-allowlist evidence;
+- Meta signature and explicit public-access configuration evidence;
 - Blob ingress restart, retry, duplicate, and dead-letter tests;
 - privacy/security review;
 - business UAT sign-off.
