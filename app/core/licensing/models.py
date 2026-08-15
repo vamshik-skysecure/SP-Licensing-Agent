@@ -131,6 +131,15 @@ class NormalizedLicenseLine(BaseModel):
         return self.sku_title or self.source_product_title
 
 
+class SellerProvidedDetail(BaseModel):
+    """Optional proposal context supplied by the seller; never inferred from pricing data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=60)
+    value: str = Field(min_length=1, max_length=500)
+
+
 class LicenseEstate(BaseModel):
     id: str
     thread_id: str
@@ -138,6 +147,7 @@ class LicenseEstate(BaseModel):
     status: EstateStatus
     lines: list[NormalizedLicenseLine]
     rate_card_version: str
+    seller_details: list[SellerProvidedDetail] = Field(default_factory=list, max_length=12)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

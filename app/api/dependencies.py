@@ -15,7 +15,12 @@ from app.core.dispatch import (
     DirectWebhookDispatcher,
     WebhookDispatcher,
 )
-from app.core.licensing.agent import IntentInterpreter, OpenAIIntentInterpreter
+from app.core.licensing.agent import (
+    IntentInterpreter,
+    OpenAIIntentInterpreter,
+    OpenAIMicrosoftRecommendationAdvisor,
+    RecommendationAdvisor,
+)
 from app.core.licensing.analysis import LicenseAnalyzer
 from app.core.licensing.capture import OpenAIRequirementExtractor, RequirementExtractor
 from app.core.licensing.migration_rules import MigrationSeedCatalog
@@ -113,7 +118,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         default_term_duration=settings.default_term_duration,
         default_billing_plan=settings.default_billing_plan,
     )
-    migration_seeds = MigrationSeedCatalog.load(settings.migration_seed_path)
+    migration_seeds = (
+        None
+        if settings.workflow_mode == "simple_pricing"
+        else MigrationSeedCatalog.load(settings.migration_seed_path)
+    )
     scenario_engine = ScenarioEngine(
         migration_seeds,
         apply_bundle_rules=settings.workflow_mode == "scenario_comparison",
@@ -130,11 +139,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise ValueError(
             "The simple pricing workflow requires a populated current-price column."
         )
-    if settings.workflow_mode in {
-        "simple_pricing",
-        "upgrade_comparison",
-        "scenario_comparison",
-    }:
+    if settings.workflow_mode in {"upgrade_comparison", "scenario_comparison"}:
         scenario_engine.validate_catalog(
             catalog,
             term_duration=settings.default_term_duration,
@@ -147,8 +152,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         catalog.version,
         len(catalog.items),
         settings.workflow_mode,
-        len(migration_seeds.rules),
-        sum(rule.approved for rule in migration_seeds.rules),
+        len(migration_seeds.rules) if migration_seeds is not None else 0,
+        (
+            sum(rule.approved for rule in migration_seeds.rules)
+            if migration_seeds is not None
+            else 0
+        ),
     )
     orchestrator = LicensingOrchestrator(
         analyzer=analyzer,
@@ -166,6 +175,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             model=settings.openai_model,
             reasoning_effort=settings.openai_reasoning_effort,
             workflow_mode=settings.workflow_mode,
+            currency=settings.default_currency,
         )
     requirement_extractor: RequirementExtractor | None = None
     if settings.requirement_capture_backend == "openai":
@@ -176,18 +186,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             max_audio_seconds=settings.max_audio_seconds,
             reasoning_effort=settings.openai_reasoning_effort,
         )
+    recommendation_advisor: RecommendationAdvisor | None = None
+    if settings.official_recommendation_backend == "openai_web":
+        recommendation_advisor = OpenAIMicrosoftRecommendationAdvisor(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            reasoning_effort=settings.openai_reasoning_effort,
+        )
     if settings.openai_validate_models_on_startup:
         try:
             if intent_interpreter is not None:
                 await intent_interpreter.validate_model_access()
             if requirement_extractor is not None:
                 await requirement_extractor.validate_model_access()
+            if recommendation_advisor is not None:
+                await recommendation_advisor.validate_model_access()
         except OpenAIError:
             logger.exception("OpenAI model access validation failed")
             if intent_interpreter is not None:
                 await intent_interpreter.close()
             if requirement_extractor is not None:
                 await requirement_extractor.close()
+            if recommendation_advisor is not None:
+                await recommendation_advisor.close()
             await workflow_store.close()
             await rate_cards.close()
             await whatsapp_http_client.aclose()
@@ -207,6 +228,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         intent_interpreter=intent_interpreter,
         requirement_extractor=requirement_extractor,
+        recommendation_advisor=recommendation_advisor,
     )
 
     dispatcher: WebhookDispatcher
@@ -244,6 +266,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await intent_interpreter.close()
         if requirement_extractor is not None:
             await requirement_extractor.close()
+        if recommendation_advisor is not None:
+            await recommendation_advisor.close()
         await whatsapp_http_client.aclose()
         logger.info("Application shutdown completed")
 

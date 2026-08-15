@@ -11,7 +11,13 @@ from app.core.licensing.analysis import (
     LicenseAnalyzer,
     parse_customer_file,
 )
-from app.core.licensing.agent import AgentIntent, OpenAIIntentInterpreter
+from app.core.licensing.agent import (
+    AgentIntent,
+    IntentInterpretationError,
+    OfficialRecommendation,
+    OpenAIIntentInterpreter,
+    OpenAIMicrosoftRecommendationAdvisor,
+)
 from app.core.licensing.migration_rules import (
     MigrationSeedCatalog,
     MigrationSeedDocument,
@@ -720,7 +726,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(scenario.comments, [])
         self.assertTrue(scenario.assumptions)
-        self.assertIn("Comments and assumptions", rendered_text)
+        self.assertIn("Proposal notes", rendered_text)
         for assumption in scenario.assumptions:
             self.assertIn(f"• {assumption}", rendered_text)
         self.assertTrue(pdf.startswith(b"%PDF"))
@@ -768,6 +774,9 @@ class IntentAdapterTests(unittest.IsolatedAsyncioTestCase):
             candidate_number=-1,
             match_selections=[],
             comment="",
+            detail_label="",
+            detail_value="",
+            response_text="",
             clarification="",
         )
 
@@ -800,6 +809,77 @@ class IntentAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(client.responses.request["text_format"], AgentIntent)
         self.assertFalse(client.responses.request["store"])
         await adapter.close()
+
+    async def test_official_recommendation_uses_microsoft_only_web_search(self) -> None:
+        expected = OfficialRecommendation(
+            recommendation=(
+                "Microsoft 365 E5 is the candidate supported for review when the seller "
+                "requires the documented E5 capabilities."
+            ),
+            clarification_question="",
+            suggested_candidate_numbers=[1],
+            source_urls=[
+                "https://learn.microsoft.com/en-us/microsoft-365/enterprise/"
+            ],
+        )
+
+        class FakeResponses:
+            request: dict[str, object] | None = None
+
+            async def parse(self, **kwargs: object) -> object:
+                self.request = kwargs
+                return SimpleNamespace(status="completed", output_parsed=expected)
+
+        client = SimpleNamespace(responses=FakeResponses())
+        advisor = OpenAIMicrosoftRecommendationAdvisor(
+            api_key="test-key",
+            model="gpt-5.6-luna",
+            client=client,
+        )
+
+        actual = await advisor.advise(
+            seller_request="Suggest an option with documented E5 capabilities",
+            current_sku="Microsoft 365 E3",
+            quantity=100,
+            candidate_skus=["Microsoft 365 E5"],
+        )
+
+        self.assertEqual(actual.suggested_candidate_numbers, [1])
+        request = client.responses.request
+        assert request is not None
+        self.assertEqual(request["tool_choice"], "required")
+        self.assertFalse(request["store"])
+        self.assertIs(request["text_format"], OfficialRecommendation)
+        self.assertEqual(
+            request["tools"][0]["filters"]["allowed_domains"],  # type: ignore[index]
+            ["learn.microsoft.com", "microsoft.com"],
+        )
+
+    async def test_official_recommendation_rejects_non_microsoft_sources(self) -> None:
+        parsed = OfficialRecommendation(
+            recommendation="Use candidate one.",
+            clarification_question="",
+            suggested_candidate_numbers=[1],
+            source_urls=["https://example.com/unverified"],
+        )
+
+        class FakeResponses:
+            async def parse(self, **_: object) -> object:
+                return SimpleNamespace(status="completed", output_parsed=parsed)
+
+        advisor = OpenAIMicrosoftRecommendationAdvisor(
+            api_key="test-key",
+            model="gpt-5.6-luna",
+            client=SimpleNamespace(responses=FakeResponses()),
+        )
+
+        with self.assertRaises(IntentInterpretationError):
+            await advisor.advise(
+                seller_request="Recommend a better SKU",
+                current_sku="Microsoft 365 E3",
+                quantity=100,
+                candidate_skus=["Microsoft 365 E5"],
+            )
 
 
 class BlobWorkflowStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -931,6 +1011,9 @@ class FakeIntentInterpreter:
             candidate_number=-1,
             match_selections=[],
             comment="",
+            detail_label="",
+            detail_value="",
+            response_text="",
             clarification="",
         )
 
@@ -957,6 +1040,9 @@ def agent_intent(action: str, **updates: object) -> AgentIntent:
         "candidate_number": -1,
         "match_selections": [],
         "comment": "",
+        "detail_label": "",
+        "detail_value": "",
+        "response_text": "",
         "clarification": "",
     }
     values.update(updates)
@@ -1000,7 +1086,9 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
             for message in client.messages
             if getattr(message, "text", None) is not None
         ]
-        self.assertTrue(any("*Confirmation required*" in body for body in prompt_bodies))
+        self.assertTrue(
+            any("*I need to confirm the intended SKU*" in body for body in prompt_bodies)
+        )
         self.assertTrue(any("No change was made" in body for body in prompt_bodies))
         confirmation_menu = client.messages[-1]
         self.assertEqual(confirmation_menu.interactive.type, "list")  # type: ignore[attr-defined]
@@ -1023,7 +1111,7 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         await store.close()
         await provider.close()
 
-    async def test_upload_displays_estate_and_scenario_menu(self) -> None:
+    async def test_upload_displays_estate_and_natural_scenario_prompt(self) -> None:
         provider, _, store, _, orchestrator = await workflow_components()
         client = FakeWhatsAppClient()
         service = WhatsAppWebhookService(
@@ -1069,11 +1157,14 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
             "customer-licence-estate.pdf",
         )
         self.assertTrue(client.documents[0]["content"].startswith(b"%PDF"))
-        menu = client.messages[-1]
-        self.assertEqual(menu.interactive.type, "list")  # type: ignore[attr-defined]
-        self.assertEqual(
-            len(menu.interactive.action.sections[0].rows),  # type: ignore[attr-defined]
-            4,
+        prompt = client.messages[-1].text.body  # type: ignore[attr-defined]
+        self.assertIn("Which annual option", prompt)
+        self.assertIn("Renew As-Is, ME3, ME5, or ME7", prompt)
+        self.assertFalse(
+            any(
+                getattr(message, "interactive", None) is not None
+                for message in client.messages
+            )
         )
         await store.close()
         await provider.close()

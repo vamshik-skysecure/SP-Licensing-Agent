@@ -33,6 +33,7 @@ class StorageModeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.message_dispatch_backend, "direct")
         self.assertEqual(settings.ai_intent_backend, "openai")
         self.assertEqual(settings.requirement_capture_backend, "openai")
+        self.assertEqual(settings.official_recommendation_backend, "openai_web")
         self.assertFalse(settings.openai_validate_models_on_startup)
 
     def test_local_demo_profile_requires_whatsapp_and_allowlist(self) -> None:
@@ -64,6 +65,7 @@ class StorageModeSettingsTests(unittest.TestCase):
         self.assertEqual(settings.rate_card_backend, "azure_blob")
         self.assertEqual(settings.workflow_store_backend, "azure_blob")
         self.assertEqual(settings.message_dispatch_backend, "azure_blob")
+        self.assertEqual(settings.official_recommendation_backend, "openai_web")
         self.assertTrue(settings.openai_validate_models_on_startup)
 
     def test_production_profile_allows_explicit_public_whatsapp_access(self) -> None:

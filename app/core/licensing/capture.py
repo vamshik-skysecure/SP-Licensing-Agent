@@ -31,6 +31,15 @@ class ExtractedRequirementLine(BaseModel):
     renewal_date: str
 
 
+class ExtractedSellerDetail(BaseModel):
+    """Optional proposal detail explicitly present in the seller's input."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    value: str
+
+
 class RequirementExtraction(BaseModel):
     """Strict extraction envelope used for text, files, images, and transcripts."""
 
@@ -40,6 +49,7 @@ class RequirementExtraction(BaseModel):
     warnings: list[str]
     needs_clarification: bool
     clarification: str
+    seller_details: list[ExtractedSellerDetail] = Field(default_factory=list)
 
     def to_parsed_rows(self) -> list[ParsedLicenseRow]:
         if self.needs_clarification:
@@ -130,6 +140,9 @@ Extraction rules:
 - If term or billing is absent, return an empty string; the application will show its configured
   default during confirmation so the seller can correct it.
 - Dates use YYYY-MM-DD when unambiguous; otherwise return an empty string and add a warning.
+- Capture optional proposal context only when explicitly present, such as customer name,
+  customer reference, opportunity/reference number, or a seller note. Put each item in
+  seller_details with a short label and its exact value. Do not infer missing context.
 - Ignore totals, discounts, margin, distributor pricing, and promotional text in the source.
 - Do not merge differently named SKUs.
 """

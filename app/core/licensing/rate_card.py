@@ -13,7 +13,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Protocol
 
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz
 
 from .models import RateCardItem, SkuMatchCandidate
 
@@ -104,7 +104,116 @@ class AzureBlobRateCardSource:
 def normalize_product_title(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).casefold()
     normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
-    return " ".join(normalized.split())
+    normalized = " ".join(normalized.split())
+    aliases = (
+        (r"\bm365\b", "microsoft 365"),
+        (r"\bo365\b", "office 365"),
+        (r"\bems\b", "enterprise mobility security"),
+        (r"\bplan one\b", "plan 1"),
+        (r"\bplan two\b", "plan 2"),
+    )
+    for pattern, replacement in aliases:
+        normalized = re.sub(pattern, replacement, normalized)
+    return normalized
+
+
+_GENERIC_SKU_TOKENS = {
+    "license",
+    "licenses",
+    "licence",
+    "licences",
+    "plan",
+    "plans",
+    "product",
+    "sku",
+    "subscription",
+    "subscriptions",
+}
+_VARIANT_MARKERS = (
+    "education",
+    "student",
+    "faculty",
+    "non profit",
+    "nonprofit",
+    "government",
+    "charity",
+    "three year",
+    "3 year",
+    "36 month",
+    "unattended",
+    "student use benefit",
+    "no teams",
+)
+_FAMILY_MARKERS = (
+    # Specific product families must precede the suite names embedded in their
+    # titles (for example, Defender for Office 365 and Microsoft 365 Copilot).
+    ("microsoft defender", "defender"),
+    ("defender", "defender"),
+    ("copilot", "copilot"),
+    ("dynamics 365", "dynamics-365"),
+    ("enterprise mobility security", "enterprise-mobility-security"),
+    ("power bi", "power-bi"),
+    ("power apps", "power-platform"),
+    ("power automate", "power-platform"),
+    ("microsoft 365", "microsoft-365"),
+    ("office 365", "office-365"),
+    ("teams", "teams"),
+    ("visio", "visio"),
+    ("project", "project"),
+    ("intune", "intune"),
+    ("entra", "entra"),
+    ("windows", "windows"),
+)
+_AMBIGUOUS_TIER_FAMILY_PRIORITY = {
+    "microsoft-365": 0,
+    "office-365": 1,
+    "enterprise-mobility-security": 2,
+    "defender": 3,
+    "dynamics-365": 4,
+}
+
+
+def _tier_tokens(normalized: str) -> set[str]:
+    return set(re.findall(r"\b(?:a|e|f)\d+\b", normalized))
+
+
+def _product_family_key(normalized: str) -> str | None:
+    for marker, family in _FAMILY_MARKERS:
+        if marker in normalized:
+            return family
+    return None
+
+
+def _unrequested_variant_count(query: str, title: str) -> int:
+    return sum(marker in title and marker not in query for marker in _VARIANT_MARKERS)
+
+
+def _base_suite_penalty(title: str) -> int:
+    """Prefer a suite itself over similarly named add-ons for a tier-only query."""
+
+    tier = next(iter(_tier_tokens(title)), "")
+    family = _product_family_key(title)
+    if not tier or family not in {
+        "microsoft-365",
+        "office-365",
+        "enterprise-mobility-security",
+    }:
+        return 1
+    permitted = {
+        "microsoft",
+        "office",
+        "365",
+        "enterprise",
+        "mobility",
+        "security",
+        tier,
+        "without",
+        "audio",
+        "conferencing",
+        "no",
+        "teams",
+    }
+    return int(bool(set(title.split()) - permitted))
 
 
 @dataclass(frozen=True)
@@ -129,6 +238,10 @@ class RateCardCatalog:
             index: normalize_product_title(identity.sku_title)
             for index, identity in enumerate(self.identities)
         }
+        self._items_by_identity: dict[tuple[str, str, str], list[RateCardItem]] = {}
+        for item in items:
+            key = (item.product_id, item.sku_id, item.sku_title)
+            self._items_by_identity.setdefault(key, []).append(item)
 
     def candidates(
         self,
@@ -180,18 +293,141 @@ class RateCardCatalog:
             if title == normalized
         ]
         if exact:
-            return [self._candidate(identity, 100.0) for identity in exact[:limit]]
+            # A workbook can expose the same display title under monthly and annual
+            # SKU identities. The seller cannot distinguish identical labels, so use
+            # the maintained annual Commercial identity when one exists.
+            return [self._candidate(self._preferred_identity(exact), 100.0)]
 
-        matches = process.extract(
-            normalized,
-            self._normalized_titles,
-            scorer=fuzz.WRatio,
-            limit=limit,
+        query_tokens = set(normalized.split())
+        tiers = _tier_tokens(normalized)
+        query_family = _product_family_key(normalized)
+        pool = list(self.identities)
+        if tiers:
+            tier_pool = [
+                identity
+                for identity in pool
+                if tiers.issubset(_tier_tokens(normalize_product_title(identity.sku_title)))
+            ]
+            if not tier_pool:
+                return []
+            pool = tier_pool
+        if query_family:
+            family_pool = [
+                identity
+                for identity in pool
+                if _product_family_key(normalize_product_title(identity.sku_title))
+                == query_family
+            ]
+            if not family_pool:
+                return []
+            pool = family_pool
+
+        ranked: list[tuple[tuple[object, ...], SkuIdentity, float]] = []
+        for identity in pool:
+            title = normalize_product_title(identity.sku_title)
+            title_tokens = set(title.split())
+            informative_query = query_tokens - _GENERIC_SKU_TOKENS
+            overlap = len(informative_query & title_tokens)
+            if informative_query and overlap == 0:
+                continue
+            score = float(fuzz.WRatio(normalized, title))
+            if informative_query:
+                score += 8.0 * overlap / len(informative_query)
+            score -= 6.0 * _unrequested_variant_count(normalized, title)
+            score = max(0.0, min(99.0, score))
+            if score < 55.0:
+                continue
+            ranked.append(
+                (
+                    self._candidate_rank(
+                        identity,
+                        normalized_query=normalized,
+                        query_family=query_family,
+                        has_tier=bool(tiers),
+                        score=score,
+                    ),
+                    identity,
+                    score,
+                )
+            )
+        ranked.sort(key=lambda item: item[0])
+
+        result: list[SkuMatchCandidate] = []
+        seen_titles: set[str] = set()
+        seen_families: set[str] = set()
+        family_choice = bool(tiers) and not query_family
+        for _rank, identity, score in ranked:
+            title_key = normalize_product_title(identity.sku_title)
+            family_key = _product_family_key(title_key) or title_key
+            if title_key in seen_titles:
+                continue
+            if family_choice and family_key in seen_families:
+                continue
+            seen_titles.add(title_key)
+            seen_families.add(family_key)
+            result.append(self._candidate(identity, score))
+            if len(result) >= limit:
+                break
+        return result
+
+    def _preferred_identity(self, identities: Sequence[SkuIdentity]) -> SkuIdentity:
+        return min(identities, key=self._identity_preference)
+
+    def _identity_preference(self, identity: SkuIdentity) -> tuple[object, ...]:
+        rows = self._items_by_identity.get(
+            (identity.product_id, identity.sku_id, identity.sku_title),
+            [],
         )
-        return [
-            self._candidate(self.identities[index], float(score))
-            for _, score, index in matches
-        ]
+        annual = any(
+            row.term_duration.casefold() == "p1y"
+            and row.billing_plan.casefold() == "annual"
+            for row in rows
+        )
+        commercial = any(
+            (row.segment or "").casefold() == "commercial"
+            and row.term_duration.casefold() == "p1y"
+            and row.billing_plan.casefold() == "annual"
+            for row in rows
+        )
+        priceable = any(
+            row.marketplace_price > 0
+            and row.term_duration.casefold() == "p1y"
+            and row.billing_plan.casefold() == "annual"
+            for row in rows
+        )
+        return (
+            not commercial,
+            not annual,
+            not priceable,
+            _unrequested_variant_count("", normalize_product_title(identity.sku_title)),
+            identity.sku_id.casefold(),
+        )
+
+    def _candidate_rank(
+        self,
+        identity: SkuIdentity,
+        *,
+        normalized_query: str,
+        query_family: str | None,
+        has_tier: bool,
+        score: float,
+    ) -> tuple[object, ...]:
+        title = normalize_product_title(identity.sku_title)
+        family = _product_family_key(title)
+        family_priority = (
+            _AMBIGUOUS_TIER_FAMILY_PRIORITY.get(family or "", 99)
+            if has_tier and query_family is None
+            else 0
+        )
+        return (
+            family_priority,
+            _unrequested_variant_count(normalized_query, title),
+            _base_suite_penalty(title),
+            *self._identity_preference(identity),
+            -score,
+            len(title),
+            title,
+        )
 
     def price_rows(
         self,
@@ -239,6 +475,60 @@ class RateCardCatalog:
             if segment_rows:
                 rows = segment_rows
         return rows
+
+    def higher_tier_candidates(
+        self,
+        current_title: str,
+        *,
+        limit: int = 3,
+    ) -> list[SkuMatchCandidate]:
+        """Return same-family higher-tier catalogue options for seller review only."""
+
+        normalized = normalize_product_title(current_title)
+        family = _product_family_key(normalized)
+        current_tiers = _tier_tokens(normalized)
+        if family is None or len(current_tiers) != 1:
+            return []
+        current_tier = next(iter(current_tiers))
+        tier_match = re.fullmatch(r"([aef])(\d+)", current_tier)
+        if tier_match is None:
+            return []
+        tier_prefix, current_level_text = tier_match.groups()
+        current_level = int(current_level_text)
+        by_tier: dict[int, list[SkuIdentity]] = {}
+        for identity in self.identities:
+            title = normalize_product_title(identity.sku_title)
+            if _product_family_key(title) != family:
+                continue
+            tiers = _tier_tokens(title)
+            if len(tiers) != 1:
+                continue
+            match = re.fullmatch(r"([aef])(\d+)", next(iter(tiers)))
+            if match is None or match.group(1) != tier_prefix:
+                continue
+            level = int(match.group(2))
+            if level <= current_level:
+                continue
+            by_tier.setdefault(level, []).append(identity)
+
+        result: list[SkuMatchCandidate] = []
+        for level in sorted(by_tier):
+            identity = min(
+                by_tier[level],
+                key=lambda item: (
+                    _unrequested_variant_count(
+                        normalized,
+                        normalize_product_title(item.sku_title),
+                    ),
+                    _base_suite_penalty(normalize_product_title(item.sku_title)),
+                    *self._identity_preference(item),
+                    len(item.sku_title),
+                ),
+            )
+            result.append(self._candidate(identity, 99.0))
+            if len(result) >= limit:
+                break
+        return result
 
     @staticmethod
     def _candidate(identity: SkuIdentity, confidence: float) -> SkuMatchCandidate:

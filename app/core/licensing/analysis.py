@@ -12,6 +12,7 @@ from .models import (
     LicenseEstate,
     NormalizedLicenseLine,
     ParsedLicenseRow,
+    SellerProvidedDetail,
 )
 from .rate_card import RateCardCatalog, RateCardProvider
 
@@ -79,12 +80,13 @@ class LicenseAnalyzer:
         content: bytes,
     ) -> LicenseEstate:
         catalog = await self._rate_cards.get()
-        parsed = parse_customer_file(content, filename)
+        parsed, seller_details = parse_customer_document(content, filename)
         return self._analyze_parsed(
             thread_id=thread_id,
             source_file=filename,
             parsed=parsed,
             catalog=catalog,
+            seller_details=seller_details,
         )
 
     async def analyze_parsed(
@@ -93,6 +95,7 @@ class LicenseAnalyzer:
         thread_id: str,
         source_file: str,
         parsed: list[ParsedLicenseRow],
+        seller_details: list[SellerProvidedDetail] | None = None,
     ) -> LicenseEstate:
         catalog = await self._rate_cards.get()
         return self._analyze_parsed(
@@ -100,6 +103,7 @@ class LicenseAnalyzer:
             source_file=source_file,
             parsed=parsed,
             catalog=catalog,
+            seller_details=seller_details,
         )
 
     def _analyze_parsed(
@@ -109,6 +113,7 @@ class LicenseAnalyzer:
         source_file: str,
         parsed: list[ParsedLicenseRow],
         catalog: RateCardCatalog,
+        seller_details: list[SellerProvidedDetail] | None = None,
     ) -> LicenseEstate:
         lines = [self._match_row(row, catalog) for row in parsed]
         lines = _aggregate_resolved_lines(lines)
@@ -125,6 +130,7 @@ class LicenseAnalyzer:
             ),
             lines=lines,
             rate_card_version=catalog.version,
+            seller_details=list(seller_details or []),
             created_at=now,
             updated_at=now,
         )
@@ -200,14 +206,9 @@ class LicenseAnalyzer:
         if len(candidates) == 1 and candidates[0].confidence == 100:
             selected = candidates[0]
             method = "exact"
-        elif candidates and candidates[0].confidence >= self._match_threshold:
-            tied = (
-                len(candidates) > 1
-                and abs(candidates[0].confidence - candidates[1].confidence) < 0.001
-            )
-            if not tied:
-                selected = candidates[0]
-                method = "fuzzy"
+        # A title-only fuzzy result is always advisory. Even a high score can cross
+        # product families (for example, Microsoft 365 E5 versus Dynamics 365), so
+        # only an exact catalogue identity is committed without seller clarification.
 
         return NormalizedLicenseLine(
             line_id=f"L{row.row_number - 1}",
@@ -231,14 +232,22 @@ class LicenseAnalyzer:
 
 
 def parse_customer_file(content: bytes, filename: str) -> list[ParsedLicenseRow]:
+    parsed, _seller_details = parse_customer_document(content, filename)
+    return parsed
+
+
+def parse_customer_document(
+    content: bytes,
+    filename: str,
+) -> tuple[list[ParsedLicenseRow], list[SellerProvidedDetail]]:
     suffix = Path(filename).suffix.casefold()
     if suffix == ".csv":
-        rows = _csv_rows(content)
+        rows = list(_csv_rows(content))
     elif suffix in {".xlsx", ".xlsm"}:
-        rows = _xlsx_rows(content)
+        rows = list(_xlsx_rows(content))
     else:
         raise LicenseAnalysisError("Upload a .csv, .xlsx, or .xlsm licence file.")
-    return _parse_rows(rows)
+    return _parse_rows(rows), _seller_details_from_preamble(rows)
 
 
 def _csv_rows(content: bytes) -> Iterable[Sequence[object]]:
@@ -262,6 +271,49 @@ def _xlsx_rows(content: bytes) -> Iterable[Sequence[object]]:
 
 def _header_key(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+_SELLER_DETAIL_LABELS = {
+    "customer": "Customer name",
+    "customername": "Customer name",
+    "company": "Customer name",
+    "companyname": "Customer name",
+    "accountname": "Customer name",
+    "customerreference": "Customer reference",
+    "referencenumber": "Customer reference",
+    "referenceid": "Customer reference",
+    "opportunity": "Opportunity",
+    "opportunityid": "Opportunity",
+    "opportunityname": "Opportunity",
+    "proposalname": "Proposal name",
+    "proposaltitle": "Proposal name",
+    "sellernote": "Seller note",
+    "notes": "Seller note",
+}
+
+
+def _seller_details_from_preamble(
+    rows: Sequence[Sequence[object]],
+) -> list[SellerProvidedDetail]:
+    """Capture explicit key/value context above the tabular header, if present."""
+
+    details: dict[str, SellerProvidedDetail] = {}
+    for candidate in rows[:25]:
+        fields = {_HEADER_ALIASES.get(_header_key(value)) for value in candidate}
+        if _REQUIRED.issubset(fields):
+            break
+        populated = [str(value).strip() for value in candidate if value not in (None, "")]
+        if len(populated) < 2:
+            continue
+        label = _SELLER_DETAIL_LABELS.get(_header_key(populated[0]))
+        if label is None:
+            continue
+        value = " ".join(populated[1].split())[:500]
+        if value:
+            details[label.casefold()] = SellerProvidedDetail(label=label, value=value)
+        if len(details) >= 12:
+            break
+    return list(details.values())
 
 
 def _parse_rows(rows: Iterable[Sequence[object]]) -> list[ParsedLicenseRow]:

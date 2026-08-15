@@ -62,22 +62,47 @@ def format_estate(
 
 
 def format_pending_matches(estate: LicenseEstate) -> str:
-    lines = ["*Confirm SKU matches*"]
+    lines = ["*I need to confirm the intended SKU*"]
     for pending in estate.pending_lines:
-        lines.extend(("", f"{pending.line_id}. {pending.source_product_title}"))
-        for index, candidate in enumerate(pending.candidates, start=1):
-            lines.append(
-                f"  {index}) {candidate.sku_title} "
-                f"[{candidate.product_id}/{candidate.sku_id}] ({candidate.confidence:.1f}%)"
+        lines.extend(
+            (
+                "",
+                f"*{pending.line_id} — {pending.source_product_title}*",
+                sku_clarification_question(
+                    pending.source_product_title,
+                    pending.candidates,
+                ),
             )
-    lines.extend(
-        (
-            "",
-            "Please confirm one candidate for each unresolved line using the displayed "
-            "line and option numbers.",
         )
-    )
+        for index, candidate in enumerate(pending.candidates, start=1):
+            lines.append(f"{index}. {candidate.sku_title}")
+    if any(line.candidates for line in estate.pending_lines):
+        lines.extend(
+            (
+                "",
+                "Reply with the line and option number, or send the complete product name. "
+                "Nothing will be priced until the SKU is confirmed.",
+            )
+        )
     return "\n".join(lines)
+
+
+def sku_clarification_question(source_title: str, candidates: list[object]) -> str:
+    """Build a concise seller question without exposing matching internals."""
+
+    if not candidates:
+        return (
+            f"I could not identify a reliable match for “{source_title}”. "
+            "What is the complete Microsoft product and plan name?"
+        )
+    titles = [str(getattr(item, "sku_title", "")) for item in candidates]
+    families = {product_family(title) for title in titles if title}
+    if len(families) > 1:
+        return (
+            f"Several Microsoft product families use “{source_title}”. "
+            "Which product family and plan do you mean?"
+        )
+    return f"I found more than one possible match for “{source_title}”. Which one do you mean?"
 
 
 _CORE_SUITE_TITLES = {
@@ -203,7 +228,30 @@ def render_estate_pdf(
             styles["Normal"],
         ),
         Spacer(1, 4 * mm),
-        _table(
+    ]
+    if estate.seller_details:
+        story.extend(
+            [
+                Paragraph("Seller-provided proposal details", styles["Heading2"]),
+                _table(
+                    [
+                        ["Detail", "Value"],
+                        *[
+                            [
+                                Paragraph(escape(item.label), styles["BodyText"]),
+                                Paragraph(escape(item.value), styles["BodyText"]),
+                            ]
+                            for item in estate.seller_details
+                        ],
+                    ],
+                    [55 * mm, 175 * mm],
+                ),
+                Spacer(1, 4 * mm),
+            ]
+        )
+    story.extend(
+        [
+            _table(
             [
                 ["SKUs", "Renewal quantity", "Expired", "Attention required"],
                 [
@@ -214,9 +262,10 @@ def render_estate_pdf(
                 ],
             ],
             [30 * mm, 45 * mm, 30 * mm, 45 * mm],
-        ),
-        Spacer(1, 5 * mm),
-    ]
+            ),
+            Spacer(1, 5 * mm),
+        ]
+    )
 
     for family in sorted(grouped):
         story.append(Paragraph(escape(family), styles["Heading2"]))
@@ -509,8 +558,22 @@ def render_proposal_pdf(
             styles["Normal"],
         ),
         Spacer(1, 5 * mm),
-        Paragraph("Proposed licence configuration", styles["Heading2"]),
     ]
+    if estate.seller_details:
+        story.extend(
+            [
+                Paragraph("Proposal details", styles["Heading2"]),
+                _table(
+                    [
+                        ["Detail", "Value"],
+                        *[[item.label, item.value] for item in estate.seller_details],
+                    ],
+                    [55 * mm, 175 * mm],
+                ),
+                Spacer(1, 4 * mm),
+            ]
+        )
+    story.append(Paragraph("Proposed licence configuration", styles["Heading2"]))
 
     detail: list[list[object]] = [[
         "Line",
@@ -630,7 +693,7 @@ def render_simple_commercial_pdf(
         leftMargin=10 * mm,
         topMargin=10 * mm,
         bottomMargin=10 * mm,
-        title="Microsoft Licensing Commercial Review",
+        title="Microsoft Licensing Renewal Proposal",
     )
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
@@ -646,16 +709,50 @@ def render_simple_commercial_pdf(
         leading=8,
     )
     story: list[object] = [
-        Paragraph("Microsoft Licensing Commercial Review", title_style),
+        Paragraph("Microsoft Licensing Renewal Proposal", title_style),
         Spacer(1, 3 * mm),
-        Paragraph(f"Pricing basis: {escape(pricing_source)}", styles["Normal"]),
         Paragraph(
-            "Pricing logic: the exact approved SKU identity and submitted term/billing are "
-            "used; applicable unit prices are multiplied by confirmed quantities.",
+            "This proposal reflects the complete requirement confirmed by the seller before "
+            "pricing. Only supplied requirement details and matched annual licence data are "
+            "included.",
             styles["Normal"],
+        ),
+        Paragraph(f"Commercial basis: {escape(pricing_source)}", styles["Normal"]),
+        Spacer(1, 5 * mm),
+        Paragraph("Executive summary", styles["Heading2"]),
+        _table(
+            [
+                ["Confirmed SKU lines", "Confirmed licence quantity", "Renew As-Is annual value"],
+                [
+                    str(len(current.lines)),
+                    f"{sum(line.proposed_quantity for line in current.lines):,}",
+                    format_money(current.total_value, currency),
+                ],
+            ],
+            [55 * mm, 65 * mm, 70 * mm],
         ),
         Spacer(1, 5 * mm),
     ]
+    if estate.seller_details:
+        story.extend(
+            [
+                Paragraph("Proposal details", styles["Heading2"]),
+                _table(
+                    [
+                        ["Detail", "Value"],
+                        *[
+                            [
+                                Paragraph(escape(item.label), styles["BodyText"]),
+                                Paragraph(escape(item.value), styles["BodyText"]),
+                            ]
+                            for item in estate.seller_details
+                        ],
+                    ],
+                    [55 * mm, 175 * mm],
+                ),
+                Spacer(1, 4 * mm),
+            ]
+        )
 
     def add_configuration(title: str, scenario: CommercialScenario) -> None:
         story.append(Paragraph(title, styles["Heading2"]))
@@ -663,7 +760,8 @@ def render_simple_commercial_pdf(
             "Line",
             "SKU",
             "Quantity",
-            "Billing term",
+            "Term / billing",
+            "Renewal / expiration",
             "Unit price",
             "Total price",
             "Price status",
@@ -679,6 +777,7 @@ def render_simple_commercial_pdf(
                 Paragraph(escape(line.sku_title), cell_style),
                 str(line.proposed_quantity),
                 f"{line.term_duration} / {line.billing_plan}",
+                _date(line.renewal_date or line.expiration_date),
                 format_money(line.unit_price, currency),
                 format_money(line.extended_price, currency),
                 Paragraph(escape(status), cell_style),
@@ -686,7 +785,7 @@ def render_simple_commercial_pdf(
         story.extend([
             _table(
                 data,
-                [16 * mm, 82 * mm, 22 * mm, 42 * mm, 32 * mm, 34 * mm, 47 * mm],
+                [13 * mm, 70 * mm, 18 * mm, 34 * mm, 30 * mm, 28 * mm, 30 * mm, 50 * mm],
                 font_size=7,
                 cell_padding=3,
             ),
@@ -700,11 +799,15 @@ def render_simple_commercial_pdf(
             story.append(Paragraph("Pricing warnings", styles["Heading3"]))
             for decision in scenario.unresolved_decisions:
                 story.append(Paragraph(f"- {escape(decision)}", styles["Normal"]))
+        if scenario.comments:
+            story.append(Paragraph("Seller-provided proposal notes", styles["Heading3"]))
+            for comment in scenario.comments:
+                story.append(Paragraph(f"- {escape(comment)}", styles["Normal"]))
 
     add_configuration("Confirmed Renew As-Is configuration", current)
     if revised is not None:
         story.extend([PageBreak()])
-        add_configuration("Recommended / revised configuration", revised)
+        add_configuration("Seller-requested revised configuration", revised)
         difference = revised.total_value - current.total_value
         story.extend([
             Spacer(1, 4 * mm),
@@ -714,7 +817,7 @@ def render_simple_commercial_pdf(
                     ["Configuration", "Value"],
                     ["Confirmed Renew As-Is", format_money(current.total_value, currency)],
                     [
-                        revised.scenario_type.label,
+                        "Seller-requested revised",
                         format_money(revised.total_value, currency),
                     ],
                     ["Difference", _signed_money(difference, currency)],
@@ -726,14 +829,6 @@ def render_simple_commercial_pdf(
         ])
         for change in _simple_configuration_changes(current, revised):
             story.append(Paragraph(f"- {escape(change)}", styles["Normal"]))
-        story.extend([
-            Spacer(1, 3 * mm),
-            Paragraph(
-                "Promotion eligibility and best-price rules are not applied until the "
-                "business rule sheet is approved and integrated.",
-                styles["Normal"],
-            ),
-        ])
 
     document.build(story)
     return output.getvalue()
@@ -833,7 +928,7 @@ def render_comparison_pdf(
         leftMargin=12 * mm,
         topMargin=12 * mm,
         bottomMargin=12 * mm,
-        title="SP/SSP Licensing Commercial Comparison",
+        title="Microsoft Licensing Annual Options Comparison",
     )
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
@@ -851,15 +946,42 @@ def render_comparison_pdf(
         spaceBefore=0,
     )
     story = [
-        Paragraph("SP/SSP Licensing Commercial Recommendation", title_style),
+        Paragraph("Microsoft Licensing Annual Options Comparison", title_style),
         Spacer(1, 5 * mm),
         Paragraph(
-            f"Recommended option: <b>{comparison.recommended_scenario.label}</b>",
+            f"Commercial observation: <b>{comparison.recommended_scenario.label}</b>",
             styles["Heading2"],
         ),
         Paragraph(escape(comparison.recommendation_rationale), styles["Normal"]),
+        Paragraph(
+            "This is a commercial comparison of seller-requested annual configurations. "
+            "It is not a feature-fit, entitlement, migration, or bundling recommendation "
+            "unless separately supported by official Microsoft documentation and confirmed "
+            "by the seller.",
+            styles["Normal"],
+        ),
         Spacer(1, 5 * mm),
     ]
+    if estate.seller_details:
+        story.extend(
+            [
+                Paragraph("Proposal details", styles["Heading2"]),
+                _table(
+                    [
+                        ["Detail", "Value"],
+                        *[
+                            [
+                                Paragraph(escape(item.label), styles["BodyText"]),
+                                Paragraph(escape(item.value), styles["BodyText"]),
+                            ]
+                            for item in estate.seller_details
+                        ],
+                    ],
+                    [55 * mm, 175 * mm],
+                ),
+                Spacer(1, 4 * mm),
+            ]
+        )
 
     estate_data = [["SKU", "Product", "Total", "Expired", "Renew", "Renewal/Expiry"]]
     for line in estate.lines:
@@ -1014,9 +1136,13 @@ def render_comparison_pdf(
                 story.append(Paragraph(f"• {escape(decision)}", styles["Normal"]))
         else:
             story.append(Paragraph("None", styles["Normal"]))
-        if scenario.comments or scenario.assumptions:
-            story.append(Paragraph("Comments and assumptions", styles["Heading3"]))
-            for comment in [*scenario.comments, *scenario.assumptions]:
+        visible_notes = [
+            *scenario.comments,
+            *(scenario.assumptions if include_internal_commercial_fields else []),
+        ]
+        if visible_notes:
+            story.append(Paragraph("Proposal notes", styles["Heading3"]))
+            for comment in visible_notes:
                 story.append(Paragraph(f"• {comment}", styles["Normal"]))
 
     document.build(story)

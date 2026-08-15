@@ -10,12 +10,14 @@ from .analysis import LicenseAnalyzer
 from .models import (
     CommercialComparison,
     CommercialScenario,
+    EstateStatus,
     LicenseEstate,
     MigrationDisposition,
     NormalizedLicenseLine,
     PendingSkuChange,
     ParsedLicenseRow,
     ScenarioType,
+    SellerProvidedDetail,
     SkuChangeResult,
     WorkflowSession,
     WorkflowStage,
@@ -112,12 +114,14 @@ class LicensingOrchestrator:
         sender: str,
         source_file: str,
         rows: list[ParsedLicenseRow],
+        seller_details: list[SellerProvidedDetail] | None = None,
     ) -> LicenseEstate:
         thread_id = self.thread_id(sender)
         estate = await self._analyzer.analyze_parsed(
             thread_id=thread_id,
             source_file=source_file,
             parsed=rows,
+            seller_details=seller_details,
         )
 
         def update(session: WorkflowSession) -> WorkflowSession:
@@ -139,6 +143,208 @@ class LicensingOrchestrator:
 
         await self._mutate(sender, update)
         return estate
+
+    async def append_document(
+        self,
+        *,
+        sender: str,
+        filename: str,
+        content: bytes,
+    ) -> LicenseEstate:
+        """Add document lines to the unconfirmed requirement draft."""
+
+        incoming = await self._analyzer.analyze(
+            thread_id=self.thread_id(sender),
+            filename=filename,
+            content=content,
+        )
+        return await self._append_estate(sender, incoming)
+
+    async def append_extracted(
+        self,
+        *,
+        sender: str,
+        source_file: str,
+        rows: list[ParsedLicenseRow],
+        seller_details: list[SellerProvidedDetail] | None = None,
+    ) -> LicenseEstate:
+        """Add multimodal/text-extracted lines to the unconfirmed draft."""
+
+        incoming = await self._analyzer.analyze_parsed(
+            thread_id=self.thread_id(sender),
+            source_file=source_file,
+            parsed=rows,
+            seller_details=seller_details,
+        )
+        return await self._append_estate(sender, incoming)
+
+    async def _append_estate(
+        self,
+        sender: str,
+        incoming: LicenseEstate,
+    ) -> LicenseEstate:
+        result: LicenseEstate | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            current = self._editable_requirement(session)
+            if session.confirmed_as_is is not None:
+                raise ScenarioError(
+                    "The full requirement is already confirmed. Should this licence be "
+                    "added to the revised configuration instead?"
+                )
+
+            lines = list(current.lines)
+            numeric_ids = [
+                int(line.line_id[1:])
+                for line in lines
+                if line.line_id.startswith("L") and line.line_id[1:].isdigit()
+            ]
+            next_id = max(numeric_ids, default=0) + 1
+            for incoming_line in incoming.lines:
+                merge_index = next(
+                    (
+                        index
+                        for index, existing in enumerate(lines)
+                        if existing.match_method != "unresolved"
+                        and incoming_line.match_method != "unresolved"
+                        and existing.product_id == incoming_line.product_id
+                        and existing.sku_id == incoming_line.sku_id
+                        and existing.term_duration == incoming_line.term_duration
+                        and existing.billing_plan == incoming_line.billing_plan
+                        and existing.expiration_date == incoming_line.expiration_date
+                        and existing.renewal_date == incoming_line.renewal_date
+                    ),
+                    None,
+                )
+                if merge_index is not None:
+                    existing = lines[merge_index]
+                    lines[merge_index] = existing.model_copy(
+                        update={
+                            "total_licenses": (
+                                existing.total_licenses + incoming_line.total_licenses
+                            ),
+                            "expired_licenses": (
+                                existing.expired_licenses
+                                + incoming_line.expired_licenses
+                            ),
+                            "assigned_licenses": (
+                                existing.assigned_licenses
+                                + incoming_line.assigned_licenses
+                            ),
+                            "renewal_quantity": (
+                                existing.renewal_quantity
+                                + incoming_line.renewal_quantity
+                            ),
+                        }
+                    )
+                    continue
+                lines.append(
+                    incoming_line.model_copy(
+                        update={
+                            "line_id": f"L{next_id}",
+                            "row_number": max(
+                                (line.row_number for line in lines),
+                                default=1,
+                            )
+                            + 1,
+                        }
+                    )
+                )
+                next_id += 1
+
+            details = {
+                item.label.casefold(): item for item in current.seller_details
+            }
+            for item in incoming.seller_details:
+                details[item.label.casefold()] = item
+            pending = any(line.match_method == "unresolved" for line in lines)
+            now = datetime.now(UTC)
+            result = current.model_copy(
+                update={
+                    "status": (
+                        EstateStatus.AWAITING_MATCH_CONFIRMATION
+                        if pending
+                        else EstateStatus.READY
+                    ),
+                    "lines": lines,
+                    "rate_card_version": incoming.rate_card_version,
+                    "seller_details": list(details.values())[:12],
+                    "updated_at": now,
+                }
+            )
+            return session.model_copy(
+                update={
+                    "estate": result,
+                    "scenarios": {},
+                    "active_scenario": None,
+                    "confirmed_as_is": None,
+                    "pending_sku_change": None,
+                    "stage": (
+                        WorkflowStage.AWAITING_MATCH_CONFIRMATION
+                        if pending
+                        else WorkflowStage.AWAITING_SCENARIO
+                    ),
+                    "updated_at": now,
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
+
+    async def set_requirement_detail(
+        self,
+        sender: str,
+        *,
+        label: str,
+        value: str,
+    ) -> LicenseEstate:
+        """Upsert or remove seller-supplied proposal context without inferring a value."""
+
+        clean_label = " ".join(label.strip().split())
+        clean_value = " ".join(value.strip().split())
+        if not clean_label:
+            raise ScenarioError("Which proposal detail would you like to add or change?")
+        result: LicenseEstate | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            if session.estate is None:
+                raise ScenarioError("Provide a licensing requirement before adding details.")
+            if session.stage == WorkflowStage.FINALIZED:
+                raise ScenarioError(
+                    "This proposal is finalized. Start a fresh requirement before changing it."
+                )
+            details = [
+                item
+                for item in session.estate.seller_details
+                if item.label.casefold() != clean_label.casefold()
+            ]
+            if clean_value:
+                details.append(SellerProvidedDetail(label=clean_label, value=clean_value))
+            result = session.estate.model_copy(
+                update={
+                    "seller_details": details,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            next_stage = (
+                WorkflowStage.REVIEWING_SCENARIO
+                if session.stage == WorkflowStage.AWAITING_FINAL_VALIDATION
+                else session.stage
+            )
+            return session.model_copy(
+                update={
+                    "estate": result,
+                    "stage": next_stage,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
 
     async def confirm_matches(
         self,
@@ -225,6 +431,31 @@ class LicensingOrchestrator:
 
         await self._mutate(sender, update)
         return scenario
+
+    async def reopen_requirement_validation(self, sender: str) -> LicenseEstate:
+        """Return an unpriceable requirement to the seller-review gate."""
+
+        result: LicenseEstate | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            if session.estate is None:
+                raise ScenarioError("Provide a licensing requirement before reviewing it.")
+            result = session.estate
+            return session.model_copy(
+                update={
+                    "scenarios": {},
+                    "active_scenario": None,
+                    "confirmed_as_is": None,
+                    "pending_sku_change": None,
+                    "stage": WorkflowStage.AWAITING_INITIAL_VALIDATION,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
 
     async def build_scenario(
         self,
@@ -773,7 +1004,10 @@ class LicensingOrchestrator:
         catalog = await self._rate_cards.get()
         candidates = catalog.candidates(cleaned_query, limit=3)
         if not candidates:
-            raise ScenarioError(f"No rate-card SKU matched {cleaned_query!r}.")
+            raise ScenarioError(
+                f"I could not identify an applicable SKU for {cleaned_query!r}. "
+                "What is the complete Microsoft product and plan name?"
+            )
         result: SkuChangeResult | None = None
 
         def update(session: WorkflowSession) -> WorkflowSession:
@@ -921,7 +1155,10 @@ class LicensingOrchestrator:
         catalog = await self._rate_cards.get()
         candidates = catalog.candidates(cleaned_query, limit=3)
         if not candidates:
-            raise ScenarioError(f"No rate-card SKU matched {cleaned_query!r}.")
+            raise ScenarioError(
+                f"I could not identify an applicable SKU for {cleaned_query!r}. "
+                "What is the complete Microsoft product and plan name?"
+            )
         result: SkuChangeResult | None = None
 
         def update(session: WorkflowSession) -> WorkflowSession:
@@ -975,6 +1212,88 @@ class LicensingOrchestrator:
                 source_line_id=source_line_id,
                 product_query=cleaned_query,
                 quantity=quantity,
+                candidates=candidates,
+            )
+            result = SkuChangeResult(
+                state="confirmation_required",
+                confirmation=pending,
+            )
+            return session.model_copy(
+                update={
+                    "pending_sku_change": pending,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
+
+    async def recommend_higher_tier(
+        self,
+        sender: str,
+        *,
+        line_id: str | None = None,
+        quantity: int | None = None,
+    ) -> SkuChangeResult:
+        """Offer same-family higher tiers without applying a migration assumption."""
+
+        catalog = await self._rate_cards.get()
+        result: SkuChangeResult | None = None
+        normalized_line_id = line_id.strip().upper() if line_id else None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            if session.confirmed_as_is is None:
+                raise ScenarioError(
+                    "Confirm the current requirement and Renew As-Is cost before requesting "
+                    "an alternative."
+                )
+            if session.active_scenario is None:
+                raise ScenarioError("Which proposal should I use for the recommendation?")
+            current = session.scenarios.get(session.active_scenario)
+            if current is None:
+                raise ScenarioError("The selected proposal is no longer available.")
+            eligible_lines = [
+                line
+                for line in current.lines
+                if line.proposed_quantity > 0 and line.source_line_id is not None
+            ]
+            if normalized_line_id:
+                source = next(
+                    (line for line in eligible_lines if line.line_id == normalized_line_id),
+                    None,
+                )
+                if source is None:
+                    raise ScenarioError(
+                        f"Which existing line should I evaluate? {normalized_line_id} was not found."
+                    )
+            elif len(eligible_lines) == 1:
+                source = eligible_lines[0]
+            else:
+                choices = ", ".join(
+                    f"{line.line_id} ({line.sku_title})" for line in eligible_lines[:8]
+                )
+                raise ScenarioError(
+                    "Which existing line should I evaluate? " + choices
+                )
+            candidates = catalog.higher_tier_candidates(source.sku_title, limit=3)
+            if not candidates:
+                raise ScenarioError(
+                    f"I found no clearly higher-tier SKU in the same product family as "
+                    f"{source.sku_title}. What capability or target product should I evaluate?"
+                )
+            target_quantity = quantity if quantity is not None else source.proposed_quantity
+            if target_quantity <= 0:
+                raise ScenarioError("How many users should the recommendation cover?")
+            pending = PendingSkuChange(
+                id=uuid4().hex,
+                action="replace",
+                scenario_type=session.active_scenario,
+                scenario_revision=current.revision,
+                source_line_id=source.line_id,
+                product_query=f"higher-tier option for {source.sku_title}",
+                quantity=target_quantity,
                 candidates=candidates,
             )
             result = SkuChangeResult(

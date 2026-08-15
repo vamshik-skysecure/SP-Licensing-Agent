@@ -47,6 +47,9 @@ def _intent(action: str, **updates: object) -> AgentIntent:
         "candidate_number": -1,
         "match_selections": [],
         "comment": "",
+        "detail_label": "",
+        "detail_value": "",
+        "response_text": "",
         "clarification": "",
     }
     values.update(updates)
@@ -170,6 +173,47 @@ class V5PricebookTests(unittest.TestCase):
         self.assertEqual(candidates[0].sku_title, "Access LTSC 2024")
         self.assertEqual(candidates[0].confidence, 100)
 
+    def test_ambiguous_e5_never_offers_an_unrelated_dynamics_sku(self) -> None:
+        catalog = RateCardCatalog(self.items, "v5")
+
+        candidates = catalog.candidates("E5 license", limit=3)
+
+        self.assertEqual(
+            [candidate.sku_title for candidate in candidates],
+            [
+                "Microsoft 365 E5 without Audio Conferencing",
+                "Office 365 E5 without Audio Conferencing",
+                "Enterprise Mobility + Security E5",
+            ],
+        )
+        self.assertTrue(all(candidate.confidence < 100 for candidate in candidates))
+        self.assertFalse(
+            any("Dynamics 365" in candidate.sku_title for candidate in candidates)
+        )
+
+    def test_family_aliases_and_defender_plan_wording_resolve_safely(self) -> None:
+        catalog = RateCardCatalog(self.items, "v5")
+
+        self.assertEqual(
+            [candidate.sku_title for candidate in catalog.candidates("M365 E3")],
+            ["Microsoft 365 E3"],
+        )
+        self.assertEqual(
+            [candidate.sku_title for candidate in catalog.candidates("EMS E5")],
+            ["Enterprise Mobility + Security E5"],
+        )
+        defender = catalog.candidates(
+            "Microsoft Defender for Office 365 Plan Two",
+            limit=3,
+        )
+        self.assertEqual(
+            [candidate.sku_title for candidate in defender],
+            ["Microsoft Defender for Office 365 (Plan 2)"],
+        )
+        self.assertFalse(
+            any(candidate.sku_title.startswith("Office 365 E") for candidate in defender)
+        )
+
 
 class RenewalOnlyWhatsAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_upload_table_natural_discount_and_final_pdf(self) -> None:
@@ -225,27 +269,17 @@ class RenewalOnlyWhatsAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Licence estate table", client.images[0]["caption"])
         self.assertIn("Renew As-Is", client.images[1]["caption"])
         self.assertEqual(client.documents[0]["filename"], "customer-licence-estate.pdf")
-        validation_ids = [
-            button.reply.id
-            for message in client.messages
-            if getattr(message, "type", None) == "interactive"
-            and getattr(getattr(message, "interactive", None), "type", None) == "button"
-            for button in message.interactive.action.buttons
-        ]
-        self.assertIn("licensing|validate_initial|confirm", validation_ids)
-        self.assertIn("licensing|validate_initial|reject", validation_ids)
         validation_bodies = [
-            message.interactive.body.text
+            message.text.body
             for message in client.messages
-            if getattr(message, "type", None) == "interactive"
-            and getattr(getattr(message, "interactive", None), "type", None) == "button"
-            and any(
-                button.reply.id == "licensing|validate_initial|confirm"
-                for button in message.interactive.action.buttons
-            )
+            if getattr(message, "type", None) == "text"
+            and getattr(message, "text", None) is not None
         ]
         self.assertTrue(
             any("attest" in body and "promotional pricing" in body for body in validation_bodies)
+        )
+        self.assertFalse(
+            any(getattr(message, "type", None) == "interactive" for message in client.messages)
         )
 
         session = await orchestrator.get_session("911234567890")
@@ -290,15 +324,15 @@ class RenewalOnlyWhatsAppTests(unittest.IsolatedAsyncioTestCase):
         session = await orchestrator.get_session("911234567890")
         assert session is not None
         self.assertEqual(session.stage, WorkflowStage.AWAITING_FINAL_VALIDATION)
-        final_validation_ids = [
-            button.reply.id
+        final_prompts = [
+            message.text.body
             for message in client.messages
-            if getattr(message, "type", None) == "interactive"
-            and getattr(getattr(message, "interactive", None), "type", None) == "button"
-            for button in message.interactive.action.buttons
+            if getattr(message, "type", None) == "text"
+            and getattr(message, "text", None) is not None
         ]
-        self.assertIn("licensing|validate_final|confirm", final_validation_ids)
-        self.assertIn("licensing|validate_final|reject", final_validation_ids)
+        self.assertTrue(
+            any("Final seller validation required" in body for body in final_prompts)
+        )
 
         await service._handle_text("911234567890", "/cancel-finalize")
         session = await orchestrator.get_session("911234567890")

@@ -58,6 +58,7 @@ class Settings(BaseSettings):
 
     ai_intent_backend: Literal["disabled", "openai"] = "disabled"
     requirement_capture_backend: Literal["disabled", "openai"] = "disabled"
+    official_recommendation_backend: Literal["disabled", "openai_web"] = "disabled"
     openai_api_key: str = ""
     openai_model: str = "gpt-5.6-luna"
     openai_transcription_model: str = "gpt-transcribe"
@@ -103,6 +104,7 @@ class Settings(BaseSettings):
             self.message_dispatch_backend = "direct"
             self.ai_intent_backend = "openai"
             self.requirement_capture_backend = "openai"
+            self.official_recommendation_backend = "openai_web"
             self.openai_validate_models_on_startup = False
             self.whatsapp_validate_credentials_on_startup = True
         elif self.runtime_profile == "production":
@@ -111,6 +113,7 @@ class Settings(BaseSettings):
             self.message_dispatch_backend = "azure_blob"
             self.ai_intent_backend = "openai"
             self.requirement_capture_backend = "openai"
+            self.official_recommendation_backend = "openai_web"
             self.openai_validate_models_on_startup = True
             self.whatsapp_validate_credentials_on_startup = True
 
@@ -150,6 +153,13 @@ class Settings(BaseSettings):
             raise ValueError("OpenAI intent routing requires OPENAI_API_KEY.")
         if self.requirement_capture_backend == "openai" and not self.openai_api_key:
             raise ValueError("OpenAI multimodal requirement capture requires OPENAI_API_KEY.")
+        if (
+            self.official_recommendation_backend == "openai_web"
+            and not self.openai_api_key
+        ):
+            raise ValueError(
+                "Official Microsoft recommendation research requires OPENAI_API_KEY."
+            )
         if self.runtime_profile == "local_demo":
             missing_demo_settings = [
                 name
