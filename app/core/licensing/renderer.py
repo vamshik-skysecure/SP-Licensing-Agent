@@ -75,7 +75,7 @@ def format_pending_matches(estate: LicenseEstate) -> str:
             )
         )
         for index, candidate in enumerate(pending.candidates, start=1):
-            lines.append(f"{index}. {candidate.sku_title}")
+            lines.append(f"{index}. {format_sku_candidate(candidate)}")
     if any(line.candidates for line in estate.pending_lines):
         lines.extend(
             (
@@ -86,6 +86,14 @@ def format_pending_matches(estate: LicenseEstate) -> str:
             )
         )
     return "\n".join(lines)
+
+
+def format_sku_candidate(candidate: object) -> str:
+    """Display the exact title plus the seller-useful Microsoft Product ID."""
+
+    title = str(getattr(candidate, "sku_title", "")).strip()
+    product_id = str(getattr(candidate, "product_id", "")).strip()
+    return f"{title} · Product ID: {product_id}" if product_id else title
 
 
 def sku_clarification_question(source_title: str, candidates: list[object]) -> str:

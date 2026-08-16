@@ -30,6 +30,7 @@ from app.core.licensing.models import (
 from app.core.licensing.orchestrator import LicensingOrchestrator
 from app.core.licensing.rate_card import LocalRateCardSource, RateCardProvider
 from app.core.licensing.renderer import (
+    format_pending_matches,
     render_proposal_pdf,
     render_simple_commercial_pdf,
 )
@@ -925,6 +926,95 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_capture_stage_sku_choice_applies_and_displays_product_id(self) -> None:
+        sender = "capture-sku-choice-seller"
+        await self.orchestrator.analyze_extracted(
+            sender=sender,
+            source_file="seller-message",
+            rows=[
+                ParsedLicenseRow(
+                    row_number=2,
+                    product_title="Office 365 E1",
+                    total_licenses=45,
+                    expired_licenses=0,
+                    assigned_licenses=0,
+                    renewal_quantity=45,
+                    term_duration="P1Y",
+                    billing_plan="Annual",
+                )
+            ],
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        pending_result = await self.orchestrator.add_requirement_sku(
+            sender,
+            "Copilot",
+            30,
+        )
+        assert pending_result.confirmation is not None
+        selected = pending_result.confirmation.candidates[1]
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._send_sku_change_result(sender, pending_result)
+        option_text = client.messages[-2].text.body  # type: ignore[attr-defined]
+        option_list = client.messages[-1].interactive  # type: ignore[attr-defined]
+        self.assertIn(f"Product ID: {selected.product_id}", option_text)
+        self.assertIn(
+            f"Product ID {selected.product_id}",
+            option_list.action.sections[0].rows[1].description,
+        )
+
+        await service._handle_interactive(
+            sender,
+            f"licensing|sku_confirm|{pending_result.confirmation.id}|2",
+        )
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.estate is not None
+        self.assertEqual(session.stage, WorkflowStage.AWAITING_INITIAL_VALIDATION)
+        self.assertIsNone(session.pending_sku_change)
+        self.assertIn(
+            (selected.sku_title, 30),
+            [
+                (line.display_title, line.renewal_quantity)
+                for line in session.estate.lines
+            ],
+        )
+
+    async def test_initial_match_and_premium_candidates_are_seller_safe(self) -> None:
+        catalog = await self.provider.get()
+        premium = catalog.candidates("Power BI Premium", limit=3)
+        self.assertTrue(premium)
+        self.assertTrue(all("Premium" in item.sku_title for item in premium))
+        self.assertNotIn("Power BI Pro", [item.sku_title for item in premium])
+
+        estate = await self.orchestrator.analyze_extracted(
+            sender="identifier-match-seller",
+            source_file="seller-message",
+            rows=[
+                ParsedLicenseRow(
+                    row_number=2,
+                    product_title="E3",
+                    total_licenses=15,
+                    expired_licenses=0,
+                    assigned_licenses=0,
+                    renewal_quantity=15,
+                )
+            ],
+        )
+        rendered = format_pending_matches(estate)
+        for candidate in estate.pending_lines[0].candidates:
+            self.assertIn(f"Product ID: {candidate.product_id}", rendered)
+
     async def test_greeting_exposes_saved_draft_and_prevents_silent_quantity_merge(
         self,
     ) -> None:
@@ -1547,6 +1637,167 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("no feature, entitlement, migration", comparison_message)
 
+    async def test_edit_after_four_way_comparison_requires_and_honors_scenario_target(
+        self,
+    ) -> None:
+        sender = "scenario-target-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        renew = await self.orchestrator.build_scenario(
+            sender,
+            ScenarioType.RENEW_AS_IS,
+            promo_eligible=False,
+        )
+        await self.orchestrator.save_confirmed_as_is(sender, renew)
+        await self.orchestrator.comparison(sender)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+        intent = SimpleNamespace(
+            action="set_disposition",
+            scenario="none",
+            line_id="L2",
+            disposition="remove",
+        )
+
+        await service._execute_agent_intent(
+            sender,
+            intent,  # type: ignore[arg-type]
+            original_message="Delete the Power BI licence within that",
+        )
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNotNone(session.pending_dialogue)
+        self.assertIn("Which proposal should I update", client.messages[-1].text.body)  # type: ignore[attr-defined]
+        self.assertEqual(
+            session.scenarios[ScenarioType.RENEW_AS_IS].revision,
+            renew.revision,
+        )
+
+        targeted_intent = SimpleNamespace(
+            action="set_disposition",
+            scenario="me5_copilot",
+            line_id="L2",
+            disposition="remove",
+        )
+        await self.orchestrator.clear_pending_dialogue(sender)
+        await service._execute_agent_intent(
+            sender,
+            targeted_intent,  # type: ignore[arg-type]
+            original_message="Remove L2 from ME5",
+        )
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertEqual(session.active_scenario, ScenarioType.ME5_COPILOT)
+        self.assertGreater(session.scenarios[ScenarioType.ME5_COPILOT].revision, 1)
+        self.assertEqual(
+            session.scenarios[ScenarioType.RENEW_AS_IS].revision,
+            renew.revision,
+        )
+
+    async def test_combined_replacement_cancel_does_not_emit_zero_difference_comparison(
+        self,
+    ) -> None:
+        sender = "cancel-and-compare-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        renew = await self.orchestrator.build_scenario(
+            sender,
+            ScenarioType.RENEW_AS_IS,
+            promo_eligible=False,
+        )
+        await self.orchestrator.save_confirmed_as_is(sender, renew)
+        pending = await self.orchestrator.replace_sku(sender, "L1", "E5", 10)
+        self.assertEqual(pending.state, "confirmation_required")
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._handle_text(
+            sender,
+            "Wait, let's not replace it; compare with another proposal",
+        )
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNone(session.pending_sku_change)
+        self.assertIsNotNone(session.pending_dialogue)
+        self.assertIn("Which options should I compare", client.messages[-1].text.body)  # type: ignore[attr-defined]
+        self.assertFalse(client.documents)
+
+    async def test_recommendation_line_question_is_persisted_for_short_reply(self) -> None:
+        sender = "recommendation-context-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        renew = await self.orchestrator.build_scenario(
+            sender,
+            ScenarioType.RENEW_AS_IS,
+            promo_eligible=False,
+        )
+        await self.orchestrator.save_confirmed_as_is(sender, renew)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._execute_agent_intent(
+            sender,
+            SimpleNamespace(
+                action="request_recommendation",
+                line_id="",
+                quantity=-1,
+            ),  # type: ignore[arg-type]
+            original_message="Can I upgrade to ME5 or ME7?",
+        )
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.pending_dialogue is not None
+        self.assertEqual(
+            session.pending_dialogue.context_message,
+            "Can I upgrade to ME5 or ME7?",
+        )
+        self.assertIn("Which current line should I evaluate", client.messages[-1].text.body)  # type: ignore[attr-defined]
+
     async def test_out_of_scope_request_receives_a_professional_boundary(self) -> None:
         client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
         service = WhatsAppWebhookService(
@@ -1602,6 +1853,108 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         restricted = client.messages[-1].text.body  # type: ignore[attr-defined]
         self.assertIn("not applied", restricted)
         self.assertIn("remains unchanged", restricted)
+
+        await service._handle_text(
+            "question-seller",
+            "Can you add a discount or any adjustments?",
+        )
+        commercial_control = client.messages[-1].text.body  # type: ignore[attr-defined]
+        self.assertIn("not seller-editable", commercial_control)
+        self.assertIn("remains unchanged", commercial_control)
+        self.assertNotIn("What discount percentage", commercial_control)
+
+        await service._execute_agent_intent(  # type: ignore[arg-type]
+            "language-seller",
+            SimpleNamespace(
+                action="clarify",
+                clarification="Which proposal should I review? கர்",
+            ),
+        )
+        sanitized = client.messages[-1].text.body  # type: ignore[attr-defined]
+        self.assertEqual(sanitized, "Which proposal should I review?")
+
+    async def test_final_validation_labels_an_edited_baseline_as_revised(self) -> None:
+        sender = "revised-final-label-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        baseline = await self.orchestrator.build_scenario(
+            sender,
+            ScenarioType.RENEW_AS_IS,
+            promo_eligible=False,
+        )
+        await self.orchestrator.save_confirmed_as_is(sender, baseline)
+        changed = await self.orchestrator.edit_quantity(sender, "L1", 50)
+        self.assertGreater(changed.revision, baseline.revision)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._request_finalization(sender)
+
+        prompt = client.messages[-1].text.body  # type: ignore[attr-defined]
+        self.assertIn("Proposal: Revised annual configuration", prompt)
+        self.assertNotIn("Proposal: Renew As-Is\n", prompt)
+
+        await service._confirm_finalization_and_send(sender)
+        finalized_message = next(
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+            and "Finalized proposal:" in message.text.body  # type: ignore[attr-defined]
+        )
+        self.assertIn("Finalized proposal: Revised annual configuration", finalized_message)
+
+    async def test_finalization_does_not_relabel_unchanged_renew_as_is(self) -> None:
+        sender = "unchanged-final-label-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        baseline = await self.orchestrator.build_scenario(
+            sender,
+            ScenarioType.RENEW_AS_IS,
+            promo_eligible=False,
+        )
+        await self.orchestrator.save_confirmed_as_is(sender, baseline)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._request_finalization(sender)
+        self.assertIn("Proposal: Renew As-Is", client.messages[-1].text.body)  # type: ignore[attr-defined]
+        await service._confirm_finalization_and_send(sender)
+        finalized_message = next(
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+            and "Finalized proposal:" in message.text.body  # type: ignore[attr-defined]
+        )
+        self.assertIn("Finalized proposal: Renew As-Is", finalized_message)
+        self.assertNotIn("Revised annual configuration", finalized_message)
 
     async def test_four_option_comparison_preserves_each_saved_proposal_revision(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Literal
@@ -43,6 +44,7 @@ from app.core.licensing.renderer import (
     format_money,
     format_pending_matches,
     format_scenario,
+    format_sku_candidate,
     render_comparison_pdf,
     render_estate_pdf,
     render_proposal_pdf,
@@ -143,6 +145,31 @@ CANCEL_REPLIES = {
     "remove it",
     "remove that",
 }
+
+SCENARIO_EDIT_ACTIONS = {
+    "set_quantity",
+    "set_copilot",
+    "set_disposition",
+    "add_sku",
+    "replace_sku",
+    "set_term",
+    "set_billing",
+    "set_segment",
+    "add_comment",
+}
+
+SIMPLE_PRICING_RESTRICTED_TERMS = (
+    "promo",
+    "promotion",
+    "discount",
+    "adjustment",
+    "adjust ",
+    "margin",
+    "partner best",
+    "partner-best",
+    "best offer",
+    "best price",
+)
 
 
 SCENARIO_ALIASES = {
@@ -583,6 +610,88 @@ class WhatsAppWebhookService:
         return all(value in compact for value in ("me3", "me5", "me7"))
 
     @staticmethod
+    def _requests_pending_change_cancel(reply: str) -> bool:
+        return reply in CANCEL_REPLIES or any(
+            phrase in reply
+            for phrase in (
+                "cancel the change",
+                "cancel that change",
+                "do not replace",
+                "don't replace",
+                "dont replace",
+                "not replace",
+                "leave it unchanged",
+                "keep it unchanged",
+            )
+        )
+
+    @staticmethod
+    def _professional_agent_text(value: str) -> str:
+        """Keep model-authored seller copy in professional English."""
+
+        cleaned: list[str] = []
+        for character in unicodedata.normalize("NFC", value):
+            if ord(character) > 127:
+                name = unicodedata.name(character, "")
+                category = unicodedata.category(character)
+                if category.startswith("L") and "LATIN" not in name:
+                    continue
+                if category.startswith("M") and "COMBINING" not in name:
+                    continue
+            cleaned.append(character)
+        return " ".join("".join(cleaned).split())
+
+    @staticmethod
+    def _scenario_from_request(intent: AgentIntent, message: str | None) -> ScenarioType | None:
+        stated = getattr(intent, "scenario", "none")
+        if stated != "none":
+            return ScenarioType(stated)
+        normalized = " ".join((message or "").casefold().replace("-", " ").split())
+        matches: list[ScenarioType] = []
+        if re.search(r"\bme3\b", normalized):
+            matches.append(ScenarioType.ME3_COPILOT)
+        if re.search(r"\bme5\b", normalized):
+            matches.append(ScenarioType.ME5_COPILOT)
+        if re.search(r"\bme7\b", normalized):
+            matches.append(ScenarioType.ME7)
+        if "renew as is" in normalized or "renewal as is" in normalized:
+            matches.append(ScenarioType.RENEW_AS_IS)
+        return matches[0] if len(set(matches)) == 1 else None
+
+    async def _select_or_request_scenario_target(
+        self,
+        sender: str,
+        intent: AgentIntent,
+        original_message: str | None,
+    ) -> bool:
+        """Select an explicit option or pause an ambiguous edit after a four-way review."""
+
+        if (
+            self._configuration.workflow_mode != "simple_pricing"
+            or intent.action not in SCENARIO_EDIT_ACTIONS
+        ):
+            return False
+        session = await self._orchestrator.get_session(sender)
+        if session is None or len(session.scenarios) <= 1:
+            return False
+        target = self._scenario_from_request(intent, original_message)
+        if target is not None:
+            await self._orchestrator.build_scenario(sender, target)
+            return False
+        available = ", ".join(item.label for item in ScenarioType if item in session.scenarios)
+        question = f"Which proposal should I update: {available}?"
+        await self._orchestrator.set_pending_dialogue(
+            sender,
+            PendingDialogue(
+                kind="agent_clarification",
+                question=question,
+                context_message=(original_message or "")[:2000],
+            ),
+        )
+        await self._send_text(sender, question)
+        return True
+
+    @staticmethod
     def _looks_like_requirement_fragment(message: str) -> bool:
         """Conservative fallback when the intent model asks instead of starting capture."""
 
@@ -864,12 +973,28 @@ class WhatsAppWebhookService:
         if pending is None:
             return False
         reply = " ".join(message.casefold().strip(" ?!.,").split())
-        if reply in CANCEL_REPLIES:
+        if self._requests_pending_change_cancel(reply):
             await self._orchestrator.cancel_sku_change(sender)
             await self._send_text(
                 sender,
                 "Okay — I cancelled that product change. The proposal remains unchanged.",
             )
+            if self._requests_enterprise_comparison(reply):
+                await self._send_enterprise_comparison(sender)
+            elif "compare" in reply or "comparison" in reply:
+                question = (
+                    "Which options should I compare with Renew As-Is: ME3, ME5, ME7, "
+                    "or all three?"
+                )
+                await self._orchestrator.set_pending_dialogue(
+                    sender,
+                    PendingDialogue(
+                        kind="agent_clarification",
+                        question=question,
+                        context_message="Compare the approved Renew As-Is proposal.",
+                    ),
+                )
+                await self._send_text(sender, question)
             return True
         if reply in UNCERTAIN_REPLIES:
             await self._send_text(
@@ -1013,13 +1138,14 @@ class WhatsAppWebhookService:
             await self._send_text(
                 sender,
                 "No problem — I can help. Based on the wording you supplied, the only "
-                f"close catalogue match is *{candidate.sku_title}*. I will not select it "
+                f"close catalogue match is *{format_sku_candidate(candidate)}*. I will not "
+                "select it "
                 f"without your approval. Shall I use it for {line.renewal_quantity:,} "
                 "licences? If not, send the product name from the invoice or a screenshot.",
             )
         else:
             options = "\n".join(
-                f"{index}. {candidate.sku_title}"
+                f"{index}. {format_sku_candidate(candidate)}"
                 for index, candidate in enumerate(line.candidates, start=1)
             )
             await self._send_text(
@@ -1042,7 +1168,9 @@ class WhatsAppWebhookService:
                 InteractiveRow(
                     id=f"licensing|match_confirm|{line.line_id}|{index}",
                     title=f"{line.line_id} · Option {index}",
-                    description=candidate.sku_title[:72],
+                    description=(
+                        f"Product ID {candidate.product_id} · {candidate.sku_title}"
+                    )[:72],
                 )
                 for index, candidate in enumerate(line.candidates, start=1)
             ]
@@ -1052,7 +1180,7 @@ class WhatsAppWebhookService:
                 sender,
                 InteractiveList(
                     body=InteractiveText(
-                        text=f"Choose one catalogue match for {line.line_id} below."
+                        text=f"Select the exact product for {line.line_id}."
                     ),
                     action=InteractiveListAction(
                         button="Choose product",
@@ -1215,6 +1343,17 @@ class WhatsAppWebhookService:
                 sender,
                 "Monthly billing is not available in this release. Every proposal uses "
                 "a one-year term with annual billing.",
+            )
+            return
+        if (
+            self._configuration.workflow_mode == "simple_pricing"
+            and any(term in lowered for term in SIMPLE_PRICING_RESTRICTED_TERMS)
+        ):
+            await self._send_text(
+                sender,
+                "That pricing request was not applied. Discounts, promotions, margins, and "
+                "manual commercial adjustments are not seller-editable in this release; the "
+                "proposal remains unchanged.",
             )
             return
         if self._requests_restricted_pricing(lowered):
@@ -1606,7 +1745,7 @@ class WhatsAppWebhookService:
             )
             return
         if intent.action == "answer_question":
-            answer = intent.response_text.strip()
+            answer = self._professional_agent_text(intent.response_text)
             await self._send_text(
                 sender,
                 answer[:1000]
@@ -1615,7 +1754,7 @@ class WhatsAppWebhookService:
             )
             return
         if intent.action == "out_of_scope":
-            response = intent.response_text.strip()
+            response = self._professional_agent_text(intent.response_text)
             await self._send_text(
                 sender,
                 response[:700]
@@ -1646,7 +1785,7 @@ class WhatsAppWebhookService:
             )
             return
         if intent.action == "clarify":
-            question = intent.clarification.strip()
+            question = self._professional_agent_text(intent.clarification)
             clarification_session = await self._orchestrator.get_session(sender)
             capture_is_open = bool(
                 clarification_session is None
@@ -1700,9 +1839,38 @@ class WhatsAppWebhookService:
                     "alternatives against that approved baseline.",
                 )
                 return
+            requested_line = intent.line_id.strip()
+            if not requested_line and session.active_scenario is not None:
+                active = session.scenarios.get(session.active_scenario)
+                eligible = (
+                    [
+                        line
+                        for line in active.lines
+                        if line.proposed_quantity > 0 and line.source_line_id is not None
+                    ]
+                    if active is not None
+                    else []
+                )
+                if len(eligible) > 1:
+                    choices = ", ".join(
+                        f"{line.line_id} ({line.sku_title})" for line in eligible[:8]
+                    )
+                    question = f"Which current line should I evaluate? {choices}"
+                    await self._orchestrator.set_pending_dialogue(
+                        sender,
+                        PendingDialogue(
+                            kind="agent_clarification",
+                            question=question,
+                            context_message=(
+                                original_message or "Recommend a suitable alternative"
+                            )[:2000],
+                        ),
+                    )
+                    await self._send_text(sender, question)
+                    return
             result = await self._orchestrator.recommend_higher_tier(
                 sender,
-                line_id=intent.line_id.strip() or None,
+                line_id=requested_line or None,
                 quantity=(intent.quantity if intent.quantity >= 0 else None),
             )
             await self._send_official_recommendation_insight(
@@ -1793,6 +1961,12 @@ class WhatsAppWebhookService:
                 )
                 await self._send_updated_requirement(sender, estate)
                 return
+        if await self._select_or_request_scenario_target(
+            sender,
+            intent,
+            original_message,
+        ):
+            return
         await self._ensure_operation_allowed(sender, agent_action=intent.action)
         if intent.action == "build_scenario":
             if intent.scenario == "none":
@@ -2044,15 +2218,6 @@ class WhatsAppWebhookService:
             )
             await self._after_requirement_match_confirmation(sender, estate)
             return
-        await self._ensure_operation_allowed(sender)
-        if action == "scenario":
-            try:
-                scenario_type = ScenarioType(value)
-            except ValueError as error:
-                raise ValueError("Unknown commercial scenario.") from error
-            scenario = await self._orchestrator.build_scenario(sender, scenario_type)
-            await self._send_scenario(sender, scenario)
-            return
         if action == "sku_confirm":
             if len(parts) != 4 or not parts[3].isdigit():
                 raise ValueError("That SKU confirmation is invalid.")
@@ -2062,6 +2227,15 @@ class WhatsAppWebhookService:
                 confirmation_id=value,
             )
             await self._send_sku_change_result(sender, result)
+            return
+        await self._ensure_operation_allowed(sender)
+        if action == "scenario":
+            try:
+                scenario_type = ScenarioType(value)
+            except ValueError as error:
+                raise ValueError("Unknown commercial scenario.") from error
+            scenario = await self._orchestrator.build_scenario(sender, scenario_type)
+            await self._send_scenario(sender, scenario)
             return
         if action == "compare":
             await self._send_comparison(sender)
@@ -2167,10 +2341,33 @@ class WhatsAppWebhookService:
             "me to finalize the Renew As-Is proposal.",
         )
 
+    async def _simple_proposal_label(self, sender: str, scenario) -> str:
+        if scenario.scenario_type != ScenarioType.RENEW_AS_IS:
+            return f"{scenario.scenario_type.label} configuration"
+        session = await self._orchestrator.get_session(sender)
+        baseline = session.confirmed_as_is if session is not None else None
+        if baseline is not None and self._scenario_configuration_changed(
+            baseline,
+            scenario,
+        ):
+            return "Revised annual configuration"
+        return "Renew As-Is"
+
+    @staticmethod
+    def _scenario_configuration_changed(baseline, scenario) -> bool:
+        excluded = {"status", "revision", "created_at", "updated_at"}
+        return baseline.model_dump(exclude=excluded) != scenario.model_dump(exclude=excluded)
+
     async def _send_simple_revised(self, sender: str, scenario) -> None:
+        proposal_label = await self._simple_proposal_label(sender, scenario)
+        pricing_title = (
+            "Revised annual cost"
+            if proposal_label == "Revised annual configuration"
+            else f"{proposal_label} annual cost"
+        )
         pricing_images = render_simple_pricing_table_images(
             scenario,
-            title="Revised annual cost",
+            title=pricing_title,
             currency=self._configuration.currency,
         )
         for index, content in enumerate(pricing_images, start=1):
@@ -2179,18 +2376,19 @@ class WhatsAppWebhookService:
                 content=content,
                 filename=f"revised-cost-{index}.png",
                 content_type="image/png",
-                caption=f"Revised configuration • Page {index}/{len(pricing_images)}",
+                caption=f"{proposal_label} • Page {index}/{len(pricing_images)}",
             )
         if scenario.status != ScenarioStatus.FINAL:
             await self._send_text(
                 sender,
-                "I recalculated the revised annual configuration. You can describe another "
+                f"I recalculated the {proposal_label}. You can describe another "
                 "change, ask me to compare it with Renew As-Is, or ask me to finalize the "
                 "proposal.",
             )
 
     async def _send_simple_commercial_pdf(self, sender: str) -> None:
         estate, current, revised = await self._orchestrator.simple_review(sender)
+        proposal_label = await self._simple_proposal_label(sender, revised)
         pdf = render_simple_commercial_pdf(
             estate,
             current,
@@ -2202,7 +2400,7 @@ class WhatsAppWebhookService:
             content=pdf,
             filename="renew-as-is-vs-selected.pdf",
             content_type="application/pdf",
-            caption="Confirmed Renew As-Is vs selected proposal",
+            caption=f"Confirmed Renew As-Is vs {proposal_label}",
         )
 
     async def _send_scenario(self, sender: str, scenario) -> None:
@@ -2299,12 +2497,14 @@ class WhatsAppWebhookService:
         ]
         rows: list[InteractiveRow] = []
         for index, candidate in enumerate(pending.candidates, start=1):
-            lines.append(f"{index}. {candidate.sku_title}")
+            lines.append(f"{index}. {format_sku_candidate(candidate)}")
             rows.append(
                 InteractiveRow(
                     id=f"licensing|sku_confirm|{pending.id}|{index}",
                     title=f"Option {index}",
-                    description=candidate.sku_title[:72],
+                    description=(
+                        f"Product ID {candidate.product_id} · {candidate.sku_title}"
+                    )[:72],
                 )
             )
         lines.extend(
@@ -2319,7 +2519,7 @@ class WhatsAppWebhookService:
             sender,
             InteractiveList(
                 body=InteractiveText(
-                    text="Choose the exact catalogue SKU below."
+                    text="Select the exact Microsoft product."
                 ),
                 action=InteractiveListAction(
                     button="Choose exact SKU",
@@ -2382,7 +2582,11 @@ class WhatsAppWebhookService:
             )
             return
         if insight.clarification_question.strip():
-            await self._send_text(sender, insight.clarification_question.strip()[:500])
+            clarification = self._professional_agent_text(
+                insight.clarification_question
+            )[:500]
+            if clarification:
+                await self._send_text(sender, clarification)
         if not insight.suggested_candidate_numbers:
             return
         selected = ", ".join(
@@ -2392,7 +2596,7 @@ class WhatsAppWebhookService:
         await self._send_text(
             sender,
             "*Microsoft-documented licensing insight*\n\n"
-            f"{insight.recommendation.strip()}\n\n"
+            f"{self._professional_agent_text(insight.recommendation)}\n\n"
             f"Catalogue option(s) supported for review: {selected}. No change has been "
             "applied. Confirm the exact SKU you want me to use, or describe another "
             "requirement you would like me to evaluate.",
@@ -2401,6 +2605,7 @@ class WhatsAppWebhookService:
     async def _send_comparison(self, sender: str) -> None:
         if self._configuration.workflow_mode == "simple_pricing":
             _estate, current, revised = await self._orchestrator.simple_review(sender)
+            revised_label = await self._simple_proposal_label(sender, revised)
             difference = revised.total_value - current.total_value
             sign = "+" if difference > 0 else ""
             await self._send_text(
@@ -2408,7 +2613,7 @@ class WhatsAppWebhookService:
                 "*Annual commercial comparison*\n\n"
                 f"Renew As-Is: {self._configuration.currency} "
                 f"{current.total_value:,.2f}\n"
-                f"Revised configuration: {self._configuration.currency} "
+                f"{revised_label}: {self._configuration.currency} "
                 f"{revised.total_value:,.2f}\n"
                 f"Difference: {sign}{self._configuration.currency} "
                 f"{difference:,.2f}\n\n"
@@ -2606,6 +2811,7 @@ class WhatsAppWebhookService:
         scenario = await self._orchestrator.request_finalization(sender)
         if self._configuration.workflow_mode == "simple_pricing":
             session = await self._orchestrator.get_session(sender)
+            proposal_label = await self._simple_proposal_label(sender, scenario)
             detail_count = (
                 len(session.estate.seller_details)
                 if session is not None and session.estate is not None
@@ -2619,7 +2825,7 @@ class WhatsAppWebhookService:
             await self._send_text(
                 sender,
                 "*Final seller validation required*\n\n"
-                f"Proposal: {scenario.scenario_type.label}\n"
+                f"Proposal: {proposal_label}\n"
                 f"Annual value: {format_money(scenario.total_value, self._configuration.currency)}\n\n"
                 f"{detail_status}\n\n"
                 "Confirm naturally that the SKU configuration, quantities, annual terms, "
@@ -2646,9 +2852,14 @@ class WhatsAppWebhookService:
 
     async def _confirm_finalization_and_send(self, sender: str) -> None:
         scenario = await self._orchestrator.confirm_finalization(sender)
+        proposal_label = (
+            await self._simple_proposal_label(sender, scenario)
+            if self._configuration.workflow_mode == "simple_pricing"
+            else scenario.scenario_type.label
+        )
         await self._send_text(
             sender,
-            "Final seller validation recorded. The proposal is now finalized.",
+            f"Final seller validation recorded. Finalized proposal: {proposal_label}.",
         )
         if self._configuration.workflow_mode == "simple_pricing":
             await self._send_simple_revised(sender, scenario)

@@ -143,7 +143,9 @@ _VARIANT_MARKERS = (
     "unattended",
     "student use benefit",
     "no teams",
+    "add on",
 )
+_REQUIRED_QUERY_QUALIFIERS = frozenset({"premium", "studio"})
 _FAMILY_MARKERS = (
     # Specific product families must precede the suite names embedded in their
     # titles (for example, Defender for Office 365 and Microsoft 365 Copilot).
@@ -299,6 +301,7 @@ class RateCardCatalog:
             return [self._candidate(self._preferred_identity(exact), 100.0)]
 
         query_tokens = set(normalized.split())
+        required_qualifiers = query_tokens & _REQUIRED_QUERY_QUALIFIERS
         tiers = _tier_tokens(normalized)
         query_family = _product_family_key(normalized)
         pool = list(self.identities)
@@ -326,6 +329,8 @@ class RateCardCatalog:
         for identity in pool:
             title = normalize_product_title(identity.sku_title)
             title_tokens = set(title.split())
+            if required_qualifiers and not required_qualifiers.issubset(title_tokens):
+                continue
             informative_query = query_tokens - _GENERIC_SKU_TOKENS
             overlap = len(informative_query & title_tokens)
             if informative_query and overlap == 0:
