@@ -56,6 +56,62 @@ class LicensingOrchestrator:
         session, _ = await self._store.get(self.thread_id(sender))
         return session
 
+    async def remember_capture_message(self, sender: str, message: str) -> list[str]:
+        """Persist bounded seller context for an incomplete typed requirement."""
+
+        cleaned = " ".join(message.strip().split())[:2000]
+        if not cleaned:
+            raise ScenarioError("Please send the missing requirement detail.")
+        result: list[str] = []
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            result = [*session.capture_messages, cleaned][-8:]
+            return session.model_copy(
+                update={
+                    "capture_messages": result,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        return result
+
+    async def reset_session(self, sender: str) -> WorkflowSession:
+        """Clear commercial state while retaining message de-duplication history."""
+
+        now = datetime.now(UTC)
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            return session.model_copy(
+                update={
+                    "stage": WorkflowStage.AWAITING_UPLOAD,
+                    "estate": None,
+                    "scenarios": {},
+                    "active_scenario": None,
+                    "confirmed_as_is": None,
+                    "pending_sku_change": None,
+                    "capture_messages": [],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+
+        return await self._mutate(sender, update)
+
+    async def clear_capture_messages(self, sender: str) -> WorkflowSession:
+        """Discard only an incomplete typed fragment, preserving the current draft."""
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            return session.model_copy(
+                update={
+                    "capture_messages": [],
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        return await self._mutate(sender, update)
+
     async def has_processed(self, sender: str, message_id: str) -> bool:
         session = await self.get_session(sender)
         return bool(session and message_id in session.processed_message_ids)
@@ -96,6 +152,7 @@ class LicensingOrchestrator:
                     "active_scenario": None,
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
+                    "capture_messages": [],
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
                         if estate.pending_lines
@@ -132,6 +189,7 @@ class LicensingOrchestrator:
                     "active_scenario": None,
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
+                    "capture_messages": [],
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
                         if estate.pending_lines
@@ -280,6 +338,7 @@ class LicensingOrchestrator:
                     "active_scenario": None,
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
+                    "capture_messages": [],
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
                         if pending
@@ -361,7 +420,11 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "estate": result,
-                    "stage": WorkflowStage.AWAITING_SCENARIO,
+                    "stage": (
+                        WorkflowStage.AWAITING_MATCH_CONFIRMATION
+                        if result.pending_lines
+                        else WorkflowStage.AWAITING_SCENARIO
+                    ),
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -906,13 +969,27 @@ class LicensingOrchestrator:
                 raise ScenarioError(f"Requirement line {normalized_id!r} was not found.")
             if not lines:
                 raise ScenarioError("A requirement must contain at least one SKU line.")
+            pending = any(line.match_method == "unresolved" for line in lines)
             result = estate.model_copy(
-                update={"lines": lines, "updated_at": datetime.now(UTC)}
+                update={
+                    "lines": lines,
+                    "status": (
+                        EstateStatus.AWAITING_MATCH_CONFIRMATION
+                        if pending
+                        else EstateStatus.READY
+                    ),
+                    "updated_at": datetime.now(UTC),
+                }
             )
             return session.model_copy(
                 update={
                     "estate": result,
                     "pending_sku_change": None,
+                    "stage": (
+                        WorkflowStage.AWAITING_MATCH_CONFIRMATION
+                        if pending
+                        else WorkflowStage.AWAITING_SCENARIO
+                    ),
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -1068,6 +1145,7 @@ class LicensingOrchestrator:
         if session.stage not in {
             WorkflowStage.AWAITING_INITIAL_VALIDATION,
             WorkflowStage.AWAITING_MATCH_CONFIRMATION,
+            WorkflowStage.AWAITING_SCENARIO,
         }:
             raise ScenarioError(
                 "Requirement capture is already confirmed. Apply changes to the revised "

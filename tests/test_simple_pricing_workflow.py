@@ -109,6 +109,49 @@ class FakeRequirementExtractor:
         return None
 
 
+class ContextAwareFragmentExtractor:
+    """Deterministic fake that proves consecutive seller turns are combined."""
+
+    def __init__(self, *, product: str = "Office 365 E1", quantity: int = 10) -> None:
+        self.product = product
+        self.quantity = quantity
+        self.inputs: list[str] = []
+
+    async def extract_text(
+        self,
+        text: str,
+        **_: object,
+    ) -> CapturedRequirement:
+        self.inputs.append(text)
+        has_quantity_turn = "Seller message 2:" in text
+        return CapturedRequirement(
+            extraction=RequirementExtraction(
+                lines=[
+                    ExtractedRequirementLine(
+                        sku_name=self.product,
+                        quantity=self.quantity if has_quantity_turn else 0,
+                        term_duration="P1Y",
+                        billing_plan="Annual",
+                        product_id="",
+                        sku_id="",
+                        expiration_date="",
+                        renewal_date="",
+                    )
+                ],
+                warnings=[],
+                needs_clarification=not has_quantity_turn,
+                clarification=(
+                    "How many licences should I include?"
+                    if not has_quantity_turn
+                    else ""
+                ),
+            )
+        )
+
+    async def close(self) -> None:
+        return None
+
+
 class FakeRecommendationAdvisor:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -533,6 +576,216 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Dynamics 365", message_text)
         self.assertNotIn("confidence", message_text.casefold())
         self.assertNotIn("ProductId", message_text)
+
+    async def test_fragmented_product_and_quantity_are_combined_without_reasking(self) -> None:
+        class CaptureInterpreter:
+            async def interpret(self, *_: object) -> object:
+                return SimpleNamespace(action="capture_requirement")
+
+        sender = "fragmented-e1-seller"
+        extractor = ContextAwareFragmentExtractor()
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=CaptureInterpreter(),  # type: ignore[arg-type]
+            requirement_extractor=extractor,  # type: ignore[arg-type]
+        )
+
+        await service._handle_text(sender, "Let's start with Office 365 E1 licence")
+        first_response = client.messages[-1].text.body  # type: ignore[attr-defined]
+        self.assertIn("I’ve noted Office 365 E1", first_response)
+        self.assertIn("How many licences", first_response)
+        self.assertNotIn("Which Microsoft product", first_response)
+
+        await service._handle_text(sender, "Maybe around 10")
+
+        self.assertEqual(len(extractor.inputs), 2)
+        self.assertIn("Office 365 E1 licence", extractor.inputs[1])
+        self.assertIn("Maybe around 10", extractor.inputs[1])
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.estate is not None
+        self.assertEqual(session.capture_messages, [])
+        self.assertEqual(len(session.estate.lines), 1)
+        self.assertEqual(session.estate.lines[0].display_title, "Office 365 E1")
+        self.assertEqual(session.estate.lines[0].renewal_quantity, 10)
+        self.assertEqual(session.stage, WorkflowStage.AWAITING_INITIAL_VALIDATION)
+
+    async def test_single_e1_candidate_supports_unsure_and_full_name_confirmation(self) -> None:
+        sender = "single-e1-candidate-seller"
+        estate = await self.orchestrator.analyze_extracted(
+            sender=sender,
+            source_file="seller-message",
+            rows=[
+                ParsedLicenseRow(
+                    row_number=2,
+                    product_title="E1",
+                    total_licenses=10,
+                    expired_licenses=0,
+                    assigned_licenses=0,
+                    renewal_quantity=10,
+                )
+            ],
+        )
+        self.assertEqual(
+            [candidate.sku_title for candidate in estate.pending_lines[0].candidates],
+            ["Office 365 E1"],
+        )
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._process_captured_estate(sender, estate)
+        initial_text = "\n".join(
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+        )
+        self.assertIn("one close catalogue match", initial_text)
+        self.assertNotIn("more than one possible match", initial_text)
+        self.assertIn("1. Office 365 E1", initial_text)
+
+        await service._handle_text(sender, "I don't know")
+        unsure_text = client.messages[-2].text.body  # type: ignore[attr-defined]
+        self.assertIn("No problem — I can help", unsure_text)
+        self.assertIn("Office 365 E1", unsure_text)
+        self.assertIn("10 licences", unsure_text)
+
+        await service._handle_text(sender, "Office 365 E1")
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.estate is not None
+        self.assertEqual(len(session.estate.lines), 1)
+        self.assertEqual(session.estate.lines[0].match_method, "seller_confirmed")
+        self.assertEqual(session.estate.lines[0].display_title, "Office 365 E1")
+        self.assertEqual(session.estate.lines[0].renewal_quantity, 10)
+        self.assertEqual(session.stage, WorkflowStage.AWAITING_INITIAL_VALIDATION)
+
+    async def test_remove_pending_line_and_start_fresh_do_not_enter_scenario_editing(self) -> None:
+        class RemoveInterpreter:
+            async def interpret(self, *_: object) -> object:
+                return SimpleNamespace(
+                    action="set_disposition",
+                    disposition="remove",
+                    line_id="L1",
+                )
+
+        sender = "remove-pending-requirement-seller"
+        await self.orchestrator.analyze_extracted(
+            sender=sender,
+            source_file="seller-message",
+            rows=[
+                ParsedLicenseRow(
+                    row_number=2,
+                    product_title="E1",
+                    total_licenses=10,
+                    expired_licenses=0,
+                    assigned_licenses=0,
+                    renewal_quantity=10,
+                )
+            ],
+        )
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=RemoveInterpreter(),  # type: ignore[arg-type]
+        )
+
+        await service._handle_text(sender, "Remove that L1")
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNone(session.estate)
+        self.assertEqual(session.stage, WorkflowStage.AWAITING_UPLOAD)
+        response = client.messages[-1].text.body  # type: ignore[attr-defined]
+        self.assertIn("requirement draft is now empty", response)
+        self.assertNotIn("Select a scenario", response)
+
+        await self.orchestrator.analyze_extracted(
+            sender=sender,
+            source_file="replacement-draft",
+            rows=[
+                ParsedLicenseRow(
+                    row_number=2,
+                    product_title="Power BI Pro",
+                    total_licenses=7,
+                    expired_licenses=0,
+                    assigned_licenses=0,
+                    renewal_quantity=7,
+                )
+            ],
+        )
+        await service._handle_text(sender, "Just start from fresh")
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNone(session.estate)
+        self.assertEqual(session.capture_messages, [])
+        self.assertIn("cleared the previous draft", client.messages[-1].text.body)  # type: ignore[attr-defined]
+
+    async def test_fragmented_addition_preserves_existing_requirement(self) -> None:
+        class CaptureInterpreter:
+            async def interpret(self, *_: object) -> object:
+                return SimpleNamespace(action="capture_requirement")
+
+        sender = "fragmented-addition-seller"
+        await self.orchestrator.analyze_extracted(
+            sender=sender,
+            source_file="initial-requirement",
+            rows=[
+                ParsedLicenseRow(
+                    row_number=2,
+                    product_title="Power BI Pro",
+                    total_licenses=25,
+                    expired_licenses=0,
+                    assigned_licenses=0,
+                    renewal_quantity=25,
+                )
+            ],
+        )
+        extractor = ContextAwareFragmentExtractor()
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=CaptureInterpreter(),  # type: ignore[arg-type]
+            requirement_extractor=extractor,  # type: ignore[arg-type]
+        )
+
+        await service._handle_text(sender, "Also include Office 365 E1")
+        await service._handle_text(sender, "10 licences")
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.estate is not None
+        self.assertEqual(
+            [(line.display_title, line.renewal_quantity) for line in session.estate.lines],
+            [("Power BI Pro", 25), ("Office 365 E1", 10)],
+        )
+        self.assertEqual(session.capture_messages, [])
 
     async def test_missing_price_reopens_confirmation_instead_of_saving_zero_cost(
         self,

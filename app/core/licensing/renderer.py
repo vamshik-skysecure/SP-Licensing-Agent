@@ -62,7 +62,7 @@ def format_estate(
 
 
 def format_pending_matches(estate: LicenseEstate) -> str:
-    lines = ["*I need to confirm the intended SKU*"]
+    lines = ["*Let’s confirm the exact Microsoft product*"]
     for pending in estate.pending_lines:
         lines.extend(
             (
@@ -80,8 +80,9 @@ def format_pending_matches(estate: LicenseEstate) -> str:
         lines.extend(
             (
                 "",
-                "Reply with the line and option number, or send the complete product name. "
-                "Nothing will be priced until the SKU is confirmed.",
+                "Choose the matching option, reply with its number, or send the complete "
+                "product name. If you are unsure, say so and I will help you narrow it down. "
+                "Pricing will remain paused until you approve the exact product.",
             )
         )
     return "\n".join(lines)
@@ -93,9 +94,15 @@ def sku_clarification_question(source_title: str, candidates: list[object]) -> s
     if not candidates:
         return (
             f"I could not identify a reliable match for “{source_title}”. "
-            "What is the complete Microsoft product and plan name?"
+            "Send the product name shown on the invoice or a screenshot, and I will help "
+            "identify it."
         )
     titles = [str(getattr(item, "sku_title", "")) for item in candidates]
+    if len(titles) == 1:
+        return (
+            f"I found one close catalogue match for “{source_title}”, but I will not "
+            "select it without your approval. Is this the product you mean?"
+        )
     families = {product_family(title) for title in titles if title}
     if len(families) > 1:
         return (

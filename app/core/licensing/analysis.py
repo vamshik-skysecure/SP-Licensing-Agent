@@ -141,12 +141,10 @@ class LicenseAnalyzer:
         selections: Mapping[str, tuple[str, str]],
     ) -> LicenseEstate:
         pending_ids = {line.line_id for line in estate.pending_lines}
-        if set(selections) != pending_ids:
-            missing = sorted(pending_ids - set(selections))
-            unknown = sorted(set(selections) - pending_ids)
-            detail = []
-            if missing:
-                detail.append("missing " + ", ".join(missing))
+        selected_ids = set(selections)
+        if not selected_ids or not selected_ids.issubset(pending_ids):
+            unknown = sorted(selected_ids - pending_ids)
+            detail = ["no pending line was selected"] if not selected_ids else []
             if unknown:
                 detail.append("unknown " + ", ".join(unknown))
             raise LicenseAnalysisError("Invalid confirmation batch: " + "; ".join(detail))
@@ -182,10 +180,16 @@ class LicenseAnalyzer:
                     }
                 )
             )
+        aggregated = _aggregate_resolved_lines(updated)
+        pending = any(line.match_method == "unresolved" for line in aggregated)
         return estate.model_copy(
             update={
-                "lines": _aggregate_resolved_lines(updated),
-                "status": EstateStatus.READY,
+                "lines": aggregated,
+                "status": (
+                    EstateStatus.AWAITING_MATCH_CONFIRMATION
+                    if pending
+                    else EstateStatus.READY
+                ),
                 "updated_at": datetime.now(UTC),
             }
         )

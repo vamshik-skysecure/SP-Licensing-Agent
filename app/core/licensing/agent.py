@@ -39,6 +39,7 @@ AgentAction = Literal[
     "compare_enterprise_options",
     "request_recommendation",
     "set_requirement_detail",
+    "reset_requirement",
     "clarify",
 ]
 
@@ -262,9 +263,15 @@ and validates every commercial operation after you return the action.
 
 Rules:
 - Use help for a greeting, a request to start, or a broad question such as "what do you do?".
+- Use reset_requirement only when the seller explicitly asks to discard the current work and
+  start fresh, reset, clear everything, or begin a new requirement. A normal greeting or the word
+  "start" by itself is help, not a reset.
 - When no estate is loaded, use capture_requirement if the seller mentions licence/SKU
   requirement data, even when a quantity or term is missing. The extraction step will ask for
   missing requirement details. Never treat a greeting or question as licence data.
+- capture_messages contains the seller's preceding fragments for one incomplete typed
+  requirement. When it is non-empty, combine the new message with those facts: never ask again
+  for a product or quantity that is already present there.
 - While the stage is awaiting_initial_validation or awaiting_match_confirmation, use
   capture_requirement when the seller supplies one or more additional licence lines without
   referring to an existing line. The application appends them to the unconfirmed draft; it
@@ -310,8 +317,10 @@ Rules:
 - Use set_term, set_billing, set_segment, and set_currency for those commercial settings.
 - Use confirm_sku with candidate_number for an explicit numbered add/replace SKU choice;
   use cancel_sku when the seller cancels that pending change.
-- Use confirm_matches when the seller selects numbered candidates for every unresolved
-  uploaded line. Put each line and one-based option number in match_selections.
+- Use confirm_matches when the seller selects a candidate for one or more unresolved uploaded
+  lines. Put each supplied line and one-based option number in match_selections. A full
+  candidate product name, "yes" to a single offered candidate, or one option number for one
+  pending line is also a confirmation; do not treat it as a new licence line.
 - Use add_comment only for an explicit note or assumption.
 - Use finalize only when the seller explicitly asks to start finalization. The application
   will show a final validation summary and ask for a second confirmation.
@@ -341,7 +350,9 @@ Rules:
   use clarify and ask one direct question.
 - Fields irrelevant to the action must use "none", an empty string, -1, or -1.0.
 - If the seller has not selected every unresolved uploaded line, use clarify and ask for
-  the remaining choices; never guess a SKU match.
+  the remaining choices; never guess a SKU match. If the seller says they do not know, do not
+  repeat the same demand. Briefly acknowledge that, preserve the offered options, and ask for the
+  product family/business need or suggest sending the invoice name or a screenshot.
 
 Authoritative workflow facts for answer_question:
 - Inputs supported by the configured workflow are Excel/CSV, Word/PDF, common images or
@@ -482,12 +493,26 @@ class OpenAIIntentInterpreter:
             "workflow_mode": self._workflow_mode,
             "currency": self._currency,
             "stage": session.stage.value,
+            "capture_messages": session.capture_messages,
             "active_scenario": (
                 session.active_scenario.value if session.active_scenario else "none"
             ),
             "estate_uploaded": session.estate is not None,
             "pending_sku_matches": (
                 len(session.estate.pending_lines) if session.estate else 0
+            ),
+            "pending_sku_options": (
+                [
+                    {
+                        "line_id": line.line_id,
+                        "source_title": line.source_product_title,
+                        "quantity": line.renewal_quantity,
+                        "candidates": [item.sku_title for item in line.candidates],
+                    }
+                    for line in session.estate.pending_lines[:10]
+                ]
+                if session.estate
+                else []
             ),
             "confirmed_renew_as_is_value": (
                 str(session.confirmed_as_is.total_value)

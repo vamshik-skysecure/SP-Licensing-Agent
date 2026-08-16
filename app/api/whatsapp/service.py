@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Literal
@@ -18,11 +19,13 @@ from app.core.licensing.agent import (
     RecommendationAdvisor,
 )
 from app.core.licensing.models import (
+    LicenseEstate,
     MigrationDisposition,
     ScenarioStatus,
     ScenarioType,
     SellerProvidedDetail,
     SkuChangeResult,
+    WorkflowSession,
     WorkflowStage,
 )
 from app.core.licensing.mobile_tables import (
@@ -32,6 +35,7 @@ from app.core.licensing.mobile_tables import (
     render_simple_pricing_table_images,
 )
 from app.core.licensing.orchestrator import LicensingOrchestrator
+from app.core.licensing.rate_card import normalize_product_title
 from app.core.licensing.renderer import (
     format_comparison,
     format_estate,
@@ -69,16 +73,62 @@ RESPONSIVE_MESSAGE_LIMIT = 900
 
 HELP_TEXT = (
     "*SkySecure Microsoft Licensing Advisor*\n\n"
-    "Hello. I can turn a Microsoft licensing requirement into a validated annual commercial "
-    "proposal.\n\n"
-    "Send Excel/CSV, Word/PDF, an image or screenshot, a voice note, or type the SKUs and "
-    "quantities here. I will extract the requirement, resolve unclear products with you, and "
-    "request seller confirmation before calculating the Renew As-Is cost.\n\n"
-    "After confirmation, I can evaluate seller-approved quantity changes, additions, "
-    "replacements, or higher-tier options and show the commercial difference. Customer-ready "
-    "PDFs are created after the final seller confirmation.\n\n"
-    "Send the requirement or ask a question whenever you are ready. No commands are required."
+    "Hello — I’m ready to help you prepare a clear annual Microsoft licensing proposal.\n\n"
+    "Send Excel/CSV, Word/PDF, an image or screenshot, a voice note, or type the requirement "
+    "here. You may give the details in one message or one at a time; I will keep the context "
+    "and ask only for information that is still missing.\n\n"
+    "I will first show the complete captured requirement for your approval. Only after you "
+    "confirm it will I calculate the Renew As-Is cost. I can then evaluate requested quantity "
+    "changes, additions, replacements, or higher-tier options and prepare customer-ready PDFs "
+    "after final seller confirmation.\n\n"
+    "Send the first requirement whenever you are ready. No commands are required."
 )
+
+
+RESET_REQUESTS = {
+    "start fresh",
+    "start from fresh",
+    "start again",
+    "reset",
+    "reset everything",
+    "clear everything",
+    "clear the requirement",
+    "new requirement",
+    "begin a new requirement",
+}
+
+UNCERTAIN_REPLIES = {
+    "i don't know",
+    "i dont know",
+    "don't know",
+    "dont know",
+    "not sure",
+    "i am not sure",
+    "i'm not sure",
+    "no idea",
+}
+
+AFFIRMATIVE_REPLIES = {
+    "yes",
+    "yes use it",
+    "use it",
+    "use that",
+    "go with it",
+    "that one",
+    "correct",
+    "yes correct",
+}
+
+CANCEL_REPLIES = {
+    "cancel",
+    "cancel that",
+    "i don't want that",
+    "i dont want that",
+    "don't want that",
+    "dont want that",
+    "remove it",
+    "remove that",
+}
 
 
 SCENARIO_ALIASES = {
@@ -398,7 +448,7 @@ class WhatsAppWebhookService:
         await self._send_estate_table(sender, estate)
         await self._send_estate_report(sender, estate)
         if estate.pending_lines:
-            await self._send_text_chunks(sender, format_pending_matches(estate))
+            await self._send_pending_match_requests(sender, estate)
         else:
             await self._continue_after_estate(sender)
 
@@ -417,6 +467,418 @@ class WhatsAppWebhookService:
                 WorkflowStage.AWAITING_SCENARIO,
             }
         )
+
+    async def _capture_typed_requirement(self, sender: str, message: str) -> None:
+        extractor = self._require_extractor(
+            "Manual natural-language capture requires OpenAI. Send the standard CSV/XLSX "
+            "template when language capture is unavailable."
+        )
+        messages = await self._orchestrator.remember_capture_message(sender, message)
+        if len(messages) == 1:
+            capture_text = messages[0]
+        else:
+            capture_text = (
+                "The seller supplied these consecutive messages for one licensing "
+                "requirement. Combine details across the messages and do not ask again for "
+                "a product or quantity already supplied:\n"
+                + "\n".join(
+                    f"Seller message {index}: {value}"
+                    for index, value in enumerate(messages, start=1)
+                )
+            )
+        captured = await extractor.extract_text(
+            capture_text,
+            source_name="whatsapp-message.txt",
+        )
+        if captured.extraction.needs_clarification:
+            question = (
+                captured.extraction.clarification.strip()
+                or "Which product or quantity is still missing?"
+            )
+            supplied_product = next(
+                (
+                    line.sku_name.strip()
+                    for line in captured.extraction.lines
+                    if line.sku_name.strip()
+                ),
+                "",
+            )
+            supplied_quantity = next(
+                (
+                    line.quantity
+                    for line in captured.extraction.lines
+                    if line.quantity > 0
+                ),
+                0,
+            )
+            if supplied_product and supplied_quantity:
+                acknowledgement = (
+                    f"Got it — I’ve retained {supplied_product} and quantity "
+                    f"{supplied_quantity:,}. "
+                )
+            elif supplied_product:
+                acknowledgement = f"Got it — I’ve noted {supplied_product}. "
+                if "product" in question.casefold() or "sku" in question.casefold():
+                    question = "How many licences should I include?"
+            elif supplied_quantity:
+                acknowledgement = f"Got it — I’ve noted quantity {supplied_quantity:,}. "
+                if "quantity" in question.casefold():
+                    question = "Which Microsoft product or plan should I use?"
+            else:
+                acknowledgement = "Got it — I’ve kept the details you already provided. "
+            await self._send_text(sender, acknowledgement + question)
+            return
+        session = await self._orchestrator.get_session(sender)
+        append_to_draft = bool(
+            session is not None
+            and session.estate is not None
+            and session.confirmed_as_is is None
+        )
+        estate = await self._analyze_captured(
+            sender,
+            "whatsapp-message.txt",
+            captured,
+            append=append_to_draft,
+        )
+        await self._process_captured_estate(
+            sender,
+            estate,
+            appended=append_to_draft,
+        )
+
+    @staticmethod
+    def _requests_fresh_start(reply: str) -> bool:
+        return reply in RESET_REQUESTS or any(
+            phrase in reply
+            for phrase in (
+                "start fresh",
+                "start from fresh",
+                "reset everything",
+                "clear everything",
+                "new requirement",
+            )
+        )
+
+    async def _try_handle_pending_requirement_match(
+        self,
+        sender: str,
+        message: str,
+        session: WorkflowSession,
+    ) -> bool:
+        if session.estate is None or not session.estate.pending_lines:
+            return False
+        pending_lines = session.estate.pending_lines
+        reply = " ".join(message.casefold().strip(" ?!.,").split())
+
+        if reply in UNCERTAIN_REPLIES:
+            await self._send_uncertain_requirement_match(sender, pending_lines[0])
+            return True
+        if reply in CANCEL_REPLIES:
+            if len(pending_lines) == 1:
+                await self._remove_requirement_line(sender, pending_lines[0].line_id)
+            else:
+                await self._send_text(
+                    sender,
+                    "Which pending line should I remove? Reply with the line ID shown in "
+                    "the requirement table.",
+                )
+            return True
+
+        line_id, candidate_number = self._candidate_selection_from_reply(
+            message,
+            pending_lines,
+        )
+        selected_line = next(
+            (line for line in pending_lines if line.line_id == line_id),
+            None,
+        )
+        if (
+            selected_line is not None
+            and candidate_number is not None
+            and 1 <= candidate_number <= len(selected_line.candidates)
+        ):
+            estate = await self._confirm_requirement_candidate(
+                sender,
+                line_id=line_id,
+                candidate_number=candidate_number,
+            )
+            await self._after_requirement_match_confirmation(sender, estate)
+            return True
+
+        normalized_message = normalize_product_title(message)
+        title_matches = [
+            (line, index)
+            for line in pending_lines
+            for index, candidate in enumerate(line.candidates, start=1)
+            if (
+                normalized_message == normalize_product_title(candidate.sku_title)
+                or normalize_product_title(candidate.sku_title) in normalized_message
+            )
+        ]
+        if len(title_matches) == 1:
+            line, index = title_matches[0]
+            estate = await self._confirm_requirement_candidate(
+                sender,
+                line_id=line.line_id,
+                candidate_number=index,
+            )
+            await self._after_requirement_match_confirmation(sender, estate)
+            return True
+
+        if (
+            reply in AFFIRMATIVE_REPLIES
+            and len(pending_lines) == 1
+            and len(pending_lines[0].candidates) == 1
+        ):
+            estate = await self._confirm_requirement_candidate(
+                sender,
+                line_id=pending_lines[0].line_id,
+                candidate_number=1,
+            )
+            await self._after_requirement_match_confirmation(sender, estate)
+            return True
+
+        if len(pending_lines) == 1:
+            source = normalize_product_title(pending_lines[0].source_product_title)
+            quantity_only = re.fullmatch(
+                r"(?:(?:about|around|approximately|approx|maybe)\s+)?"
+                r"\d+\s*(?:(?:licence|license)s?|users?|seats?|quantity)?",
+                reply,
+            )
+            if (
+                quantity_only is not None
+                or (source and source in normalized_message)
+            ):
+                await self._send_uncertain_requirement_match(sender, pending_lines[0])
+                return True
+        return False
+
+    async def _try_handle_pending_sku_change_reply(
+        self,
+        sender: str,
+        message: str,
+        session: WorkflowSession,
+    ) -> bool:
+        pending = session.pending_sku_change
+        if pending is None:
+            return False
+        reply = " ".join(message.casefold().strip(" ?!.,").split())
+        if reply in CANCEL_REPLIES:
+            await self._orchestrator.cancel_sku_change(sender)
+            await self._send_text(
+                sender,
+                "Okay — I cancelled that product change. The proposal remains unchanged.",
+            )
+            return True
+        if reply in UNCERTAIN_REPLIES:
+            await self._send_text(
+                sender,
+                "No problem — I will not guess. Review the exact product names below. If "
+                "none is familiar, send the invoice name, a screenshot, or the business "
+                "capability you need and I will help narrow it down.",
+            )
+            await self._send_sku_change_result(
+                sender,
+                SkuChangeResult(
+                    state="confirmation_required",
+                    confirmation=pending,
+                ),
+            )
+            return True
+
+        number = self._single_candidate_number(message)
+        normalized_message = normalize_product_title(message)
+        title_numbers = [
+            index
+            for index, candidate in enumerate(pending.candidates, start=1)
+            if (
+                normalized_message == normalize_product_title(candidate.sku_title)
+                or normalize_product_title(candidate.sku_title) in normalized_message
+            )
+        ]
+        if len(title_numbers) == 1:
+            number = title_numbers[0]
+        elif reply in AFFIRMATIVE_REPLIES and len(pending.candidates) == 1:
+            number = 1
+        if number is None or number < 1 or number > len(pending.candidates):
+            return False
+        result = await self._orchestrator.confirm_sku_change(sender, number)
+        await self._send_sku_change_result(sender, result)
+        return True
+
+    @staticmethod
+    def _single_candidate_number(message: str) -> int | None:
+        reply = " ".join(message.casefold().strip(" ?!.,").split())
+        match = re.fullmatch(
+            r"(?:(?:choose|select|use)\s+)?(?:option\s+|number\s+)?(\d+)",
+            reply,
+        )
+        return int(match.group(1)) if match else None
+
+    def _candidate_selection_from_reply(
+        self,
+        message: str,
+        pending_lines: list,
+    ) -> tuple[str | None, int | None]:
+        reply = " ".join(message.casefold().strip(" ?!.,").split())
+        line_match = re.search(r"\b(l\d+)\b", reply)
+        line_id = line_match.group(1).upper() if line_match else None
+        number_match = re.search(
+            r"(?:option|number|choose|select|use)\s*(\d+)\b",
+            reply,
+        )
+        number = int(number_match.group(1)) if number_match else None
+        if number is None:
+            bare = self._single_candidate_number(message)
+            if (
+                bare is not None
+                and len(pending_lines) == 1
+                and bare <= len(pending_lines[0].candidates)
+            ):
+                number = bare
+        if line_id is None and len(pending_lines) == 1:
+            line_id = pending_lines[0].line_id
+        if line_id is not None and number is None and line_match is not None:
+            remainder = reply[line_match.end() :]
+            trailing = re.search(r"\b(\d+)\b", remainder)
+            if trailing:
+                number = int(trailing.group(1))
+        return line_id, number
+
+    async def _confirm_requirement_candidate(
+        self,
+        sender: str,
+        *,
+        line_id: str,
+        candidate_number: int,
+    ) -> LicenseEstate:
+        session = await self._orchestrator.get_session(sender)
+        if session is None or session.estate is None:
+            raise ValueError("There is no requirement awaiting product confirmation.")
+        line = next(
+            (
+                item
+                for item in session.estate.pending_lines
+                if item.line_id == line_id.upper()
+            ),
+            None,
+        )
+        if line is None:
+            raise ValueError(f"{line_id.upper()} is not awaiting product confirmation.")
+        index = candidate_number - 1
+        if index < 0 or index >= len(line.candidates):
+            raise ValueError(
+                f"Choose an option from 1 to {len(line.candidates)} for {line.line_id}."
+            )
+        candidate = line.candidates[index]
+        return await self._orchestrator.confirm_matches(
+            sender,
+            {line.line_id: (candidate.product_id, candidate.sku_id)},
+        )
+
+    async def _after_requirement_match_confirmation(
+        self,
+        sender: str,
+        estate: LicenseEstate,
+    ) -> None:
+        if estate.pending_lines:
+            await self._send_text(
+                sender,
+                "Thank you — that product is confirmed. Let’s resolve the next unclear "
+                "line; all quantities and other captured details remain unchanged.",
+            )
+            await self._send_pending_match_requests(sender, estate)
+            return
+        await self._send_text(
+            sender,
+            "Thank you — the exact product is confirmed. I retained the quantity and other "
+            "details you already supplied.",
+        )
+        await self._send_estate_table(sender, estate)
+        await self._send_estate_report(sender, estate)
+        await self._continue_after_estate(sender)
+
+    async def _send_pending_match_requests(
+        self,
+        sender: str,
+        estate: LicenseEstate,
+    ) -> None:
+        await self._send_text_chunks(sender, format_pending_matches(estate))
+        await self._send_pending_match_lists(sender, estate.pending_lines)
+
+    async def _send_uncertain_requirement_match(self, sender: str, line) -> None:
+        if len(line.candidates) == 1:
+            candidate = line.candidates[0]
+            await self._send_text(
+                sender,
+                "No problem — I can help. Based on the wording you supplied, the only "
+                f"close catalogue match is *{candidate.sku_title}*. I will not select it "
+                f"without your approval. Shall I use it for {line.renewal_quantity:,} "
+                "licences? If not, send the product name from the invoice or a screenshot.",
+            )
+        else:
+            options = "\n".join(
+                f"{index}. {candidate.sku_title}"
+                for index, candidate in enumerate(line.candidates, start=1)
+            )
+            await self._send_text(
+                sender,
+                "No problem — I will help narrow it down. These are the actual available "
+                f"matches for {line.line_id}:\n{options}\n\nTell me which product family "
+                "appears on the customer’s invoice. If that is unavailable, send a "
+                "screenshot or describe the required business capability.",
+            )
+        if line.candidates:
+            await self._send_pending_match_lists(sender, [line])
+
+    async def _send_pending_match_lists(
+        self,
+        sender: str,
+        pending_lines: list,
+    ) -> None:
+        for line in pending_lines:
+            rows = [
+                InteractiveRow(
+                    id=f"licensing|match_confirm|{line.line_id}|{index}",
+                    title=f"{line.line_id} · Option {index}",
+                    description=candidate.sku_title[:72],
+                )
+                for index, candidate in enumerate(line.candidates, start=1)
+            ]
+            if not rows:
+                continue
+            await self._send_interactive(
+                sender,
+                InteractiveList(
+                    body=InteractiveText(text=f"Select the exact product for {line.line_id}."),
+                    action=InteractiveListAction(
+                        button="Choose product",
+                        sections=[InteractiveSection(title="Available matches", rows=rows)],
+                    ),
+                ),
+            )
+
+    async def _remove_requirement_line(self, sender: str, line_id: str) -> None:
+        normalized_id = line_id.strip().upper()
+        session = await self._orchestrator.get_session(sender)
+        if session is None or session.estate is None:
+            raise ValueError("There is no captured requirement to edit.")
+        line = next(
+            (item for item in session.estate.lines if item.line_id == normalized_id),
+            None,
+        )
+        if line is None:
+            raise ValueError(f"I could not find {normalized_id} in the current requirement.")
+        if len(session.estate.lines) == 1:
+            await self._orchestrator.reset_session(sender)
+            await self._send_text(
+                sender,
+                f"Removed {line.line_id} — {line.display_title}. The requirement draft is "
+                "now empty. What licence would you like to start with?",
+            )
+            return
+        estate = await self._orchestrator.remove_requirement_line(sender, normalized_id)
+        await self._send_updated_requirement(sender, estate)
 
     def _require_extractor(self, message: str) -> RequirementExtractor:
         if self._requirement_extractor is None:
@@ -503,6 +965,9 @@ class WhatsAppWebhookService:
 
     async def _handle_text(self, sender: str, body: str) -> None:
         command = body.strip()
+        if not command:
+            await self._send_text(sender, "What licensing requirement would you like to review?")
+            return
         lowered = command.casefold()
         intro_request = " ".join(lowered.strip(" ?!.,").split())
         if lowered in {"/help", "/start", "/about", "/analyze"} or intro_request in {
@@ -526,6 +991,14 @@ class WhatsAppWebhookService:
         }:
             await self._send_text(sender, HELP_TEXT)
             return
+        if self._requests_fresh_start(intro_request):
+            await self._orchestrator.reset_session(sender)
+            await self._send_text(
+                sender,
+                "Done — I cleared the previous draft. Send the first licence and quantity "
+                "when you are ready; you can provide them together or one detail at a time.",
+            )
+            return
         if self._requests_monthly_billing(lowered):
             await self._send_text(
                 sender,
@@ -540,11 +1013,48 @@ class WhatsAppWebhookService:
                 "remains unchanged.",
             )
             return
+        session = await self._orchestrator.get_session(sender)
+        if self._configuration.workflow_mode == "simple_pricing" and session is not None:
+            if await self._try_handle_pending_sku_change_reply(
+                sender,
+                command,
+                session,
+            ):
+                return
+            if await self._try_handle_pending_requirement_match(
+                sender,
+                command,
+                session,
+            ):
+                return
+            if (
+                session.capture_messages
+                and intro_request in CANCEL_REPLIES
+            ):
+                if session.estate is None:
+                    await self._orchestrator.reset_session(sender)
+                    response = (
+                        "Okay — I cleared the incomplete requirement. What licence would "
+                        "you like to start with?"
+                    )
+                else:
+                    await self._orchestrator.clear_capture_messages(sender)
+                    response = (
+                        "Okay — I cancelled that incomplete addition. The licences already "
+                        "shown in your draft are unchanged."
+                    )
+                await self._send_text(sender, response)
+                return
+            if (
+                session.capture_messages
+                and not lowered.startswith("/")
+            ):
+                await self._capture_typed_requirement(sender, command)
+                return
         if (
             self._configuration.workflow_mode == "simple_pricing"
             and not lowered.startswith("/")
         ):
-            session = await self._orchestrator.get_session(sender)
             if session is None or session.estate is None:
                 if self._intent_interpreter is not None:
                     try:
@@ -565,20 +1075,7 @@ class WhatsAppWebhookService:
                             original_message=command,
                         )
                         return
-                extractor = self._require_extractor(
-                    "Manual natural-language capture requires OpenAI. Use the standard "
-                    "CSV/XLSX template in offline mode."
-                )
-                captured = await extractor.extract_text(
-                    command,
-                    source_name="whatsapp-message.txt",
-                )
-                estate = await self._analyze_captured(
-                    sender,
-                    "whatsapp-message.txt",
-                    captured,
-                )
-                await self._process_captured_estate(sender, estate)
+                await self._capture_typed_requirement(sender, command)
                 return
         if lowered in {"/validate", "/confirm-details"}:
             await self._confirm_validation(sender)
@@ -598,9 +1095,7 @@ class WhatsAppWebhookService:
         if lowered.startswith("/confirm "):
             selections = self._parse_confirmations(command[9:])
             estate = await self._orchestrator.confirm_matches(sender, selections)
-            await self._send_estate_table(sender, estate)
-            await self._send_estate_report(sender, estate)
-            await self._continue_after_estate(sender)
+            await self._after_requirement_match_confirmation(sender, estate)
             return
         if lowered.startswith("/confirm-sku "):
             value = command[13:].strip()
@@ -622,7 +1117,11 @@ class WhatsAppWebhookService:
         if (
             self._configuration.workflow_mode == "simple_pricing"
             and session is not None
-            and session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION
+            and session.stage
+            in {
+                WorkflowStage.AWAITING_INITIAL_VALIDATION,
+                WorkflowStage.AWAITING_MATCH_CONFIRMATION,
+            }
         ):
             if lowered.startswith("/set "):
                 line_id, quantity = self._line_quantity(command[5:])
@@ -641,7 +1140,11 @@ class WhatsAppWebhookService:
         if (
             self._configuration.workflow_mode == "simple_pricing"
             and session is not None
-            and session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION
+            and session.stage
+            in {
+                WorkflowStage.AWAITING_INITIAL_VALIDATION,
+                WorkflowStage.AWAITING_MATCH_CONFIRMATION,
+            }
         ):
             if lowered.startswith("/add "):
                 product, quantity = self._product_quantity(command[5:])
@@ -659,10 +1162,7 @@ class WhatsAppWebhookService:
                 return
             if lowered.startswith("/remove "):
                 line_id = command[8:].strip()
-                estate = await self._orchestrator.remove_requirement_line(
-                    sender, line_id
-                )
-                await self._send_updated_requirement(sender, estate)
+                await self._remove_requirement_line(sender, line_id)
                 return
             if lowered.startswith("/term "):
                 term_duration = self._required_text(command[6:], "contract term")
@@ -877,6 +1377,14 @@ class WhatsAppWebhookService:
         if intent.action == "help":
             await self._send_text(sender, HELP_TEXT)
             return
+        if intent.action == "reset_requirement":
+            await self._orchestrator.reset_session(sender)
+            await self._send_text(
+                sender,
+                "Done — I cleared the previous draft. Send the first licence and quantity "
+                "when you are ready; you can provide them together or one detail at a time.",
+            )
+            return
         if intent.action == "answer_question":
             answer = intent.response_text.strip()
             await self._send_text(
@@ -908,24 +1416,7 @@ class WhatsAppWebhookService:
             return
         if intent.action == "capture_requirement":
             if original_message and await self._has_open_requirement_draft(sender):
-                extractor = self._require_extractor(
-                    "Adding a typed requirement requires OpenAI requirement capture."
-                )
-                captured = await extractor.extract_text(
-                    original_message,
-                    source_name="whatsapp-message.txt",
-                )
-                estate = await self._analyze_captured(
-                    sender,
-                    "whatsapp-message.txt",
-                    captured,
-                    append=True,
-                )
-                await self._process_captured_estate(
-                    sender,
-                    estate,
-                    appended=True,
-                )
+                await self._capture_typed_requirement(sender, original_message)
                 return
             await self._send_text(
                 sender,
@@ -998,7 +1489,11 @@ class WhatsAppWebhookService:
         if (
             self._configuration.workflow_mode == "simple_pricing"
             and session is not None
-            and session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION
+            and session.stage
+            in {
+                WorkflowStage.AWAITING_INITIAL_VALIDATION,
+                WorkflowStage.AWAITING_MATCH_CONFIRMATION,
+            }
         ):
             if intent.action == "set_quantity":
                 estate = await self._orchestrator.edit_requirement_quantity(
@@ -1029,11 +1524,10 @@ class WhatsAppWebhookService:
                 await self._send_sku_change_result(sender, result)
                 return
             if intent.action == "set_disposition" and intent.disposition == "remove":
-                estate = await self._orchestrator.remove_requirement_line(
+                await self._remove_requirement_line(
                     sender,
                     self._required_text(intent.line_id, "line ID"),
                 )
-                await self._send_updated_requirement(sender, estate)
                 return
             if intent.action == "set_term":
                 term_duration = self._required_text(
@@ -1209,12 +1703,8 @@ class WhatsAppWebhookService:
                 raise ValueError("Upload a licence file before confirming SKU matches.")
             pending = {line.line_id: line for line in session.estate.pending_lines}
             selected_ids = {item.line_id.upper() for item in intent.match_selections}
-            if selected_ids != set(pending):
-                missing = sorted(set(pending) - selected_ids)
-                raise ValueError(
-                    "Choose one candidate for every pending line"
-                    + (f": {', '.join(missing)}." if missing else ".")
-                )
+            if not selected_ids or not selected_ids.issubset(set(pending)):
+                raise ValueError("Choose one of the displayed options for a pending line.")
             selections: dict[str, tuple[str, str]] = {}
             for item in intent.match_selections:
                 line_id = item.line_id.upper()
@@ -1227,9 +1717,7 @@ class WhatsAppWebhookService:
                 candidate = candidates[index]
                 selections[line_id] = (candidate.product_id, candidate.sku_id)
             estate = await self._orchestrator.confirm_matches(sender, selections)
-            await self._send_estate_table(sender, estate)
-            await self._send_estate_report(sender, estate)
-            await self._continue_after_estate(sender)
+            await self._after_requirement_match_confirmation(sender, estate)
             return
         if intent.action == "confirm_sku":
             if intent.candidate_number <= 0:
@@ -1301,6 +1789,16 @@ class WhatsAppWebhookService:
                     "No recommendation changes were applied. You can finalize the as-is "
                     "configuration whenever you are ready.",
                 )
+            return
+        if action == "match_confirm":
+            if len(parts) != 4 or not parts[3].isdigit():
+                raise ValueError("That product selection is no longer valid.")
+            estate = await self._confirm_requirement_candidate(
+                sender,
+                line_id=value,
+                candidate_number=int(parts[3]),
+            )
+            await self._after_requirement_match_confirmation(sender, estate)
             return
         await self._ensure_operation_allowed(sender)
         if action == "scenario":
@@ -1383,7 +1881,10 @@ class WhatsAppWebhookService:
             "Requirement updated. Review the refreshed table and confirm when correct.",
         )
         await self._send_estate_table(sender, estate)
-        await self._continue_after_estate(sender)
+        if estate.pending_lines:
+            await self._send_pending_match_requests(sender, estate)
+        else:
+            await self._continue_after_estate(sender)
 
     async def _send_simple_as_is(self, sender: str, scenario) -> None:
         images = render_simple_pricing_table_images(

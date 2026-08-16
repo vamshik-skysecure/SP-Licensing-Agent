@@ -250,6 +250,7 @@ class WorkflowSession(BaseModel):
     active_scenario: ScenarioType | None = None
     confirmed_as_is: CommercialScenario | None = None
     pending_sku_change: PendingSkuChange | None = None
+    capture_messages: list[str] = Field(default_factory=list, max_length=8)
     processed_message_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
