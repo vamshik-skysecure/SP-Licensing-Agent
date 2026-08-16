@@ -1,3 +1,4 @@
+import re
 import unittest
 from decimal import Decimal
 from io import BytesIO
@@ -143,6 +144,56 @@ class ContextAwareFragmentExtractor:
                 clarification=(
                     "How many licences should I include?"
                     if not has_quantity_turn
+                    else ""
+                ),
+            )
+        )
+
+    async def close(self) -> None:
+        return None
+
+
+class TranscriptRequirementExtractor:
+    """Contract-faithful fake for short, multi-turn product/quantity capture."""
+
+    def __init__(self) -> None:
+        self.inputs: list[str] = []
+
+    async def extract_text(self, text: str, **_: object) -> CapturedRequirement:
+        self.inputs.append(text)
+        normalized = text.casefold()
+        if "copilot" in normalized:
+            product = "Copilot"
+        elif "power bi" in normalized:
+            product = "Power BI licence"
+        else:
+            product = "E1"
+        seller_followups = re.findall(r"Seller message \d+:\s*([^\n]+)", text)
+        quantity = 0
+        for value in seller_followups[1:]:
+            match = re.search(r"\b(\d+)\b", value)
+            if match:
+                quantity = int(match.group(1))
+        needs_clarification = quantity <= 0
+        return CapturedRequirement(
+            extraction=RequirementExtraction(
+                lines=[
+                    ExtractedRequirementLine(
+                        sku_name=product,
+                        quantity=quantity,
+                        term_duration="P1Y",
+                        billing_plan="Annual",
+                        product_id="",
+                        sku_id="",
+                        expiration_date="",
+                        renewal_date="",
+                    )
+                ],
+                warnings=[],
+                needs_clarification=needs_clarification,
+                clarification=(
+                    f"How many {product} licences should I include?"
+                    if needs_clarification
                     else ""
                 ),
             )
@@ -786,6 +837,145 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             [("Power BI Pro", 25), ("Office 365 E1", 10)],
         )
         self.assertEqual(session.capture_messages, [])
+
+    async def test_live_style_dialogue_retains_slots_blocks_premature_yes_and_compares_four(
+        self,
+    ) -> None:
+        class ClarifyingInterpreter:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            async def interpret(self, message: str, *_: object) -> object:
+                self.messages.append(message)
+                if "confirm the complete requirement" in message.casefold():
+                    return SimpleNamespace(action="confirm_validation")
+                return SimpleNamespace(
+                    action="clarify",
+                    clarification="How many licences should I include?",
+                )
+
+            async def close(self) -> None:
+                return None
+
+        sender = "ceo-transcript-regression"
+        interpreter = ClarifyingInterpreter()
+        extractor = TranscriptRequirementExtractor()
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=interpreter,  # type: ignore[arg-type]
+            requirement_extractor=extractor,
+        )
+
+        await service._handle_text(sender, "I want E1 licence")
+        await service._handle_text(sender, "10")
+        await service._handle_text(sender, "Office 365 E1")
+
+        await service._handle_text(sender, "Let's add Power BI licence now")
+        await service._handle_text(sender, "15")
+        await service._handle_text(sender, "Power BI Pro")
+
+        await service._handle_text(sender, "I want Copilot licence also")
+        await service._handle_text(sender, "Yes")
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNone(session.confirmed_as_is)
+        self.assertTrue(session.capture_messages)
+        self.assertEqual(session.stage, WorkflowStage.AWAITING_INITIAL_VALIDATION)
+
+        await service._handle_text(sender, "5")
+        await service._handle_text(sender, "Microsoft 365 Copilot")
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.estate is not None
+        self.assertEqual(
+            [(line.display_title, line.renewal_quantity) for line in session.estate.lines],
+            [
+                ("Office 365 E1", 10),
+                ("Power BI Pro", 15),
+                ("Microsoft 365 Copilot", 5),
+            ],
+        )
+        self.assertIsNone(session.confirmed_as_is)
+
+        await service._handle_text(
+            sender,
+            "Confirm the complete requirement and calculate Renew As-Is",
+        )
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNotNone(session.confirmed_as_is)
+
+        calls_before_comparison = len(interpreter.messages)
+        await service._handle_text(sender, "Compare with other 4")
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertEqual(set(session.scenarios), set(ScenarioType))
+        self.assertEqual(len(interpreter.messages), calls_before_comparison)
+        self.assertTrue(
+            any(
+                item["filename"] == "annual-licensing-comparison.pdf"
+                for item in client.documents
+            )
+        )
+
+    async def test_greeting_exposes_saved_draft_and_prevents_silent_quantity_merge(
+        self,
+    ) -> None:
+        sender = "saved-draft-seller"
+        await self.orchestrator.analyze_extracted(
+            sender=sender,
+            source_file="previous-session",
+            rows=[
+                ParsedLicenseRow(
+                    row_number=2,
+                    product_title="Office 365 E1",
+                    total_licenses=20,
+                    expired_licenses=0,
+                    assigned_licenses=0,
+                    renewal_quantity=20,
+                    term_duration="P1Y",
+                    billing_plan="Annual",
+                )
+            ],
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._handle_text(sender, "Hi")
+        response = client.messages[-1].text.body  # type: ignore[attr-defined]
+        self.assertIn("active saved draft", response)
+        self.assertIn("Resume", response)
+        self.assertIn("Start fresh", response)
+
+        await service._handle_text(sender, "I want E1 licence")
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.estate is not None
+        self.assertEqual(session.estate.total_renewal_quantity, 20)
+        self.assertIsNotNone(session.pending_dialogue)
+        self.assertIn("will not merge", client.messages[-1].text.body)  # type: ignore[attr-defined]
+
+        await service._handle_text(sender, "Start fresh")
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNone(session.estate)
+        self.assertIsNone(session.pending_dialogue)
 
     async def test_missing_price_reopens_confirmation_instead_of_saving_zero_cost(
         self,

@@ -219,6 +219,17 @@ class PendingSkuChange(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class PendingDialogue(BaseModel):
+    """A seller question that must be resolved before normal intent routing resumes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["resume_session", "agent_clarification"]
+    question: str = Field(min_length=1, max_length=500)
+    context_message: str = Field(default="", max_length=2000)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class SkuChangeResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -250,6 +261,7 @@ class WorkflowSession(BaseModel):
     active_scenario: ScenarioType | None = None
     confirmed_as_is: CommercialScenario | None = None
     pending_sku_change: PendingSkuChange | None = None
+    pending_dialogue: PendingDialogue | None = None
     capture_messages: list[str] = Field(default_factory=list, max_length=8)
     processed_message_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)

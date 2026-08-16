@@ -272,6 +272,9 @@ Rules:
 - capture_messages contains the seller's preceding fragments for one incomplete typed
   requirement. When it is non-empty, combine the new message with those facts: never ask again
   for a product or quantity that is already present there.
+- pending_dialogue contains the exact question the advisor most recently asked. Interpret a
+  short reply such as a number, "yes", or "that one" only as the answer to that question. Never
+  use such a reply to confirm the whole requirement while a pending dialogue exists.
 - While the stage is awaiting_initial_validation or awaiting_match_confirmation, use
   capture_requirement when the seller supplies one or more additional licence lines without
   referring to an existing line. The application appends them to the unconfirmed draft; it
@@ -494,6 +497,15 @@ class OpenAIIntentInterpreter:
             "currency": self._currency,
             "stage": session.stage.value,
             "capture_messages": session.capture_messages,
+            "pending_dialogue": (
+                {
+                    "kind": session.pending_dialogue.kind,
+                    "question": session.pending_dialogue.question,
+                    "context_message": session.pending_dialogue.context_message,
+                }
+                if session.pending_dialogue is not None
+                else None
+            ),
             "active_scenario": (
                 session.active_scenario.value if session.active_scenario else "none"
             ),

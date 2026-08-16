@@ -21,6 +21,7 @@ from app.core.licensing.agent import (
 from app.core.licensing.models import (
     LicenseEstate,
     MigrationDisposition,
+    PendingDialogue,
     ScenarioStatus,
     ScenarioType,
     SellerProvidedDetail,
@@ -95,6 +96,19 @@ RESET_REQUESTS = {
     "clear the requirement",
     "new requirement",
     "begin a new requirement",
+}
+
+RESUME_REQUESTS = {
+    "resume",
+    "resume it",
+    "resume draft",
+    "resume the draft",
+    "continue",
+    "continue it",
+    "continue draft",
+    "continue the draft",
+    "show draft",
+    "show the draft",
 }
 
 UNCERTAIN_REPLIES = {
@@ -559,6 +573,193 @@ class WhatsAppWebhookService:
             )
         )
 
+    @staticmethod
+    def _requests_enterprise_comparison(reply: str) -> bool:
+        if "compare" not in reply:
+            return False
+        compact = " ".join(reply.split())
+        if re.search(r"\b(?:all|other|the)?\s*(?:4|four)\b", compact):
+            return True
+        return all(value in compact for value in ("me3", "me5", "me7"))
+
+    @staticmethod
+    def _looks_like_requirement_fragment(message: str) -> bool:
+        """Conservative fallback when the intent model asks instead of starting capture."""
+
+        value = " ".join(message.casefold().strip(" ?!.,").split())
+        if any(
+            phrase in value
+            for phrase in (
+                "how much",
+                "what is the price",
+                "what does it cost",
+                "compare",
+                "finalize",
+                "what is",
+                "what are",
+                "explain",
+            )
+        ):
+            return False
+        product_markers = (
+            "licence",
+            "license",
+            "sku",
+            "subscription",
+            "copilot",
+            "power bi",
+            "microsoft 365",
+            "office 365",
+            "teams",
+            "defender",
+            "intune",
+            "entra",
+            "visio",
+            "project plan",
+            "dynamics 365",
+            "windows 11",
+        )
+        request_markers = (
+            "want",
+            "need",
+            "require",
+            "add",
+            "include",
+            "also",
+            "licence",
+            "license",
+            "sku",
+        )
+        return any(marker in value for marker in product_markers) and any(
+            marker in value for marker in request_markers
+        )
+
+    async def _show_saved_session_choice(
+        self,
+        sender: str,
+        session: WorkflowSession,
+    ) -> None:
+        assert session.estate is not None
+        question = (
+            "Would you like to resume this saved draft, or start a fresh requirement?"
+        )
+        await self._orchestrator.set_pending_dialogue(
+            sender,
+            PendingDialogue(
+                kind="resume_session",
+                question=question,
+            ),
+        )
+        await self._send_text(
+            sender,
+            "*SkySecure Microsoft Licensing Advisor*\n\n"
+            "Welcome back. I found an active saved draft containing "
+            f"{len(session.estate.lines)} SKU line(s) and "
+            f"{session.estate.total_renewal_quantity:,} licences. I have not added, removed, "
+            "or repriced anything.\n\n"
+            f"{question} Reply *Resume* or *Start fresh*.",
+        )
+
+    async def _resume_saved_session(
+        self,
+        sender: str,
+        session: WorkflowSession,
+    ) -> None:
+        assert session.estate is not None
+        await self._orchestrator.clear_pending_dialogue(sender)
+        await self._send_text(
+            sender,
+            "Saved draft resumed. Review the complete requirement below before continuing.",
+        )
+        await self._send_estate_table(sender, session.estate)
+        if session.estate.pending_lines:
+            await self._send_pending_match_requests(sender, session.estate)
+            return
+        if session.confirmed_as_is is None:
+            await self._continue_after_estate(sender)
+            return
+        await self._send_text(
+            sender,
+            "The Renew As-Is baseline is already confirmed. Describe the next change, request "
+            "a four-option comparison, or ask me to finalize the active proposal.",
+        )
+
+    async def _resolve_pending_dialogue(
+        self,
+        sender: str,
+        message: str,
+        session: WorkflowSession,
+    ) -> bool:
+        pending = session.pending_dialogue
+        if pending is None:
+            return False
+        reply = " ".join(message.casefold().strip(" ?!.,").split())
+        if pending.kind == "resume_session":
+            if reply in RESUME_REQUESTS:
+                await self._resume_saved_session(sender, session)
+                return True
+            await self._send_text(
+                sender,
+                "I found an existing saved draft and will not merge a new requirement into it "
+                "without your approval. Reply *Resume* to continue it or *Start fresh* to "
+                "clear it and begin again.",
+            )
+            return True
+        if reply in CANCEL_REPLIES:
+            await self._orchestrator.clear_pending_dialogue(sender)
+            await self._send_text(
+                sender,
+                "Okay — I cancelled that question. The saved requirement and proposal are "
+                "unchanged. What would you like to do next?",
+            )
+            return True
+        if self._intent_interpreter is None:
+            await self._send_text(sender, pending.question)
+            return True
+
+        seller_context = "\n".join(
+            value
+            for value in (pending.context_message.strip(), message.strip())
+            if value
+        )
+        interpretation_input = (
+            "Resolve the seller's latest answer in the context of the preceding exchange.\n"
+            f"Earlier seller request: {pending.context_message or '(none)'}\n"
+            f"Advisor question: {pending.question}\n"
+            f"Seller answer: {message}"
+        )
+        try:
+            intent = await self._intent_interpreter.interpret(
+                interpretation_input,
+                session,
+            )
+        except IntentInterpretationError:
+            await self._send_text(sender, pending.question)
+            return True
+
+        if intent.action == "confirm_validation":
+            await self._send_text(
+                sender,
+                "That reply relates to the pending question, so I have not confirmed the "
+                f"complete requirement. {pending.question}",
+            )
+            return True
+        await self._orchestrator.clear_pending_dialogue(sender)
+        if intent.action == "capture_requirement" and seller_context:
+            if pending.context_message.strip():
+                await self._orchestrator.remember_capture_message(
+                    sender,
+                    pending.context_message,
+                )
+            await self._capture_typed_requirement(sender, message)
+            return True
+        await self._execute_agent_intent(
+            sender,
+            intent,
+            original_message=seller_context or message,
+        )
+        return True
+
     async def _try_handle_pending_requirement_match(
         self,
         sender: str,
@@ -850,7 +1051,9 @@ class WhatsAppWebhookService:
             await self._send_interactive(
                 sender,
                 InteractiveList(
-                    body=InteractiveText(text=f"Select the exact product for {line.line_id}."),
+                    body=InteractiveText(
+                        text=f"Choose one catalogue match for {line.line_id} below."
+                    ),
                     action=InteractiveListAction(
                         button="Choose product",
                         sections=[InteractiveSection(title="Available matches", rows=rows)],
@@ -970,6 +1173,7 @@ class WhatsAppWebhookService:
             return
         lowered = command.casefold()
         intro_request = " ".join(lowered.strip(" ?!.,").split())
+        session = await self._orchestrator.get_session(sender)
         if lowered in {"/help", "/start", "/about", "/analyze"} or intro_request in {
             "hi",
             "hello",
@@ -989,7 +1193,14 @@ class WhatsAppWebhookService:
             "how do you work",
             "how does this work",
         }:
-            await self._send_text(sender, HELP_TEXT)
+            if (
+                self._configuration.workflow_mode == "simple_pricing"
+                and session is not None
+                and session.estate is not None
+            ):
+                await self._show_saved_session_choice(sender, session)
+            else:
+                await self._send_text(sender, HELP_TEXT)
             return
         if self._requests_fresh_start(intro_request):
             await self._orchestrator.reset_session(sender)
@@ -1050,6 +1261,15 @@ class WhatsAppWebhookService:
                 and not lowered.startswith("/")
             ):
                 await self._capture_typed_requirement(sender, command)
+                return
+            if await self._resolve_pending_dialogue(sender, command, session):
+                return
+            if self._requests_enterprise_comparison(intro_request):
+                await self._ensure_operation_allowed(
+                    sender,
+                    agent_action="compare_enterprise_options",
+                )
+                await self._send_enterprise_comparison(sender)
                 return
         if (
             self._configuration.workflow_mode == "simple_pricing"
@@ -1427,11 +1647,35 @@ class WhatsAppWebhookService:
             return
         if intent.action == "clarify":
             question = intent.clarification.strip()
-            await self._send_text(
-                sender,
+            clarification_session = await self._orchestrator.get_session(sender)
+            capture_is_open = bool(
+                clarification_session is None
+                or clarification_session.estate is None
+                or clarification_session.confirmed_as_is is None
+            )
+            if (
+                capture_is_open
+                and original_message
+                and self._looks_like_requirement_fragment(original_message)
+            ):
+                await self._capture_typed_requirement(sender, original_message)
+                return
+            resolved_question = (
                 question[:500]
                 if question
-                else "Which proposal, line, or quantity would you like to change?",
+                else "Which proposal, line, or quantity would you like to change?"
+            )
+            await self._orchestrator.set_pending_dialogue(
+                sender,
+                PendingDialogue(
+                    kind="agent_clarification",
+                    question=resolved_question,
+                    context_message=(original_message or "")[:2000],
+                ),
+            )
+            await self._send_text(
+                sender,
+                resolved_question,
             )
             return
         if intent.action == "confirm_validation":
@@ -2075,7 +2319,7 @@ class WhatsAppWebhookService:
             sender,
             InteractiveList(
                 body=InteractiveText(
-                    text="Which exact Microsoft SKU should I use?"
+                    text="Choose the exact catalogue SKU below."
                 ),
                 action=InteractiveListAction(
                     button="Choose exact SKU",

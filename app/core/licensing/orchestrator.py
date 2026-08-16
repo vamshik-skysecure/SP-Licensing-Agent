@@ -14,6 +14,7 @@ from .models import (
     LicenseEstate,
     MigrationDisposition,
     NormalizedLicenseLine,
+    PendingDialogue,
     PendingSkuChange,
     ParsedLicenseRow,
     ScenarioType,
@@ -70,6 +71,7 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "capture_messages": result,
+                    "pending_dialogue": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -91,6 +93,7 @@ class LicensingOrchestrator:
                     "active_scenario": None,
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
+                    "pending_dialogue": None,
                     "capture_messages": [],
                     "created_at": now,
                     "updated_at": now,
@@ -106,11 +109,40 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "capture_messages": [],
+                    "pending_dialogue": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
 
         return await self._mutate(sender, update)
+
+    async def set_pending_dialogue(
+        self,
+        sender: str,
+        pending: PendingDialogue,
+    ) -> WorkflowSession:
+        """Persist a clarification so a short reply is interpreted in context."""
+
+        return await self._mutate(
+            sender,
+            lambda session: session.model_copy(
+                update={
+                    "pending_dialogue": pending,
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
+        )
+
+    async def clear_pending_dialogue(self, sender: str) -> WorkflowSession:
+        return await self._mutate(
+            sender,
+            lambda session: session.model_copy(
+                update={
+                    "pending_dialogue": None,
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
+        )
 
     async def has_processed(self, sender: str, message_id: str) -> bool:
         session = await self.get_session(sender)
@@ -152,6 +184,7 @@ class LicensingOrchestrator:
                     "active_scenario": None,
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
+                    "pending_dialogue": None,
                     "capture_messages": [],
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
@@ -189,6 +222,7 @@ class LicensingOrchestrator:
                     "active_scenario": None,
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
+                    "pending_dialogue": None,
                     "capture_messages": [],
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
@@ -338,6 +372,7 @@ class LicensingOrchestrator:
                     "active_scenario": None,
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
+                    "pending_dialogue": None,
                     "capture_messages": [],
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
@@ -463,6 +498,10 @@ class LicensingOrchestrator:
                 raise ScenarioError("There is no requirement awaiting seller confirmation.")
             if session.estate is None or session.estate.pending_lines:
                 raise ScenarioError("Resolve all SKU matches before confirming the requirement.")
+            if session.capture_messages or session.pending_dialogue is not None:
+                raise ScenarioError(
+                    "Resolve the pending requirement question before confirming the requirement."
+                )
             result = session.estate
             return session.model_copy(
                 update={
