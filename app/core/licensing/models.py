@@ -78,6 +78,7 @@ class RateCardItem(BaseModel):
     partner_cost: Money = Decimal("0")
     partner_best_offer: Money = Decimal("0")
     marketplace_price: Money = Decimal("0")
+    distributor_price: Money = Decimal("0")
     initial_quote_with_promo: Money
     initial_quote_without_promo: Money
     initial_quote_with_promo_available: bool = True

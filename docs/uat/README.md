@@ -6,7 +6,7 @@ This pack verifies the CEO-approved V1 `simple_pricing` journey using synthetic 
 
 1. capture a requirement by text, spreadsheet, Word/PDF, image, or voice;
 2. allow corrections and require explicit seller confirmation;
-3. show the as-submitted annual Marketplace cost;
+3. show the as-submitted annual approved distributor cost;
 4. optionally apply a seller-directed SKU or quantity revision;
 5. compare Renew As-Is with the revised configuration and confirm the final PDF.
 
@@ -45,7 +45,8 @@ ENVIRONMENT=development
 STORAGE_MODE=local
 WORKFLOW_MODE=simple_pricing
 RATE_CARD_LOCAL_PATH=docs/microsoft_sku_v5.xlsx
-RATE_CARD_SHEET_NAME=Final Output Sheet
+RATE_CARD_SHEET_NAME=Outcome Sheet
+SIMPLE_PRICE_BASIS=distributor_expected
 MESSAGE_DISPATCH_BACKEND=direct
 AI_INTENT_BACKEND=openai
 REQUIREMENT_CAPTURE_BACKEND=openai
@@ -78,5 +79,5 @@ duplicate delivery, and restart recovery.
 ## Phase 1 boundary
 
 The active implementation does not depend on the legacy Phase 1 API or source code. It
-loads the maintained `Final Output Sheet` directly and does not assume undocumented Phase 1
+loads the maintained final `Outcome Sheet` directly and does not assume undocumented Phase 1
 behavior.

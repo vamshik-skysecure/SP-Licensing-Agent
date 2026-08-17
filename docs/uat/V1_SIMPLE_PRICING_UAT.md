@@ -13,7 +13,7 @@ Use synthetic licensing data only. The active configuration must show
    and that no price has been calculated yet.
 4. Reply `Change L1 to 30 licences`. Confirm the refreshed capture table shows 30.
 5. Choose **Confirm requirement**. Confirm the as-is table and PDF show SKU,
-   quantity, billing term, Marketplace unit price, line total, and overall value.
+   quantity, billing term, approved unit price, line total, and overall value.
 6. Confirm no seller output contains `0% discount`, distributor discount, margin,
    adjustment, promotion eligibility, Partner Best Offer, or an internal price build-up.
 7. Choose **Yes, revise**, then send `Add 10 Microsoft 365 Copilot licences`.
@@ -53,8 +53,8 @@ asks a clarification question instead of guessing.
 - Voice duration is limited by `MAX_AUDIO_SECONDS` (default 300), uploads are limited by
   byte-size configuration, PDF/image detail is `low`, output tokens are capped, and
   Responses calls use `store=False`.
-- The model never receives the FYD pricebook and never calculates a price. Exact/fuzzy
-  catalogue matching, Marketplace price selection, multiplication, totals, revisions, and
+- The model never receives the pricing workbook and never calculates a price. Exact/fuzzy
+  catalogue matching, approved distributor-price selection, multiplication, totals, revisions, and
   confirmation gates remain deterministic application operations.
 - Generic “recommend a better SKU” requests must not invent an entitlement decision while
   the business rule sheet is pending. The agent asks for the source line, target capability

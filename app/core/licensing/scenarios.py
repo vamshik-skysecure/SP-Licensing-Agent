@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Literal
+from typing import Literal, TypeAlias
 from uuid import uuid4
 
 from .migration_rules import MigrationSeedCatalog
@@ -28,12 +28,19 @@ class ScenarioError(ValueError):
     pass
 
 
+PriceBasis: TypeAlias = Literal[
+    "partner_best_offer",
+    "marketplace",
+    "distributor_expected",
+]
+
+
 def price_unavailability_message(
     item: RateCardItem,
     promo_eligible: bool,
-    price_basis: Literal["partner_best_offer", "marketplace"] = "partner_best_offer",
+    price_basis: PriceBasis = "partner_best_offer",
 ) -> str:
-    if price_basis == "marketplace":
+    if price_basis in {"marketplace", "distributor_expected"}:
         return "The current licence price is blank; the line is not included in the total."
     if (
         not promo_eligible
@@ -51,9 +58,9 @@ def price_unavailability_decision(
     line_id: str,
     item: RateCardItem,
     promo_eligible: bool,
-    price_basis: Literal["partner_best_offer", "marketplace"] = "partner_best_offer",
+    price_basis: PriceBasis = "partner_best_offer",
 ) -> str:
-    if price_basis == "marketplace":
+    if price_basis in {"marketplace", "distributor_expected"}:
         return f"{line_id}: the current licence price is unavailable."
     if (
         not promo_eligible
@@ -105,7 +112,7 @@ class ScenarioEngine:
         migration_seeds: MigrationSeedCatalog | None = None,
         *,
         apply_bundle_rules: bool = True,
-        price_basis: Literal["partner_best_offer", "marketplace"] = "partner_best_offer",
+        price_basis: PriceBasis = "partner_best_offer",
     ) -> None:
         self._migration_seeds = migration_seeds
         self._apply_bundle_rules = apply_bundle_rules
@@ -133,14 +140,7 @@ class ScenarioEngine:
                 billing_plan,
                 segment,
             )
-            if (
-                item.marketplace_price <= 0
-                if self._price_basis == "marketplace"
-                else not (
-                    item.initial_quote_with_promo_available
-                    or item.initial_quote_without_promo_available
-                )
-            ):
+            if not self._price_available(item):
                 raise ScenarioError(
                     f"The required current price is blank for {title!r}."
                 )
@@ -1090,10 +1090,12 @@ class ScenarioEngine:
             raise ScenarioError(
                 f"No {term_duration}/{billing_plan} price exists for {selector.sku_title}."
             )
-        prices = (
-            {row.marketplace_price for row in rows}
-            if self._price_basis == "marketplace"
-            else {
+        if self._price_basis == "marketplace":
+            prices = {row.marketplace_price for row in rows}
+        elif self._price_basis == "distributor_expected":
+            prices = {row.distributor_price for row in rows}
+        else:
+            prices = {
                 (
                     row.initial_quote_with_promo,
                     row.initial_quote_without_promo,
@@ -1102,7 +1104,6 @@ class ScenarioEngine:
                 )
                 for row in rows
             }
-        )
         if len(prices) > 1:
             raise ScenarioError(
                 f"Multiple commercial prices exist for {selector.sku_title}; "
@@ -1119,11 +1120,25 @@ class ScenarioEngine:
             if item.marketplace_price > 0:
                 return money(item.marketplace_price), False
             return Decimal("0.00"), True
+        if self._price_basis == "distributor_expected":
+            if item.distributor_price > 0:
+                return money(item.distributor_price), False
+            return Decimal("0.00"), True
         if promo_eligible and item.initial_quote_with_promo_available:
             return money(item.initial_quote_with_promo), False
         if item.initial_quote_without_promo_available:
             return money(item.initial_quote_without_promo), False
         return Decimal("0.00"), True
+
+    def _price_available(self, item: RateCardItem) -> bool:
+        if self._price_basis == "marketplace":
+            return item.marketplace_price > 0
+        if self._price_basis == "distributor_expected":
+            return item.distributor_price > 0
+        return (
+            item.initial_quote_with_promo_available
+            or item.initial_quote_without_promo_available
+        )
 
     def _new_scenario(
         self,

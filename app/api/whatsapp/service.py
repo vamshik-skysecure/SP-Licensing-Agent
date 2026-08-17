@@ -135,6 +135,24 @@ AFFIRMATIVE_REPLIES = {
     "yes correct",
 }
 
+REQUIREMENT_CONFIRMATION_REPLIES = {
+    "approve",
+    "approved",
+    "confirm",
+    "confirmed",
+    "confirm for pricing",
+    "confirm requirement",
+    "confirm the requirement",
+    "i approve",
+    "i confirm",
+    "it is correct",
+    "proceed with pricing",
+    "yes confirm",
+    "yes confirm for pricing",
+    "yes it is correct",
+    "yes proceed",
+}
+
 CANCEL_REPLIES = {
     "cancel",
     "cancel that",
@@ -847,6 +865,16 @@ class WhatsAppWebhookService:
             return True
 
         if intent.action == "confirm_validation":
+            if (
+                session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION
+                and session.estate is not None
+                and not session.estate.pending_lines
+                and not session.capture_messages
+                and self._pending_confirms_complete_requirement(pending)
+            ):
+                await self._orchestrator.clear_pending_dialogue(sender)
+                await self._confirm_validation(sender)
+                return True
             await self._send_text(
                 sender,
                 "That reply relates to the pending question, so I have not confirmed the "
@@ -868,6 +896,50 @@ class WhatsAppWebhookService:
             original_message=seller_context or message,
         )
         return True
+
+    @staticmethod
+    def _is_requirement_confirmation_reply(message: str) -> bool:
+        reply = " ".join(message.casefold().strip(" ?!.,").split())
+        if reply in AFFIRMATIVE_REPLIES or reply in REQUIREMENT_CONFIRMATION_REPLIES:
+            return True
+        negative_markers = {
+            "cancel",
+            "change",
+            "don't",
+            "dont",
+            "incorrect",
+            "no",
+            "not",
+            "remove",
+            "wrong",
+        }
+        words = set(reply.split())
+        if words & negative_markers:
+            return False
+        return any(
+            marker in words
+            for marker in {"approve", "approved", "confirm", "confirmed", "correct"}
+        )
+
+    @staticmethod
+    def _pending_confirms_complete_requirement(pending: PendingDialogue) -> bool:
+        if pending.kind != "agent_clarification":
+            return False
+        question = " ".join(pending.question.casefold().split())
+        identifies_requirement = any(
+            marker in question
+            for marker in {
+                "captured requirement",
+                "complete requirement",
+                "current requirement",
+                "requirement for",
+            }
+        )
+        requests_approval = any(
+            marker in question
+            for marker in {"confirm", "correct", "approve"}
+        )
+        return identifies_requirement and requests_approval
 
     async def _try_handle_pending_requirement_match(
         self,
@@ -1400,6 +1472,23 @@ class WhatsAppWebhookService:
                 and not lowered.startswith("/")
             ):
                 await self._capture_typed_requirement(sender, command)
+                return
+            if (
+                session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION
+                and session.estate is not None
+                and not session.estate.pending_lines
+                and not session.capture_messages
+                and self._is_requirement_confirmation_reply(command)
+                and (
+                    session.pending_dialogue is None
+                    or self._pending_confirms_complete_requirement(
+                        session.pending_dialogue
+                    )
+                )
+            ):
+                if session.pending_dialogue is not None:
+                    await self._orchestrator.clear_pending_dialogue(sender)
+                await self._confirm_validation(sender)
                 return
             if await self._resolve_pending_dialogue(sender, command, session):
                 return

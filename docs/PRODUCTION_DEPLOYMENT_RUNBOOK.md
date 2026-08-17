@@ -11,14 +11,14 @@ that no second fixed-cost platform is created.
 | `asp-skysecure-microsoft-pricing-agent-dev` | Linux B1, one instance, no deployment slots | Reuse without changing tier. |
 | `skysecure-microsoft-pricing-agent-dev` | Existing Phase 1 Web App | Back up, then replace in place. |
 | `stskysecureprice48eb` | Existing Storage Account | Reuse for pricing, sessions, and durable webhook ingress. |
-| `pricing-workbooks` | Existing container | Preserve Phase 1 workbook and add `active/Microsoft_SKU_V5.0.xlsx`. |
+| `pricing-workbooks` | Existing container | Preserve earlier workbooks and add `active/Microsoft_SKU_V6.0_Distributor.xlsx`. |
 | `licensing-workflows` | Existing container | Store sessions and persisted webhook work. |
 
 No second App Service plan, Web App, Service Bus, Key Vault, Cosmos DB, Log Analytics
 workspace, or Application Insights resource is part of this deployment.
 
 Read-only verification on 2026-08-08 found Blob versioning and Blob soft delete disabled.
-Therefore the Phase 1 workbook must not be overwritten; V5 uses a separate blob name.
+Therefore the Phase 1 and V5 workbooks must not be overwritten; V6 uses a separate blob name.
 
 ## 2. Architecture within the existing resources
 
@@ -64,10 +64,10 @@ Do not replace Phase 1 until a restorable App Service backup is confirmed.
    callback URL for rollback evidence. Never paste secret values into tickets or documents.
 7. Preserve `pricing-workbooks/active/Microsoft_SKU_Active.xlsx` unchanged. It is the older
    Phase 1 workbook and is part of the rollback boundary.
-8. Upload the tested `docs/microsoft_sku_v5.xlsx` as the new blob
-   `pricing-workbooks/active/Microsoft_SKU_V5.0.xlsx` without overwriting the Phase 1 blob.
-9. Record the V5 Blob ETag, last-modified time, size, and SHA-256. Its expected local SHA-256 is
-   `2ea28fe7ac27280144fd161a450a71ed2dd4775c5e4d7cbe259c68aa7f1cc74f`.
+8. Upload the tested `docs/microsoft_sku_v6_distributor.xlsx` as the new blob
+   `pricing-workbooks/active/Microsoft_SKU_V6.0_Distributor.xlsx` without overwriting earlier blobs.
+9. Record the V6 Blob ETag, last-modified time, size, and SHA-256. Its expected local SHA-256 is
+   `0da7ef261d987722e4a8c4af3d6a8fa46ecef5f96f2d01c77ceb2023df8ee86e`.
 
 Stop if no successful App Service backup is available.
 
@@ -166,7 +166,7 @@ Expected readiness evidence:
 Also confirm:
 
 - no unresolved application settings;
-- the current workbook loaded from `active/Microsoft_SKU_V5.0.xlsx`;
+- the current workbook loaded from `active/Microsoft_SKU_V6.0_Distributor.xlsx`;
 - no secret, phone number, raw message, workbook row, or uploaded content appears in logs;
 - memory remains stable after startup.
 
@@ -178,9 +178,8 @@ When the production Meta number and system-user token are available:
    `https://skysecure-microsoft-pricing-agent-dev.azurewebsites.net/api/whatsapp/webhook`.
 2. Enter the same webhook verify token stored in App Service settings.
 3. Verify and save, then subscribe to `messages`.
-4. For the approved public-access deployment, set
-   `WHATSAPP_ALLOW_ALL_SELLERS=true` and leave `WHATSAPP_SELLER_ALLOWLIST` empty.
-   Meta webhook signature verification remains mandatory.
+4. Set `WHATSAPP_ALLOW_ALL_SELLERS=false` and populate `WHATSAPP_SELLER_ALLOWLIST`
+   with the approved E.164 seller numbers. Meta webhook signature verification remains mandatory.
 5. Run text, spreadsheet, image, PDF/Word, and voice capture using synthetic data.
 6. Confirm correction, seller validation, as-is pricing, optional recommendations/changes,
    revised pricing, final validation, and customer-ready PDF delivery.

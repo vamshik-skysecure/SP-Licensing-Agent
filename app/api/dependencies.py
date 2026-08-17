@@ -127,15 +127,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         migration_seeds,
         apply_bundle_rules=settings.workflow_mode == "scenario_comparison",
         price_basis=(
-            "marketplace"
+            settings.simple_price_basis
             if settings.workflow_mode == "simple_pricing"
             else "partner_best_offer"
         ),
     )
     catalog = await rate_cards.get()
-    if settings.workflow_mode == "simple_pricing" and not any(
-        item.marketplace_price > 0 for item in catalog.items
-    ):
+    simple_prices_available = any(
+        (
+            item.distributor_price > 0
+            if settings.simple_price_basis == "distributor_expected"
+            else item.marketplace_price > 0
+        )
+        for item in catalog.items
+    )
+    if settings.workflow_mode == "simple_pricing" and not simple_prices_available:
         raise ValueError(
             "The simple pricing workflow requires a populated current-price column."
         )

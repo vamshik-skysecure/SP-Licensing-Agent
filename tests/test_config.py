@@ -102,15 +102,16 @@ class StorageModeSettingsTests(unittest.TestCase):
                 whatsapp_seller_allowlist="",
             )
 
-    def test_default_local_workflow_uses_v5_final_output(self) -> None:
+    def test_default_local_workflow_uses_v6_distributor_outcome(self) -> None:
         settings = Settings(_env_file=None)
 
         self.assertEqual(settings.workflow_mode, "simple_pricing")
+        self.assertEqual(settings.simple_price_basis, "distributor_expected")
         self.assertEqual(
             settings.rate_card_local_path.as_posix(),
-            "docs/microsoft_sku_v5.xlsx",
+            "docs/microsoft_sku_v6_distributor.xlsx",
         )
-        self.assertEqual(settings.rate_card_sheet_name, "Final Output Sheet")
+        self.assertEqual(settings.rate_card_sheet_name, "Outcome Sheet")
 
     def test_local_mode_selects_workbook_and_memory(self) -> None:
         settings = Settings(

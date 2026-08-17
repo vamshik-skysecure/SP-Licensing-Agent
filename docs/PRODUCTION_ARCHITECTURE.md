@@ -4,7 +4,7 @@
 
 The draft PRD's domain boundaries are retained, but the seven-agent supervisor design is replaced by a deterministic persisted workflow.
 
-This workflow is commercial software: SKU identity, quantities, Marketplace prices, and totals must be reproducible and auditable. The official OpenAI Python SDK provides structured natural-language intent, multimodal requirement extraction, and bounded voice transcription, but the model is not an authority for SKU matching, price selection, calculations, or commercial state changes. Deterministic command handlers remain available as operational fallbacks.
+This workflow is commercial software: SKU identity, quantities, approved distributor prices, and totals must be reproducible and auditable. The official OpenAI Python SDK provides structured natural-language intent, multimodal requirement extraction, and bounded voice transcription, but the model is not an authority for SKU matching, price selection, calculations, or commercial state changes. Deterministic command handlers remain available as operational fallbacks.
 
 The linked `ssp-v2-boilerplate` repository was assessed and is not used as a code base. Its own guide identifies it as an early scaffold with empty prompts/tools, an invalid model wrapper, no graph, no WhatsApp route, no tests, and no production wiring. Its data-contract and acceptance-criteria ideas informed this implementation.
 
@@ -36,7 +36,7 @@ Analysis      Scenario/pricing   Output renderers
               |
        Azure Blob JSON state (ETag concurrency)
 
-Azure Blob Storage -> maintained Excel workbook -> Final Output Sheet cache
+Azure Blob Storage -> maintained V6 Distributor workbook -> Outcome Sheet cache
 ```
 
 ## Why this differs from the draft PRD
@@ -46,7 +46,7 @@ Azure Blob Storage -> maintained Excel workbook -> Final Output Sheet cache
 - The edit operation must recalculate and persist atomically. That belongs in one application transaction, not a conversation between agents.
 - The existing workflow Blob container provides durable webhook ingress because FastAPI background tasks are not durable across process restarts or deployments. This satisfies the manager's no-new-service constraint.
 - Managed Identity is the production default for Azure data services.
-- The rate-card workbook is read directly, so the business can update the Final Output Sheet without coordinating changes with hidden Phase 1 code.
+- The rate-card workbook is read directly, so the business can update the Outcome Sheet without coordinating changes with hidden Phase 1 code.
 
 The intent adapter uses a strict JSON Schema and receives only the seller message plus a
 bounded workflow summary. The capture adapter receives an individual seller-supplied file,
@@ -71,10 +71,10 @@ LangGraph can still be introduced later if genuine long-running human interrupts
   custom configurations when `RUNTIME_PROFILE` is unset.
 
 - One maintained `.xlsx` workbook in the private `pricing-workbooks` container, with
-  the reviewed V5 version published as `active/Microsoft_SKU_V5.0.xlsx`. The older
+  the reviewed V6 Distributor version published as `active/Microsoft_SKU_V6.0_Distributor.xlsx`. The older
   `Microsoft_SKU_Active.xlsx` remains unchanged for Phase 1 rollback.
-- Current local workbook: `docs/microsoft_sku_v5.xlsx`.
-- Configured worksheet: `Final Output Sheet`.
+- Current local workbook: `docs/microsoft_sku_v6_distributor.xlsx`.
+- Configured worksheet: `Outcome Sheet` (the final workbook sheet).
 - Application caches the parsed catalog for five minutes and records the Blob ETag/content digest as the rate-card version.
 - A separate private workflow container in the same Storage account holds one JSON blob per hashed seller thread.
 - Blob ETags and `If-Match` conditional writes provide optimistic concurrency and prevent lost updates.
@@ -84,9 +84,9 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 
 ### Excel-only commercial authority
 
-- `Final Output Sheet` is the licensing catalogue and pricing source.
-- `Price on Marketplace` is the sole price basis for `WORKFLOW_MODE=simple_pricing`, the
-  current default. Partner Best Offer, distributor price, margin, and promotion columns are
+- The final `Outcome Sheet` is the licensing catalogue and pricing source.
+- `Expectec Disti Price to Skysecure` is the sole price basis for `WORKFLOW_MODE=simple_pricing`, the
+  current default. ERP, UnitPrice, Partner Best Offer, margin, and promotion columns are
   not used or exposed in this workflow.
 - The three-step state machine is capture/reconfirm, show the as-is cost, then optionally
   revise SKUs/quantities and compare the revised value with the immutable as-is snapshot.
@@ -115,8 +115,8 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 
 - Verify `X-Hub-Signature-256` before parsing or queuing a webhook.
 - Keep Meta `X-Hub-Signature-256` verification mandatory for every inbound request.
-- Seller access is fail-closed by default. This deployment explicitly enables public access
-  with `WHATSAPP_ALLOW_ALL_SELLERS=true`; an allowlist can be restored without changing code.
+- Seller access is fail-closed. This deployment uses `WHATSAPP_ALLOW_ALL_SELLERS=false`
+  with an explicit E.164 seller allowlist; other senders are ignored without entering the workflow.
 - Use App Service/Container App Managed Identity with these data-plane roles:
   - Storage Blob Data Reader scoped to the pricing container
   - Storage Blob Data Contributor scoped to the workflow container
@@ -135,7 +135,7 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 
 ## Workbook boundary
 
-No further reference-licensing dataset is required for as-is Marketplace pricing. A seller
+No further reference-licensing dataset is required for as-is distributor pricing. A seller
 can provide each opportunity as text, voice, image, spreadsheet, Word document, or PDF.
 The application deliberately does not automate entitlement-level or promotion decisions
 that the workbook/rule sheet cannot support; it asks for a seller-directed target instead.

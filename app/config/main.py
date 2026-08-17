@@ -38,13 +38,16 @@ class Settings(BaseSettings):
         "upgrade_comparison",
         "scenario_comparison",
     ] = "simple_pricing"
+    simple_price_basis: Literal["marketplace", "distributor_expected"] = (
+        "distributor_expected"
+    )
     rate_card_backend: Literal["local", "azure_blob"] = "local"
-    rate_card_local_path: Path = Path("docs/microsoft_sku_v5.xlsx")
-    rate_card_sheet_name: str = "Final Output Sheet"
+    rate_card_local_path: Path = Path("docs/microsoft_sku_v6_distributor.xlsx")
+    rate_card_sheet_name: str = "Outcome Sheet"
     rate_card_storage_account_url: str | None = None
     rate_card_storage_connection_string: str | None = None
     rate_card_container_name: str = "pricing-workbooks"
-    rate_card_blob_name: str = "active/Microsoft_SKU_V5.0.xlsx"
+    rate_card_blob_name: str = "active/Microsoft_SKU_V6.0_Distributor.xlsx"
 
     workflow_store_backend: Literal["memory", "azure_blob"] = "memory"
     workflow_blob_container_name: str = "licensing-workflows"

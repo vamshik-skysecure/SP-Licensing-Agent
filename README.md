@@ -1,6 +1,6 @@
 # SkySecure Microsoft Licensing Advisor
 
-Production-oriented WhatsApp workflow for capturing a seller's Microsoft CSP licensing requirement, confirming it, pricing it as submitted, and optionally modelling SKU or quantity changes. The default `simple_pricing` mode implements the CEO-approved three-step first release and uses `Price on Marketplace` from the FYD `Final Output Sheet`.
+Production-oriented WhatsApp workflow for capturing a seller's Microsoft CSP licensing requirement, confirming it, pricing it as submitted, and optionally modelling SKU or quantity changes. The default `simple_pricing` mode implements the CEO-approved three-step first release and uses the approved `Expectec Disti Price to Skysecure` column from the V6 Distributor workbook's final `Outcome Sheet`.
 
 The active workflow is self-contained. It does not call the legacy Phase 1 pricing-agent API.
 
@@ -9,7 +9,7 @@ The active workflow is self-contained. It does not call the legacy Phase 1 prici
 1. Meta sends a signed WhatsApp webhook.
 2. Production ingress persists the webhook in the existing workflow Blob container before acknowledgement; local development uses an in-process dispatcher.
 3. The application accepts natural-language text, voice notes, screenshots/images, or common spreadsheet/document uploads and normalizes them into one strict requirement schema.
-4. The `Final Output Sheet` is loaded from Microsoft SKU V5.0 locally or from the configured Blob workbook.
+4. The final `Outcome Sheet` is loaded from Microsoft SKU V6.0 Distributor locally or from the configured Blob workbook.
 5. The official OpenAI Python SDK and Responses API provide structured intent routing and bounded multimodal extraction; the Audio Transcriptions API handles voice notes.
 6. SKU matching, price selection, edits, and totals run deterministically from that catalogue.
 7. Normalized state and proposal revisions are persisted as versioned JSON in Azure Blob Storage in production.
@@ -27,7 +27,7 @@ state. Standard CSV/XLSX layouts are parsed deterministically without an OpenAI 
 - It requires explicit seller validation of the captured SKU names, quantities, terms, and
   dates before it performs any pricing. The seller can add, replace, remove, or change a line
   while this gate is open; fuzzy add/replace matches require an explicit candidate choice.
-- After confirmation, it displays SKU, quantity, billing term, Marketplace unit price, line
+- After confirmation, it displays SKU, quantity, billing term, approved unit price, line
   total, and overall value. It intentionally omits 0% discount, distributor discount, margin,
   adjustment, promotion-selection questions, and internal calculations.
 - Scenario and comparison responses use the same mobile-first PNG table format. If image
@@ -52,9 +52,9 @@ state. Standard CSV/XLSX layouts are parsed deterministically without an OpenAI 
   as-is value, revised value, difference, replacement/addition notes, and pricing source.
 - `scenario_comparison` remains an optional future mode for business-approved migration
   rules; it is not used by the default workflow.
-- Promotion, term, billing, and segment changes reprice through the same deterministic Final Output Sheet lookup. Currency conversion rejects
+- Term and billing changes reprice through the same deterministic Outcome Sheet lookup. Currency conversion rejects
   unsupported conversion because the workbook contains no currency or FX table.
-- A blank or zero `Price on Marketplace` is displayed and serialized as
+- A blank or zero approved distributor price is displayed and serialized as
   `price_unavailable` and is excluded from the total; it is never silently presented as a
   free product.
 - An unknown bundle relationship is never invented. In the default mode, the add-on remains
@@ -63,8 +63,8 @@ state. Standard CSV/XLSX layouts are parsed deterministically without an OpenAI 
   from real pricebook families. Rows record official, third-party, or unverified
   provenance, but every seed remains `approved: false`; unapproved rows are displayed as
   suggestions and never auto-applied.
-- `Price on Marketplace` is the sole seller price basis in the current release. Partner Best
-  Offer, margin, and promotional workbook fields are not used or displayed. The upcoming
+- `Expectec Disti Price to Skysecure` is the sole price basis in the current release. ERP,
+  UnitPrice, Partner Best Offer, margin, and promotional workbook fields are not used or displayed. The upcoming
   business rule sheet is intentionally not simulated: generic recommendation requests ask
   for the source line, required capability/target SKU, and user count instead of inventing
   eligibility or entitlement logic.
@@ -83,8 +83,9 @@ Use the single storage switch in `.env`:
 ```dotenv
 STORAGE_MODE=local
 WORKFLOW_MODE=simple_pricing
-RATE_CARD_LOCAL_PATH=docs/microsoft_sku_v5.xlsx
-RATE_CARD_SHEET_NAME=Final Output Sheet
+RATE_CARD_LOCAL_PATH=docs/microsoft_sku_v6_distributor.xlsx
+RATE_CARD_SHEET_NAME=Outcome Sheet
+SIMPLE_PRICE_BASIS=distributor_expected
 AI_INTENT_BACKEND=openai
 REQUIREMENT_CAPTURE_BACKEND=openai
 OPENAI_MODEL=gpt-5.6-luna
@@ -116,9 +117,9 @@ Run verification:
 
 Production should set `STORAGE_MODE=azure_blob`.
 
-Before switching modes, publish the reviewed V5 workbook to
-`pricing-workbooks/active/Microsoft_SKU_V5.0.xlsx` and confirm its
-`Final Output Sheet` checksum/version. This implementation does not modify that Blob during
+Before switching modes, publish the reviewed V6 Distributor workbook to
+`pricing-workbooks/active/Microsoft_SKU_V6.0_Distributor.xlsx` and confirm its
+`Outcome Sheet` checksum/version. This implementation does not modify that Blob during
 local UAT.
 
 `ENVIRONMENT=production` refuses to start unless:

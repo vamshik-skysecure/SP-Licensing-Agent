@@ -23,6 +23,7 @@ from app.core.licensing.models import (
     EstateStatus,
     LicenseEstate,
     NormalizedLicenseLine,
+    PendingDialogue,
     ParsedLicenseRow,
     ScenarioType,
     WorkflowStage,
@@ -411,6 +412,135 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "SkySecure Microsoft Licensing Advisor",
             client.messages[0].text.body,  # type: ignore[attr-defined]
         )
+
+    async def test_complete_requirement_accepts_swathi_confirmation_phrases(
+        self,
+    ) -> None:
+        class InterpreterThatMustNotBeCalled:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def interpret(self, *_: object, **__: object) -> object:
+                self.calls += 1
+                return SimpleNamespace(
+                    action="clarify",
+                    clarification="Please confirm whether the captured requirement is correct.",
+                )
+
+            async def close(self) -> None:
+                return None
+
+        for index, reply in enumerate(
+            ("Yes", "Confirm", "yes confirm for pricing", "yes it is correct"),
+            start=1,
+        ):
+            with self.subTest(reply=reply):
+                sender = f"swathi-confirm-{index}"
+                await self.orchestrator.analyze_document(
+                    sender=sender,
+                    filename=CUSTOMER.name,
+                    content=CUSTOMER.read_bytes(),
+                )
+                await self.orchestrator.request_requirement_validation(sender)
+                interpreter = InterpreterThatMustNotBeCalled()
+                client = FakeWhatsAppClient(
+                    WhatsAppMedia(b"", "unused", "text/plain")
+                )
+                service = WhatsAppWebhookService(
+                    client,  # type: ignore[arg-type]
+                    self.orchestrator,
+                    ServiceConfiguration(
+                        frozenset(),
+                        10 * 1024 * 1024,
+                        allow_all_sellers=True,
+                        workflow_mode="simple_pricing",
+                    ),
+                    intent_interpreter=interpreter,  # type: ignore[arg-type]
+                )
+
+                await service._handle_text(sender, reply)
+
+                session = await self.orchestrator.get_session(sender)
+                assert session is not None
+                self.assertIsNotNone(session.confirmed_as_is)
+                self.assertEqual(interpreter.calls, 0)
+                self.assertTrue(
+                    any(
+                        item["filename"] == "as-is-commercial.pdf"
+                        for item in client.documents
+                    )
+                )
+
+    async def test_existing_requirement_confirmation_dialogue_recovers(self) -> None:
+        sender = "swathi-stuck-confirmation-recovery"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.set_pending_dialogue(
+            sender,
+            PendingDialogue(
+                kind="agent_clarification",
+                question=(
+                    "Please confirm whether the captured requirement for 1 Power BI "
+                    "Premium Per User licence is correct."
+                ),
+            ),
+        )
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._handle_text(sender, "yes confirm for pricing")
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNone(session.pending_dialogue)
+        self.assertIsNotNone(session.confirmed_as_is)
+
+    async def test_yes_does_not_confirm_a_missing_detail_question(self) -> None:
+        sender = "missing-detail-remains-protected"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.set_pending_dialogue(
+            sender,
+            PendingDialogue(
+                kind="agent_clarification",
+                question="How many Power BI Pro licences should I include?",
+            ),
+        )
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._handle_text(sender, "Yes")
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNotNone(session.pending_dialogue)
+        self.assertIsNone(session.confirmed_as_is)
 
     async def test_default_access_rejects_sender_outside_allowlist(self) -> None:
         client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))

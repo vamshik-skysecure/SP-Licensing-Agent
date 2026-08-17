@@ -395,7 +395,12 @@ class RateCardCatalog:
             for row in rows
         )
         priceable = any(
-            row.marketplace_price > 0
+            (
+                row.distributor_price > 0
+                or row.marketplace_price > 0
+                or row.initial_quote_with_promo_available
+                or row.initial_quote_without_promo_available
+            )
             and row.term_duration.casefold() == "p1y"
             and row.billing_plan.casefold() == "annual"
             for row in rows
@@ -621,6 +626,10 @@ _HEADERS = {
     "partnerscostofproduct": "partner_cost",
     "partnerbestoffer": "partner_best_offer",
     "priceonmarketplace": "marketplace_price",
+    # V6.0 currently contains the misspelled "Expectec" header. Support both
+    # spellings so a corrected business workbook does not require a code change.
+    "expectecdistipricetoskysecure": "distributor_price",
+    "expecteddistipricetoskysecure": "distributor_price",
     "initialquotewithpromo": "initial_quote_with_promo",
     "initialquotewithoutpromo": "initial_quote_without_promo",
 }
@@ -679,16 +688,26 @@ def _is_placeholder_identifier(value: str) -> bool:
 
 def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
     iterator = iter(rows)
-    try:
-        raw_headers = next(iterator)
-    except StopIteration as error:
-        raise RateCardError("The rate card is empty.") from error
-
     columns: dict[int, str] = {}
-    for index, header in enumerate(raw_headers):
-        field = _HEADERS.get(_header_key(header))
-        if field:
-            columns[index] = field
+    header_row_number = 0
+    # Business workbooks commonly place a title or blank row above the real
+    # headers. Locate the first complete catalogue header within a bounded area.
+    for candidate_row_number, raw_headers in enumerate(iterator, start=1):
+        candidate_columns = {
+            index: field
+            for index, header in enumerate(raw_headers)
+            if (field := _HEADERS.get(_header_key(header)))
+        }
+        if _BASE_REQUIRED.issubset(candidate_columns.values()):
+            columns = candidate_columns
+            header_row_number = candidate_row_number
+            break
+        if candidate_row_number >= 25:
+            break
+    if not columns:
+        raise RateCardError(
+            "A complete rate-card header was not found in the first 25 rows."
+        )
     available_fields = set(columns.values())
     missing = sorted(_BASE_REQUIRED - available_fields)
     if missing:
@@ -698,26 +717,54 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
         "initial_quote_without_promo",
     }.issubset(available_fields)
     has_final_offer = "partner_best_offer" in available_fields
-    if not has_legacy_quotes and not has_final_offer:
+    has_marketplace_price = "marketplace_price" in available_fields
+    has_distributor_price = "distributor_price" in available_fields
+    if not any(
+        (
+            has_legacy_quotes,
+            has_final_offer,
+            has_marketplace_price,
+            has_distributor_price,
+        )
+    ):
         raise RateCardError(
             "Missing rate-card price columns: provide a supported commercial-price field."
         )
 
     items: list[RateCardItem] = []
-    for row_number, values in enumerate(iterator, start=2):
+    for row_number, values in enumerate(iterator, start=header_row_number + 1):
         record = {
             field: values[index] if index < len(values) else None
             for index, field in columns.items()
         }
         if not any(value not in (None, "") for value in record.values()):
             continue
-        for field in ("product_id", "sku_id", "sku_title", "term_duration", "billing_plan"):
+        # V6 includes rows without Microsoft ProductId/SkuId. Retain them as
+        # name-only catalogue entries; an empty identifier is never invented or
+        # displayed. Duplicate same-name commercial prices remain ambiguous and
+        # are rejected by ScenarioEngine rather than selected silently.
+        for field in ("product_id", "sku_id"):
             raw_value = record.get(field)
-            record[field] = (
-                "" if raw_value in (None, "") else str(raw_value).strip()
-            )
+            record[field] = "" if raw_value in (None, "") else str(raw_value).strip()
+        for field in ("sku_title", "billing_plan"):
+            raw_value = record.get(field)
+            record[field] = "" if raw_value in (None, "") else str(raw_value).strip()
             if not record[field]:
                 raise RateCardError(f"Rate-card row {row_number} has an empty {field}.")
+        raw_term = record.get("term_duration")
+        record["term_duration"] = (
+            str(raw_term).strip()
+            if raw_term not in (None, "")
+            else (
+                "Perpetual"
+                if record["billing_plan"].casefold() in {"onetime", "one time"}
+                else ""
+            )
+        )
+        if not record["term_duration"]:
+            raise RateCardError(
+                f"Rate-card row {row_number} has an empty term_duration."
+            )
 
         # Microsoft SKU V5.0 makes the maintained Final Output Sheet authoritative.
         # Its direct seller offer is the quoted commercial value. Promotional rows are
@@ -757,6 +804,7 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
             "partner_cost",
             "partner_best_offer",
             "marketplace_price",
+            "distributor_price",
             "initial_quote_with_promo",
             "initial_quote_without_promo",
         ):
