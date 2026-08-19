@@ -40,18 +40,18 @@ jobs:
           app-name: ${{ vars.AZURE_WEBAPP_NAME }}
           package: release.zip
 
-      - name: Apply approved public WhatsApp access mode
+      - name: Apply five-minute inactive-session expiry
         shell: bash
         run: |
           az webapp config appsettings set \
             --resource-group rg-skysecure-microsoft-pricing-agent-dev \
             --name "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --settings WHATSAPP_ALLOW_ALL_SELLERS=true \
+            --settings SESSION_TTL_MINUTES=5 \
             --output none
           az webapp config appsettings delete \
             --resource-group rg-skysecure-microsoft-pricing-agent-dev \
             --name "${{ vars.AZURE_WEBAPP_NAME }}" \
-            --setting-names WHATSAPP_SELLER_ALLOWLIST \
+            --setting-names SESSION_TTL_HOURS \
             --output none
 
       - name: Restart and verify application health
