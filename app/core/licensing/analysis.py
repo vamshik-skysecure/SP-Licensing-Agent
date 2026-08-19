@@ -203,7 +203,7 @@ class LicenseAnalyzer:
             row.product_title,
             product_id=row.product_id,
             sku_id=row.sku_id,
-            limit=3,
+            limit=None,
         )
         selected = None
         method: str = "unresolved"

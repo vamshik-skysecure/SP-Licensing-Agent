@@ -105,12 +105,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             prefix=settings.workflow_blob_prefix,
             account_url=settings.rate_card_storage_account_url,
             connection_string=settings.rate_card_storage_connection_string,
-            session_ttl_hours=settings.session_ttl_hours,
+            session_ttl_minutes=settings.session_ttl_minutes,
         )
         await blob_store.connect()
         workflow_store = blob_store
     else:
-        workflow_store = InMemoryWorkflowStore()
+        workflow_store = InMemoryWorkflowStore(
+            session_ttl_minutes=settings.session_ttl_minutes,
+        )
 
     analyzer = LicenseAnalyzer(
         rate_cards,

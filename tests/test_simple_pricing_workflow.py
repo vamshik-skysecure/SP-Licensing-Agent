@@ -1,5 +1,6 @@
 import re
 import unittest
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -413,6 +414,56 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             client.messages[0].text.body,  # type: ignore[attr-defined]
         )
 
+    async def test_five_minute_inactivity_starts_a_clean_requirement(self) -> None:
+        sender = "expired-session-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        thread_id = self.orchestrator.thread_id(sender)
+        session, version = await self.store.get(thread_id)
+        assert session is not None and version is not None
+        expired = session.model_copy(
+            update={"updated_at": datetime.now(UTC) - timedelta(minutes=6)}
+        )
+        await self.store.save(expired, version)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "message-after-expiry",
+                    "from": sender,
+                    "type": "text",
+                    "text": {"body": "Hi"},
+                }
+            )
+        )
+
+        fresh = await self.orchestrator.get_session(sender)
+        assert fresh is not None
+        self.assertIsNone(fresh.estate)
+        self.assertEqual(fresh.scenarios, {})
+        self.assertIsNone(fresh.confirmed_as_is)
+        bodies = [
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+        ]
+        self.assertIn("expired after five minutes", bodies[0])
+        self.assertTrue(any("Send the first requirement" in body for body in bodies))
+
     async def test_complete_requirement_accepts_swathi_confirmation_phrases(
         self,
     ) -> None:
@@ -724,14 +775,15 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         line = estate.lines[0]
         self.assertEqual(line.match_method, "unresolved")
         self.assertIsNone(line.sku_title)
+        candidate_titles = [candidate.sku_title for candidate in line.candidates]
+        self.assertGreater(len(candidate_titles), 3)
         self.assertEqual(
-            [candidate.sku_title for candidate in line.candidates],
-            [
-                "Microsoft 365 E5 without Audio Conferencing",
-                "Office 365 E5 without Audio Conferencing",
-                "Enterprise Mobility + Security E5",
-            ],
+            candidate_titles[0],
+            "Microsoft 365 E5 without Audio Conferencing",
         )
+        self.assertIn("Office 365 E5 without Audio Conferencing", candidate_titles)
+        self.assertIn("Enterprise Mobility + Security E5", candidate_titles)
+        self.assertTrue(all("E5" in title for title in candidate_titles))
         self.assertFalse(
             any("Dynamics 365" in candidate.sku_title for candidate in line.candidates)
         )
@@ -799,8 +851,8 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.estate.lines[0].renewal_quantity, 10)
         self.assertEqual(session.stage, WorkflowStage.AWAITING_INITIAL_VALIDATION)
 
-    async def test_single_e1_candidate_supports_unsure_and_full_name_confirmation(self) -> None:
-        sender = "single-e1-candidate-seller"
+    async def test_all_e1_candidates_support_unsure_and_full_name_confirmation(self) -> None:
+        sender = "all-e1-candidates-seller"
         estate = await self.orchestrator.analyze_extracted(
             sender=sender,
             source_file="seller-message",
@@ -817,7 +869,13 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [candidate.sku_title for candidate in estate.pending_lines[0].candidates],
-            ["Office 365 E1"],
+            [
+                "Office 365 E1",
+                "Office 365 E1 Plus",
+                "Office 365 E1 (no Teams)",
+                "Office 365 E1 Plus (No Teams)",
+                "Office 365 E1 (Non-Profit Pricing)",
+            ],
         )
         client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
         service = WhatsAppWebhookService(
@@ -837,15 +895,16 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             for message in client.messages
             if getattr(message, "text", None) is not None
         )
-        self.assertIn("one close catalogue match", initial_text)
-        self.assertNotIn("more than one possible match", initial_text)
+        self.assertNotIn("one close catalogue match", initial_text)
+        self.assertIn("more than one possible match", initial_text)
         self.assertIn("1. Office 365 E1", initial_text)
+        self.assertIn("5. Office 365 E1 (Non-Profit Pricing)", initial_text)
 
         await service._handle_text(sender, "I don't know")
         unsure_text = client.messages[-2].text.body  # type: ignore[attr-defined]
-        self.assertIn("No problem — I can help", unsure_text)
+        self.assertIn("No problem — I will help narrow it down", unsure_text)
         self.assertIn("Office 365 E1", unsure_text)
-        self.assertIn("10 licences", unsure_text)
+        self.assertIn("Office 365 E1 Plus", unsure_text)
 
         await service._handle_text(sender, "Office 365 E1")
         session = await self.orchestrator.get_session(sender)
@@ -1095,12 +1154,24 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         await service._send_sku_change_result(sender, pending_result)
-        option_text = client.messages[-2].text.body  # type: ignore[attr-defined]
-        option_list = client.messages[-1].interactive  # type: ignore[attr-defined]
+        option_text = next(
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+        )
+        option_rows = [
+            row
+            for message in client.messages
+            if getattr(message, "interactive", None) is not None
+            for section in message.interactive.action.sections  # type: ignore[attr-defined]
+            for row in section.rows
+        ]
+        selected_row = next(row for row in option_rows if row.id.endswith("|2"))
         self.assertIn(f"Product ID: {selected.product_id}", option_text)
+        self.assertIn(f"SKU ID: {selected.sku_id}", option_text)
         self.assertIn(
-            f"Product ID {selected.product_id}",
-            option_list.action.sections[0].rows[1].description,
+            f"ID {selected.product_id} / {selected.sku_id}",
+            selected_row.description,
         )
 
         await service._handle_interactive(

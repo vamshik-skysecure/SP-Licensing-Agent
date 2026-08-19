@@ -97,6 +97,9 @@ MAX_AUDIO_SECONDS=300
 `STORAGE_MODE=azure_blob` to use the configured Blob workbook and Blob workflow
 container. `STORAGE_MODE` overrides the lower-level `RATE_CARD_BACKEND` and
 `WORKFLOW_STORE_BACKEND` values; omit it only for backward-compatible mixed setups.
+Both stores expire inactive seller context after `SESSION_TTL_MINUTES` (five minutes by
+default). The next WhatsApp message starts a fresh requirement and receives an explicit
+expiry notice; previous proposal details are not reused.
 
 ```powershell
 python -m venv .venv

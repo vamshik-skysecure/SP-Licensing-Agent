@@ -940,7 +940,7 @@ class BlobWorkflowStoreTests(unittest.IsolatedAsyncioTestCase):
         store = AzureBlobWorkflowStore(
             container_name="unused",
             container_client=container,
-            session_ttl_hours=1,
+            session_ttl_minutes=5,
         )
         await store.connect()
         session = WorkflowSession(
@@ -960,7 +960,7 @@ class BlobWorkflowStoreTests(unittest.IsolatedAsyncioTestCase):
             await store.save(session, version_1)
 
         expired = session.model_copy(
-            update={"updated_at": datetime.now(UTC) - timedelta(hours=2)}
+            update={"updated_at": datetime.now(UTC) - timedelta(minutes=6)}
         )
         await store.save(expired, version_2)
         loaded, expired_version = await store.get("thread-1")

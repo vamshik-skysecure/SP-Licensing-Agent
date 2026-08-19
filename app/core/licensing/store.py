@@ -24,9 +24,10 @@ class WorkflowStore(Protocol):
 
 
 class InMemoryWorkflowStore:
-    def __init__(self) -> None:
+    def __init__(self, *, session_ttl_minutes: int = 5) -> None:
         self._documents: dict[str, tuple[WorkflowSession, int]] = {}
         self._lock = asyncio.Lock()
+        self._session_ttl = timedelta(minutes=session_ttl_minutes)
 
     async def get(self, thread_id: str) -> tuple[WorkflowSession | None, str | None]:
         async with self._lock:
@@ -34,6 +35,10 @@ class InMemoryWorkflowStore:
             if stored is None:
                 return None, None
             session, version = stored
+            if session.updated_at + self._session_ttl <= datetime.now(UTC):
+                # Preserve the version so the orchestrator can atomically replace the
+                # expired state with a fresh session instead of reviving old context.
+                return None, str(version)
             return session.model_copy(deep=True), str(version)
 
     async def save(
@@ -67,7 +72,7 @@ class AzureBlobWorkflowStore:
         prefix: str = "sessions",
         account_url: str | None = None,
         connection_string: str | None = None,
-        session_ttl_hours: int = 24,
+        session_ttl_minutes: int = 5,
         container_client: Any | None = None,
     ) -> None:
         self._credential = None
@@ -93,7 +98,7 @@ class AzureBlobWorkflowStore:
                 )
             self._container = self._service.get_container_client(container_name)
         self._prefix = prefix.strip("/")
-        self._session_ttl = timedelta(hours=session_ttl_hours)
+        self._session_ttl = timedelta(minutes=session_ttl_minutes)
 
     async def connect(self) -> None:
         await self._container.get_container_properties()

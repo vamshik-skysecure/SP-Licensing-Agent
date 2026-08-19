@@ -146,6 +146,16 @@ _VARIANT_MARKERS = (
     "add on",
 )
 _REQUIRED_QUERY_QUALIFIERS = frozenset({"premium", "studio"})
+_DEFENDER_WORKLOAD_MARKERS = (
+    ("vulnerability management", "vulnerability-management"),
+    ("office 365", "office-365"),
+    ("cloud apps", "cloud-apps"),
+    ("endpoint", "endpoint"),
+    ("identity", "identity"),
+    ("iot", "iot"),
+    ("business", "business"),
+    ("purview", "purview"),
+)
 _FAMILY_MARKERS = (
     # Specific product families must precede the suite names embedded in their
     # titles (for example, Defender for Office 365 and Microsoft 365 Copilot).
@@ -177,6 +187,33 @@ _AMBIGUOUS_TIER_FAMILY_PRIORITY = {
 
 def _tier_tokens(normalized: str) -> set[str]:
     return set(re.findall(r"\b(?:a|e|f)\d+\b", normalized))
+
+
+def _plan_tokens(normalized: str) -> set[str]:
+    """Canonicalize spoken plan wording without changing the display title.
+
+    Microsoft uses both ``Plan 2`` and ``P2`` across catalogue families. ``F2`` is
+    a separate frontline licence and must never satisfy a seller request for Plan 2.
+    """
+
+    result = {
+        f"{prefix}{number}"
+        for prefix, number in re.findall(r"\b([pf])\s*([0-9]+)\b", normalized)
+    }
+    result.update(
+        f"p{number}" for number in re.findall(r"\bplan\s+([0-9]+)\b", normalized)
+    )
+    return result
+
+
+def _defender_workloads(normalized: str) -> set[str]:
+    if "defender" not in normalized:
+        return set()
+    return {
+        workload
+        for marker, workload in _DEFENDER_WORKLOAD_MARKERS
+        if marker in normalized
+    }
 
 
 def _product_family_key(normalized: str) -> str | None:
@@ -251,7 +288,7 @@ class RateCardCatalog:
         *,
         product_id: str | None = None,
         sku_id: str | None = None,
-        limit: int = 3,
+        limit: int | None = 3,
     ) -> list[SkuMatchCandidate]:
         if (
             product_id
@@ -273,10 +310,11 @@ class RateCardCatalog:
                     if normalize_product_title(identity.sku_title) == normalized_query
                 ]
                 if exact_title:
-                    return [
+                    matches = [
                         self._candidate(identity, 100.0)
-                        for identity in exact_title[:limit]
+                        for identity in exact_title
                     ]
+                    return matches if limit is None else matches[:limit]
                 if len(exact_ids) == 1:
                     return [self._candidate(exact_ids[0], 100.0)]
                 best = max(
@@ -295,14 +333,24 @@ class RateCardCatalog:
             if title == normalized
         ]
         if exact:
-            # A workbook can expose the same display title under monthly and annual
-            # SKU identities. The seller cannot distinguish identical labels, so use
-            # the maintained annual Commercial identity when one exists.
-            return [self._candidate(self._preferred_identity(exact), 100.0)]
+            # The same display title can exist under distinct Microsoft Product/SKU
+            # identities. Do not collapse those identities or silently select one;
+            # the seller must see and confirm every maintained catalogue choice.
+            matches = [
+                self._candidate(identity, 100.0)
+                for identity in sorted(exact, key=self._identity_preference)
+            ]
+            if limit is None:
+                return matches
+            # A finite limit is the legacy internal preview API. Keep one preferred
+            # identity there; all seller-facing analysis explicitly requests None.
+            return matches[:1]
 
         query_tokens = set(normalized.split())
         required_qualifiers = query_tokens & _REQUIRED_QUERY_QUALIFIERS
         tiers = _tier_tokens(normalized)
+        requested_plans = _plan_tokens(normalized)
+        requested_defender_workloads = _defender_workloads(normalized)
         query_family = _product_family_key(normalized)
         pool = list(self.identities)
         if tiers:
@@ -329,6 +377,12 @@ class RateCardCatalog:
         for identity in pool:
             title = normalize_product_title(identity.sku_title)
             title_tokens = set(title.split())
+            if requested_plans and not requested_plans.issubset(_plan_tokens(title)):
+                continue
+            if requested_defender_workloads and not requested_defender_workloads.issubset(
+                _defender_workloads(title)
+            ):
+                continue
             if required_qualifiers and not required_qualifiers.issubset(title_tokens):
                 continue
             informative_query = query_tokens - _GENERIC_SKU_TOKENS
@@ -360,18 +414,21 @@ class RateCardCatalog:
         result: list[SkuMatchCandidate] = []
         seen_titles: set[str] = set()
         seen_families: set[str] = set()
-        family_choice = bool(tiers) and not query_family
+        family_preview = limit is not None and bool(tiers) and query_family is None
         for _rank, identity, score in ranked:
+            # Identities are already unique by ProductId + SkuId + title. Unlimited
+            # seller-facing lookups preserve every identity; finite internal previews
+            # retain their historical title/family diversification.
             title_key = normalize_product_title(identity.sku_title)
             family_key = _product_family_key(title_key) or title_key
-            if title_key in seen_titles:
+            if limit is not None and title_key in seen_titles:
                 continue
-            if family_choice and family_key in seen_families:
+            if family_preview and family_key in seen_families:
                 continue
             seen_titles.add(title_key)
             seen_families.add(family_key)
             result.append(self._candidate(identity, score))
-            if len(result) >= limit:
+            if limit is not None and len(result) >= limit:
                 break
         return result
 

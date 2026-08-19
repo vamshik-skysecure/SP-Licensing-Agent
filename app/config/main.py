@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     max_image_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
     max_audio_bytes: int = Field(default=10 * 1024 * 1024, gt=0, le=25 * 1024 * 1024)
     max_audio_seconds: int = Field(default=300, ge=1, le=30 * 60)
-    session_ttl_hours: int = Field(default=24, ge=1, le=24 * 30)
+    session_ttl_minutes: int = Field(default=5, ge=1, le=24 * 60)
 
     log_level: str = "INFO"
     port: int = 8000

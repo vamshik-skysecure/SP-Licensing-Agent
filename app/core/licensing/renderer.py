@@ -89,11 +89,18 @@ def format_pending_matches(estate: LicenseEstate) -> str:
 
 
 def format_sku_candidate(candidate: object) -> str:
-    """Display the exact title plus the seller-useful Microsoft Product ID."""
+    """Display the exact title plus its Microsoft catalogue identity."""
 
     title = str(getattr(candidate, "sku_title", "")).strip()
     product_id = str(getattr(candidate, "product_id", "")).strip()
-    return f"{title} · Product ID: {product_id}" if product_id else title
+    sku_id = str(getattr(candidate, "sku_id", "")).strip()
+    if product_id and sku_id:
+        return f"{title} · Product ID: {product_id} · SKU ID: {sku_id}"
+    if product_id:
+        return f"{title} · Product ID: {product_id}"
+    if sku_id:
+        return f"{title} · SKU ID: {sku_id}"
+    return title
 
 
 def sku_clarification_question(source_title: str, candidates: list[object]) -> str:
@@ -139,10 +146,12 @@ def product_family(title: str) -> str:
         ("dataverse", "Power Platform / Dataverse"),
         ("copilot", "Copilot"),
         ("defender", "Microsoft Defender"),
-        ("teams", "Microsoft Teams"),
         ("azure", "Azure"),
         ("microsoft 365", "Microsoft 365"),
         ("office 365", "Office 365"),
+        # Suite names must win over the "no Teams" qualifier. Otherwise Office
+        # 365 E1 (no Teams) is incorrectly presented as a Teams-family product.
+        ("teams", "Microsoft Teams"),
     )
     for marker, family in rules:
         if marker in normalized:

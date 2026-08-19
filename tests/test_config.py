@@ -107,11 +107,16 @@ class StorageModeSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.workflow_mode, "simple_pricing")
         self.assertEqual(settings.simple_price_basis, "distributor_expected")
+        self.assertEqual(settings.session_ttl_minutes, 5)
         self.assertEqual(
             settings.rate_card_local_path.as_posix(),
             "docs/microsoft_sku_v6_distributor.xlsx",
         )
         self.assertEqual(settings.rate_card_sheet_name, "Outcome Sheet")
+
+    def test_session_ttl_must_be_at_least_one_minute(self) -> None:
+        with self.assertRaises(ValidationError):
+            Settings(_env_file=None, session_ttl_minutes=0)
 
     def test_local_mode_selects_workbook_and_memory(self) -> None:
         settings = Settings(

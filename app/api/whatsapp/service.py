@@ -251,6 +251,14 @@ class WhatsAppWebhookService:
             logger.warning("Unauthorized WhatsApp sender rejected")
             await self._send_text(sender, "This WhatsApp number is not authorized.")
             return
+        expired = await self._orchestrator.reset_expired_session(sender)
+        if expired:
+            await self._send_text(
+                sender,
+                "Your previous licensing session expired after five minutes of inactivity. "
+                "I have started a new requirement and will not reuse any earlier proposal "
+                "details.",
+            )
         if await self._orchestrator.has_processed(sender, message.id):
             logger.info("Duplicate WhatsApp message ignored message_ref=%s", message_ref)
             return
@@ -952,6 +960,13 @@ class WhatsAppWebhookService:
         pending_lines = session.estate.pending_lines
         reply = " ".join(message.casefold().strip(" ?!.,").split())
 
+        remove_line = re.fullmatch(
+            r"(?:please\s+)?remove(?:\s+that)?\s+(l\d+)(?:\s+.*)?",
+            reply,
+        )
+        if remove_line is not None:
+            await self._remove_requirement_line(sender, remove_line.group(1))
+            return True
         if reply in UNCERTAIN_REPLIES:
             await self._send_uncertain_requirement_match(sender, pending_lines[0])
             return True
@@ -1033,7 +1048,21 @@ class WhatsAppWebhookService:
             ):
                 await self._send_uncertain_requirement_match(sender, pending_lines[0])
                 return True
-        return False
+        # An unresolved catalogue choice is a hard workflow gate. Do not pass free
+        # text to the intent model, where a plan number such as "Plan 2" could be
+        # mistaken for "Option 2". Keep showing the complete deterministic choices
+        # until the seller makes an explicit numbered, interactive, or exact-title
+        # selection.
+        if len(pending_lines) == 1:
+            await self._send_uncertain_requirement_match(sender, pending_lines[0])
+        else:
+            await self._send_text(
+                sender,
+                "Please identify the pending line first, then choose one of its exact "
+                "catalogue products. No product has been selected.",
+            )
+            await self._send_pending_match_requests(sender, session.estate)
+        return True
 
     async def _try_handle_pending_sku_change_reply(
         self,
@@ -1099,7 +1128,16 @@ class WhatsAppWebhookService:
         elif reply in AFFIRMATIVE_REPLIES and len(pending.candidates) == 1:
             number = 1
         if number is None or number < 1 or number > len(pending.candidates):
-            return False
+            # Keep add/replace choices inside the same deterministic gate. A later
+            # language-model pass must not turn the "2" in a plan name into option 2.
+            await self._send_sku_change_result(
+                sender,
+                SkuChangeResult(
+                    state="confirmation_required",
+                    confirmation=pending,
+                ),
+            )
+            return True
         result = await self._orchestrator.confirm_sku_change(sender, number)
         await self._send_sku_change_result(sender, result)
         return True
@@ -1236,30 +1274,43 @@ class WhatsAppWebhookService:
         pending_lines: list,
     ) -> None:
         for line in pending_lines:
-            rows = [
-                InteractiveRow(
-                    id=f"licensing|match_confirm|{line.line_id}|{index}",
-                    title=f"{line.line_id} · Option {index}",
-                    description=(
-                        f"Product ID {candidate.product_id} · {candidate.sku_title}"
-                    )[:72],
+            total = len(line.candidates)
+            for offset in range(0, total, 10):
+                page = line.candidates[offset : offset + 10]
+                rows = [
+                    InteractiveRow(
+                        id=(
+                            f"licensing|match_confirm|{line.line_id}|"
+                            f"{offset + page_index}"
+                        ),
+                        title=f"{line.line_id} · Option {offset + page_index}",
+                        description=self._candidate_row_description(candidate),
+                    )
+                    for page_index, candidate in enumerate(page, start=1)
+                ]
+                first = offset + 1
+                last = offset + len(page)
+                await self._send_interactive(
+                    sender,
+                    InteractiveList(
+                        body=InteractiveText(
+                            text=(
+                                f"Select the exact product for {line.line_id}. "
+                                f"Options {first}-{last} of {total}; full names are shown "
+                                "in the preceding message."
+                            )
+                        ),
+                        action=InteractiveListAction(
+                            button="Choose product",
+                            sections=[
+                                InteractiveSection(
+                                    title=f"Options {first}-{last}",
+                                    rows=rows,
+                                )
+                            ],
+                        ),
+                    ),
                 )
-                for index, candidate in enumerate(line.candidates, start=1)
-            ]
-            if not rows:
-                continue
-            await self._send_interactive(
-                sender,
-                InteractiveList(
-                    body=InteractiveText(
-                        text=f"Select the exact product for {line.line_id}."
-                    ),
-                    action=InteractiveListAction(
-                        button="Choose product",
-                        sections=[InteractiveSection(title="Available matches", rows=rows)],
-                    ),
-                ),
-            )
 
     async def _remove_requirement_line(self, sender: str, line_id: str) -> None:
         normalized_id = line_id.strip().upper()
@@ -2584,18 +2635,8 @@ class WhatsAppWebhookService:
                 pending.candidates,
             ),
         ]
-        rows: list[InteractiveRow] = []
         for index, candidate in enumerate(pending.candidates, start=1):
             lines.append(f"{index}. {format_sku_candidate(candidate)}")
-            rows.append(
-                InteractiveRow(
-                    id=f"licensing|sku_confirm|{pending.id}|{index}",
-                    title=f"Option {index}",
-                    description=(
-                        f"Product ID {candidate.product_id} · {candidate.sku_title}"
-                    )[:72],
-                )
-            )
         lines.extend(
             [
                 "",
@@ -2604,18 +2645,49 @@ class WhatsAppWebhookService:
             ]
         )
         await self._send_text_chunks(sender, "\n".join(lines))
-        await self._send_interactive(
-            sender,
-            InteractiveList(
-                body=InteractiveText(
-                    text="Select the exact Microsoft product."
+        total = len(pending.candidates)
+        for offset in range(0, total, 10):
+            page = pending.candidates[offset : offset + 10]
+            rows = [
+                InteractiveRow(
+                    id=f"licensing|sku_confirm|{pending.id}|{offset + page_index}",
+                    title=f"Option {offset + page_index}",
+                    description=self._candidate_row_description(candidate),
+                )
+                for page_index, candidate in enumerate(page, start=1)
+            ]
+            first = offset + 1
+            last = offset + len(page)
+            await self._send_interactive(
+                sender,
+                InteractiveList(
+                    body=InteractiveText(
+                        text=(
+                            "Select the exact Microsoft product. "
+                            f"Options {first}-{last} of {total}; full names are shown "
+                            "in the preceding message."
+                        )
+                    ),
+                    action=InteractiveListAction(
+                        button="Choose exact SKU",
+                        sections=[
+                            InteractiveSection(
+                                title=f"Options {first}-{last}",
+                                rows=rows,
+                            )
+                        ],
+                    ),
                 ),
-                action=InteractiveListAction(
-                    button="Choose exact SKU",
-                    sections=[InteractiveSection(title="Top matches", rows=rows)],
-                ),
-            ),
-        )
+            )
+
+    @staticmethod
+    def _candidate_row_description(candidate: object) -> str:
+        product_id = str(getattr(candidate, "product_id", "")).strip()
+        sku_id = str(getattr(candidate, "sku_id", "")).strip()
+        title = str(getattr(candidate, "sku_title", "")).strip()
+        identity = " / ".join(value for value in (product_id, sku_id) if value)
+        prefix = f"ID {identity} · " if identity else ""
+        return f"{prefix}{title}"[:72]
 
     async def _send_official_recommendation_insight(
         self,

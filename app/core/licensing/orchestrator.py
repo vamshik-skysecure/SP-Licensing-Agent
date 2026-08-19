@@ -57,6 +57,28 @@ class LicensingOrchestrator:
         session, _ = await self._store.get(self.thread_id(sender))
         return session
 
+    async def reset_expired_session(self, sender: str) -> bool:
+        """Atomically replace expired state and report whether a reset occurred."""
+
+        thread_id = self.thread_id(sender)
+        for _ in range(3):
+            session, version = await self._store.get(thread_id)
+            if session is not None or version is None:
+                return False
+            fresh = WorkflowSession(
+                id=thread_id,
+                thread_id=thread_id,
+                sender=sender,
+            )
+            try:
+                await self._store.save(fresh, version)
+                return True
+            except WorkflowConflictError:
+                continue
+        raise WorkflowConflictError(
+            "The expired workflow changed concurrently; retry the last operation."
+        )
+
     async def remember_capture_message(self, sender: str, message: str) -> list[str]:
         """Persist bounded seller context for an incomplete typed requirement."""
 
@@ -1118,7 +1140,7 @@ class LicensingOrchestrator:
         if quantity <= 0:
             raise ScenarioError("SKU quantity must be greater than zero.")
         catalog = await self._rate_cards.get()
-        candidates = catalog.candidates(cleaned_query, limit=3)
+        candidates = catalog.candidates(cleaned_query, limit=None)
         if not candidates:
             raise ScenarioError(
                 f"I could not identify an applicable SKU for {cleaned_query!r}. "
@@ -1270,7 +1292,7 @@ class LicensingOrchestrator:
         if quantity <= 0:
             raise ScenarioError("SKU quantity must be greater than zero.")
         catalog = await self._rate_cards.get()
-        candidates = catalog.candidates(cleaned_query, limit=3)
+        candidates = catalog.candidates(cleaned_query, limit=None)
         if not candidates:
             raise ScenarioError(
                 f"I could not identify an applicable SKU for {cleaned_query!r}. "

@@ -79,7 +79,9 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 - A separate private workflow container in the same Storage account holds one JSON blob per hashed seller thread.
 - Blob ETags and `If-Match` conditional writes provide optimistic concurrency and prevent lost updates.
 - The same container holds a leased `webhook-queue` inbox. Signed requests are persisted before acknowledgement, processed sequentially on the single B1 instance, retried, and moved to a dead-letter prefix after repeated failures.
-- Expired sessions are ignored by the application; a prefix-scoped lifecycle rule deletes old session blobs.
+- Sessions expire after five minutes of inactivity in both Blob and local-memory modes.
+  The next seller message atomically replaces expired state, starts a fresh requirement,
+  and receives an expiry notice. A prefix-scoped lifecycle rule deletes old session blobs.
 - Raw customer uploads are never persisted. Only normalized estate and proposal state are stored.
 
 ### Excel-only commercial authority

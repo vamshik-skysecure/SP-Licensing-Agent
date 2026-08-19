@@ -216,7 +216,7 @@ class PendingSkuChange(BaseModel):
     product_query: str
     quantity: int = Field(gt=0)
     source_line_id: str | None = None
-    candidates: list[SkuMatchCandidate] = Field(min_length=1, max_length=3)
+    candidates: list[SkuMatchCandidate] = Field(min_length=1)
     created_at: datetime = Field(default_factory=utc_now)
 
 
