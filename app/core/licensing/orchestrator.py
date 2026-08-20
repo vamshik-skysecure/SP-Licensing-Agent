@@ -924,7 +924,11 @@ class LicensingOrchestrator:
                     update={
                         "estate": changed_estate,
                         "pending_sku_change": None,
-                        "stage": WorkflowStage.AWAITING_INITIAL_VALIDATION,
+                        "stage": (
+                            WorkflowStage.AWAITING_MATCH_CONFIRMATION
+                            if changed_estate.pending_lines
+                            else WorkflowStage.AWAITING_INITIAL_VALIDATION
+                        ),
                         "updated_at": datetime.now(UTC),
                     }
                 )
@@ -1181,6 +1185,11 @@ class LicensingOrchestrator:
                     update={
                         "estate": changed,
                         "pending_sku_change": None,
+                        "stage": (
+                            WorkflowStage.AWAITING_MATCH_CONFIRMATION
+                            if changed.pending_lines
+                            else WorkflowStage.AWAITING_INITIAL_VALIDATION
+                        ),
                         "updated_at": datetime.now(UTC),
                     }
                 )
