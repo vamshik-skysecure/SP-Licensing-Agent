@@ -11,7 +11,11 @@ from pypdf import PdfReader
 
 from app.api.whatsapp.service import HELP_TEXT, ServiceConfiguration, WhatsAppWebhookService
 from app.core.licensing.analysis import LicenseAnalyzer
-from app.core.licensing.agent import OfficialRecommendation
+from app.core.licensing.agent import (
+    OfficialProductAnswer,
+    OfficialRecommendation,
+    OpenAIIntentInterpreter,
+)
 from app.core.licensing.capture import (
     CapturedRequirement,
     ExtractedRequirementLine,
@@ -254,6 +258,19 @@ class FakeRecommendationAdvisor:
             ),
             clarification_question="",
             suggested_candidate_numbers=[1],
+            source_urls=[
+                "https://learn.microsoft.com/en-us/microsoft-365/enterprise/"
+            ],
+        )
+
+    async def answer_product_question(self, **kwargs: object) -> OfficialProductAnswer:
+        self.calls.append(kwargs)
+        return OfficialProductAnswer(
+            answer=(
+                "Microsoft Teams is included in Microsoft 365 E3, subject to the "
+                "applicable regional suite offering and tenant configuration."
+            ),
+            clarification_question="",
             source_urls=[
                 "https://learn.microsoft.com/en-us/microsoft-365/enterprise/"
             ],
@@ -1114,7 +1131,7 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.estate.lines[0].renewal_quantity, 1)
         self.assertEqual(session.stage, WorkflowStage.AWAITING_INITIAL_VALIDATION)
 
-    async def test_pending_sku_choice_allows_question_then_accepts_selection(self) -> None:
+    async def test_new_subject_cancels_stale_pending_sku_choice(self) -> None:
         class OutOfScopeInterpreter:
             async def interpret(self, *_: object) -> object:
                 return SimpleNamespace(
@@ -1143,7 +1160,7 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.state, "confirmation_required")
         assert result.confirmation is not None
-        selected_title = result.confirmation.candidates[0].sku_title
+        original_title = (await self.orchestrator.get_session(sender)).estate.lines[0].display_title  # type: ignore[union-attr]
         client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
         service = WhatsAppWebhookService(
             client,  # type: ignore[arg-type]
@@ -1159,18 +1176,13 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         await service._handle_text(sender, "Who is Virat Kohli?")
         session = await self.orchestrator.get_session(sender)
-        assert session is not None
-        self.assertIsNotNone(session.pending_sku_change)
-        self.assertIn("outside this licensing advisor", client.messages[-1].text.body)  # type: ignore[attr-defined]
-
-        await service._handle_text(sender, selected_title)
-        session = await self.orchestrator.get_session(sender)
         assert session is not None and session.estate is not None
         self.assertIsNone(session.pending_sku_change)
-        self.assertEqual(session.estate.lines[0].display_title, selected_title)
-        self.assertEqual(session.estate.lines[0].renewal_quantity, 25)
+        self.assertEqual(session.estate.lines[0].display_title, original_title)
+        self.assertEqual(session.estate.lines[0].renewal_quantity, 45)
+        self.assertIn("outside this licensing advisor", client.messages[-1].text.body)  # type: ignore[attr-defined]
 
-    async def test_pending_dialogue_allows_question_without_losing_original_context(self) -> None:
+    async def test_new_subject_clears_stale_pending_dialogue(self) -> None:
         class OutOfScopeInterpreter:
             async def interpret(self, *_: object) -> object:
                 return SimpleNamespace(
@@ -1212,9 +1224,8 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await service._handle_text(sender, "Which country should I visit?")
 
         session = await self.orchestrator.get_session(sender)
-        assert session is not None and session.pending_dialogue is not None
-        self.assertEqual(session.pending_dialogue.question, original.question)
-        self.assertEqual(session.pending_dialogue.context_message, original.context_message)
+        assert session is not None
+        self.assertIsNone(session.pending_dialogue)
         self.assertIn("outside this licensing advisor", client.messages[-1].text.body)  # type: ignore[attr-defined]
 
     async def test_incomplete_media_extraction_persists_supplied_facts_for_text_followup(self) -> None:
@@ -1635,6 +1646,18 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_greeting_exposes_saved_draft_and_prevents_silent_quantity_merge(
         self,
     ) -> None:
+        class SavedDraftGreetingInterpreter:
+            async def interpret(self, message: str, *_: object) -> object:
+                if "e1" in message.casefold():
+                    return SimpleNamespace(action="capture_requirement")
+                return SimpleNamespace(
+                    action="help",
+                    response_text=(
+                        "Welcome back. Your licensing draft contains one SKU line and 20 "
+                        "licences. Would you like to resume it or start fresh?"
+                    ),
+                )
+
         sender = "saved-draft-seller"
         await self.orchestrator.analyze_extracted(
             sender=sender,
@@ -1663,13 +1686,14 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 allow_all_sellers=True,
                 workflow_mode="simple_pricing",
             ),
+            intent_interpreter=SavedDraftGreetingInterpreter(),  # type: ignore[arg-type]
         )
 
         await service._handle_text(sender, "Hi")
         response = client.messages[-1].text.body  # type: ignore[attr-defined]
-        self.assertIn("active saved draft", response)
-        self.assertIn("Resume", response)
-        self.assertIn("Start fresh", response)
+        self.assertIn("one SKU line and 20 licences", response)
+        self.assertIn("resume", response.casefold())
+        self.assertIn("start fresh", response.casefold())
 
         await service._handle_text(sender, "I want E1 licence")
         session = await self.orchestrator.get_session(sender)
@@ -2000,6 +2024,27 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_help_is_professional_natural_language_first_and_hides_internal_sources(
         self,
     ) -> None:
+        class DynamicHelpInterpreter:
+            async def interpret(self, message: str, *_: object) -> object:
+                normalized = message.casefold()
+                if "what" in normalized:
+                    response = (
+                        "I capture Microsoft licensing needs, confirm exact SKUs, calculate "
+                        "annual Renew As-Is pricing, and prepare reviewed proposals. What "
+                        "licensing outcome would you like to work on?"
+                    )
+                elif "hi" in normalized:
+                    response = (
+                        "Hello. I’m the SkySecure Microsoft Licensing Advisor. How can I "
+                        "help with your Microsoft licensing requirement today?"
+                    )
+                else:
+                    response = (
+                        "I’m the SkySecure Microsoft Licensing Advisor. You can describe a "
+                        "requirement or share a supported file; what would you like to review?"
+                    )
+                return SimpleNamespace(action="help", response_text=response)
+
         client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
         service = WhatsAppWebhookService(
             client,  # type: ignore[arg-type]
@@ -2009,6 +2054,7 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 10 * 1024 * 1024,
                 workflow_mode="simple_pricing",
             ),
+            intent_interpreter=DynamicHelpInterpreter(),  # type: ignore[arg-type]
         )
 
         await service._handle_text("help-seller", "/help")
@@ -2025,15 +2071,24 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Price on Marketplace", HELP_TEXT)
         self.assertNotIn("pricebook", HELP_TEXT.casefold())
         self.assertEqual(len(client.messages), 3)
-        self.assertEqual(client.messages[0].text.body, client.messages[1].text.body)  # type: ignore[attr-defined]
-        self.assertEqual(client.messages[0].text.body, client.messages[2].text.body)  # type: ignore[attr-defined]
+        responses = [message.text.body for message in client.messages]  # type: ignore[attr-defined]
+        self.assertEqual(len(set(responses)), 3)
+        self.assertTrue(all("licens" in response.casefold() for response in responses))
+        self.assertTrue(all(response.rstrip().endswith("?") for response in responses))
+        self.assertTrue(all(response != HELP_TEXT for response in responses))
 
     async def test_preupload_capability_question_is_not_treated_as_requirement_data(
         self,
     ) -> None:
         class HelpInterpreter:
             async def interpret(self, *_: object) -> object:
-                return SimpleNamespace(action="help")
+                return SimpleNamespace(
+                    action="help",
+                    response_text=(
+                        "I can capture and validate Microsoft licensing requirements before "
+                        "pricing. What requirement would you like help with?"
+                    ),
+                )
 
             async def close(self) -> None:
                 return None
@@ -2056,7 +2111,11 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await service._handle_text("new-seller", "What can this agent do?")
 
         self.assertEqual(extractor.calls, [])
-        self.assertEqual(client.messages[-1].text.body, HELP_TEXT)  # type: ignore[attr-defined]
+        self.assertIn(
+            "capture and validate",
+            client.messages[-1].text.body,  # type: ignore[attr-defined]
+        )
+        self.assertNotEqual(client.messages[-1].text.body, HELP_TEXT)  # type: ignore[attr-defined]
 
     async def test_specific_question_is_answered_and_sku_text_starts_capture(self) -> None:
         class MutableInterpreter:
@@ -2687,6 +2746,289 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 getattr(message, "interactive", None) is not None
                 for message in normal_client.messages
             )
+        )
+
+    async def test_intent_context_exposes_exact_proposal_facts_for_followup_questions(
+        self,
+    ) -> None:
+        sender = "proposal-fact-context-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        scenario = await self.orchestrator.build_scenario(
+            sender,
+            ScenarioType.RENEW_AS_IS,
+            promo_eligible=False,
+        )
+        await self.orchestrator.save_confirmed_as_is(sender, scenario)
+        session = await self.orchestrator.get_session(sender)
+        interpreter = OpenAIIntentInterpreter(
+            api_key="test-key",
+            model="test-model",
+            workflow_mode="simple_pricing",
+            client=SimpleNamespace(),
+        )
+
+        context = interpreter._context(session)
+
+        self.assertEqual(context["reference_line_count"], 5)
+        self.assertEqual(context["reference_total_quantity"], 168)
+        self.assertEqual(
+            context["reference_products_alphabetical"],
+            sorted(context["reference_products_alphabetical"], key=str.casefold),
+        )
+        self.assertIsNotNone(context["reference_cheapest_by_annual_unit_price"])
+        self.assertIsNotNone(context["reference_costliest_by_annual_unit_price"])
+        self.assertFalse(context["inventory_stock_data_available"])
+        self.assertFalse(context["historical_purchase_count_available"])
+
+    async def test_catalog_budget_question_uses_current_rate_card_without_mutation(
+        self,
+    ) -> None:
+        sender = "catalog-budget-seller"
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+                simple_price_basis="marketplace",
+            ),
+        )
+
+        await service._execute_agent_intent(
+            sender,
+            SimpleNamespace(
+                action="answer_question",
+                detail_label="catalog_budget",
+                amount=5000,
+                product_query="",
+            ),
+            original_message="If I have INR 5,000, what can I buy?",
+        )
+
+        response = "\n".join(
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+        )
+        self.assertIn("within INR 5,000.00 per licence", response)
+        self.assertIn("per licence/year", response)
+        self.assertIn("not a feature-fit recommendation", response)
+        self.assertIsNone(await self.orchestrator.get_session(sender))
+
+    async def test_official_product_question_is_grounded_and_hides_source_urls(
+        self,
+    ) -> None:
+        sender = "official-product-question-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        advisor = FakeRecommendationAdvisor()
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            recommendation_advisor=advisor,
+        )
+
+        await service._execute_agent_intent(
+            sender,
+            SimpleNamespace(
+                action="answer_question",
+                detail_label="official_product_question",
+                detail_value="Can I use Teams in these products?",
+                product_query="Microsoft Teams",
+            ),
+            original_message="Can I use Teams in these products?",
+        )
+
+        self.assertEqual(len(advisor.calls), 1)
+        self.assertEqual(len(advisor.calls[0]["product_names"]), 6)
+        self.assertEqual(advisor.calls[0]["product_names"][0], "Microsoft Teams")
+        self.assertIn("Advanced Communications", advisor.calls[0]["product_names"])
+        response = client.messages[-1].text.body  # type: ignore[attr-defined]
+        self.assertIn("Microsoft Teams", response)
+        self.assertNotIn("learn.microsoft.com", response)
+        self.assertNotIn("https://", response)
+
+    async def test_voice_question_routes_through_conversation_instead_of_capture_error(
+        self,
+    ) -> None:
+        class VoiceQuestionExtractor:
+            async def extract_audio(self, *_: object, **__: object) -> CapturedRequirement:
+                return CapturedRequirement(
+                    extraction=RequirementExtraction(
+                        lines=[],
+                        warnings=[],
+                        needs_clarification=False,
+                        clarification="",
+                    ),
+                    transcript="Is there any warranty for these products?",
+                )
+
+        class ProductQuestionInterpreter:
+            async def interpret(self, message: str, *_: object) -> object:
+                return SimpleNamespace(
+                    action="answer_question",
+                    detail_label="official_product_question",
+                    detail_value=message,
+                    product_query="",
+                    response_text="",
+                )
+
+        sender = "voice-product-question-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        advisor = FakeRecommendationAdvisor()
+        client = FakeWhatsAppClient(
+            WhatsAppMedia(b"voice", "voice.ogg", "audio/ogg; codecs=opus")
+        )
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=ProductQuestionInterpreter(),  # type: ignore[arg-type]
+            requirement_extractor=VoiceQuestionExtractor(),  # type: ignore[arg-type]
+            recommendation_advisor=advisor,
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "voice-question",
+                    "from": sender,
+                    "type": "audio",
+                    "audio": {
+                        "id": "voice-media",
+                        "mime_type": "audio/ogg; codecs=opus",
+                        "voice": True,
+                    },
+                }
+            )
+        )
+
+        self.assertEqual(len(advisor.calls), 1)
+        bodies = [
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+        ]
+        self.assertTrue(any("Voice transcript" in body for body in bodies))
+        self.assertTrue(any("Microsoft Teams" in body for body in bodies))
+        self.assertFalse(any("No licensing requirement lines found" in body for body in bodies))
+
+    async def test_attachment_caption_is_processed_as_a_followup_question(self) -> None:
+        class CaptionInterpreter:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            async def interpret(self, message: str, *_: object) -> object:
+                self.messages.append(message)
+                return SimpleNamespace(
+                    action="answer_question",
+                    detail_label="",
+                    response_text=(
+                        "I captured the attachment. Confirm the requirement before I quote "
+                        "which submitted line is within the requested budget."
+                    ),
+                )
+
+        interpreter = CaptionInterpreter()
+        extractor = FakeRequirementExtractor()
+        client = FakeWhatsAppClient(WhatsAppMedia(b"image", "image.png", "image/png"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=interpreter,  # type: ignore[arg-type]
+            requirement_extractor=extractor,
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "captioned-image",
+                    "from": "caption-seller",
+                    "type": "image",
+                    "image": {
+                        "id": "image-media",
+                        "mime_type": "image/png",
+                        "caption": "Show me products under INR 5,000",
+                    },
+                }
+            )
+        )
+
+        self.assertIn("Show me products under INR 5,000", interpreter.messages)
+        self.assertIn(
+            "Confirm the requirement before I quote",
+            client.messages[-1].text.body,  # type: ignore[attr-defined]
+        )
+
+    async def test_product_title_cannot_be_saved_as_requirement_metadata(self) -> None:
+        sender = "product-metadata-guard-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._execute_agent_intent(
+            sender,
+            SimpleNamespace(
+                action="set_requirement_detail",
+                detail_label="Advanced Communications",
+                detail_value="",
+            ),
+            original_message="Advanced Communications",
+        )
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.estate is not None
+        self.assertEqual(session.estate.seller_details, [])
+        self.assertIn(
+            "recognized that as a Microsoft product",
+            client.messages[-1].text.body,  # type: ignore[attr-defined]
         )
 
     async def test_manual_image_audio_and_word_capture_route_to_one_schema(self) -> None:

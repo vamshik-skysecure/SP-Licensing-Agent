@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Callable, Literal
@@ -23,9 +24,19 @@ from .models import (
     WorkflowSession,
     WorkflowStage,
 )
-from .rate_card import RateCardCatalog, RateCardProvider
+from .rate_card import RateCardCatalog, RateCardProvider, normalize_product_title
 from .scenarios import ScenarioEngine, ScenarioError, SkuSelector
 from .store import WorkflowConflictError, WorkflowStore
+
+
+@dataclass(frozen=True)
+class CatalogOffer:
+    product_id: str
+    sku_id: str
+    sku_title: str
+    unit_price: Decimal
+    term_duration: str
+    billing_plan: str
 
 
 class LicensingOrchestrator:
@@ -56,6 +67,92 @@ class LicensingOrchestrator:
     async def get_session(self, sender: str) -> WorkflowSession | None:
         session, _ = await self._store.get(self.thread_id(sender))
         return session
+
+    async def affordable_catalog_offers(
+        self,
+        *,
+        budget: Decimal,
+        price_basis: Literal["marketplace", "distributor_expected"],
+        product_query: str = "",
+        limit: int = 8,
+    ) -> list[CatalogOffer]:
+        """Return unambiguous one-year annual offers closest to a stated unit budget."""
+
+        if budget <= 0 or limit <= 0:
+            return []
+        catalog = await self._rate_cards.get()
+        allowed: set[tuple[str, str, str]] | None = None
+        if product_query.strip():
+            candidates = catalog.candidates(product_query, limit=None)
+            allowed = {
+                (
+                    candidate.product_id.casefold(),
+                    candidate.sku_id.casefold(),
+                    normalize_product_title(candidate.sku_title),
+                )
+                for candidate in candidates
+            }
+            if not allowed:
+                return []
+
+        grouped: dict[tuple[str, str, str], list] = {}
+        for item in catalog.items:
+            if item.term_duration.casefold() != self._default_term_duration.casefold():
+                continue
+            if item.billing_plan.casefold() != self._default_billing_plan.casefold():
+                continue
+            identity = (
+                item.product_id.casefold(),
+                item.sku_id.casefold(),
+                normalize_product_title(item.sku_title),
+            )
+            if allowed is not None and identity not in allowed:
+                continue
+            grouped.setdefault(identity, []).append(item)
+
+        offers: list[CatalogOffer] = []
+        for rows in grouped.values():
+            exact_segment = [
+                row
+                for row in rows
+                if row.segment
+                and row.segment.casefold() == self._default_segment.casefold()
+            ]
+            selected_rows = exact_segment or rows
+            prices = {
+                (
+                    row.distributor_price
+                    if price_basis == "distributor_expected"
+                    else row.marketplace_price
+                )
+                for row in selected_rows
+            }
+            prices = {price for price in prices if price > Decimal("0")}
+            if len(prices) != 1:
+                # A blank or conflicting commercial value is not safe to present.
+                continue
+            selected_price = next(iter(prices))
+            if selected_price > budget:
+                continue
+            row = selected_rows[0]
+            offers.append(
+                CatalogOffer(
+                    product_id=row.product_id,
+                    sku_id=row.sku_id,
+                    sku_title=row.sku_title,
+                    unit_price=selected_price,
+                    term_duration=row.term_duration,
+                    billing_plan=row.billing_plan,
+                )
+            )
+        offers.sort(key=lambda item: (-item.unit_price, item.sku_title.casefold()))
+        return offers[:limit]
+
+    async def catalog_candidates(self, query: str):
+        """Expose read-only matching for service-layer ambiguity guards."""
+
+        catalog = await self._rate_cards.get()
+        return catalog.candidates(query, limit=None)
 
     async def reset_expired_session(self, sender: str) -> bool:
         """Atomically replace expired state and report whether a reset occurred."""

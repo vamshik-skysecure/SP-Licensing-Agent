@@ -232,6 +232,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             max_image_bytes=settings.max_image_bytes,
             max_audio_bytes=settings.max_audio_bytes,
             currency=settings.default_currency,
+            simple_price_basis=settings.simple_price_basis,
             workflow_mode=settings.workflow_mode,
         ),
         intent_interpreter=intent_interpreter,

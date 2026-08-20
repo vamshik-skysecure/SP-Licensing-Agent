@@ -133,6 +133,33 @@ class OfficialRecommendation(BaseModel):
         )
 
 
+class OfficialProductAnswer(BaseModel):
+    """Read-only product guidance grounded in Microsoft-owned documentation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str
+    clarification_question: str
+    source_urls: list[str]
+
+    def validated(self) -> "OfficialProductAnswer":
+        if not self.answer.strip() and not self.clarification_question.strip():
+            raise IntentInterpretationError(
+                "The official product answer contained no usable response."
+            )
+        for value in self.source_urls:
+            host = (urlsplit(value).hostname or "").casefold()
+            if host != "microsoft.com" and not host.endswith(".microsoft.com"):
+                raise IntentInterpretationError(
+                    "The product answer contained a non-Microsoft source."
+                )
+        if self.answer.strip() and not self.source_urls:
+            raise IntentInterpretationError(
+                "The product answer did not contain an official Microsoft source."
+            )
+        return self
+
+
 class RecommendationAdvisor(Protocol):
     async def advise(
         self,
@@ -142,6 +169,14 @@ class RecommendationAdvisor(Protocol):
         quantity: int,
         candidate_skus: list[str],
     ) -> OfficialRecommendation: ...
+
+    async def answer_product_question(
+        self,
+        *,
+        seller_question: str,
+        product_names: list[str],
+        proposal_context: str,
+    ) -> OfficialProductAnswer: ...
 
     async def validate_model_access(self) -> None: ...
 
@@ -164,6 +199,26 @@ Rules:
 - source_urls must contain only the official Microsoft pages actually supporting the advice.
 - If no relevant official evidence is found, return no candidate numbers, an empty
   recommendation, and one clarification question.
+"""
+
+
+OFFICIAL_PRODUCT_ANSWER_PROMPT = """You are a concise Microsoft licensing product advisor.
+Use web search and only official Microsoft-owned documentation to answer the seller's question
+about the product names supplied by the application.
+
+Rules:
+- Answer the question directly in no more than four short sentences. Compare named products only
+  when the official evidence supports the comparison.
+- Distinguish product features from the customer's purchased quantities and from historical sales.
+- Do not invent inventory or stock status, purchase counts, warranty terms, refunds, cancellation
+  rights, future prices, eligibility, entitlements, or customer-specific contract terms.
+- If the answer depends on a contract, tenant configuration, plan variant, geography, or an
+  unspecified product, say so and ask one direct clarification question.
+- Never calculate or quote price, discounts, promotions, margins, or commercial adjustments.
+- source_urls must contain only the official Microsoft pages actually supporting the answer.
+- Do not place URLs, citations, markdown links, or source names inside answer or
+  clarification_question. The application retains sources for audit but does not expose them in
+  the seller conversation.
 """
 
 
@@ -252,6 +307,64 @@ class OpenAIMicrosoftRecommendationAdvisor:
                 "Official Microsoft recommendation research is temporarily unavailable."
             ) from error
 
+    async def answer_product_question(
+        self,
+        *,
+        seller_question: str,
+        product_names: list[str],
+        proposal_context: str,
+    ) -> OfficialProductAnswer:
+        if not product_names:
+            raise IntentInterpretationError(
+                "No product names are available for official evaluation."
+            )
+        try:
+            response = await self._client.responses.parse(
+                model=self._model,
+                instructions=OFFICIAL_PRODUCT_ANSWER_PROMPT,
+                input=json.dumps(
+                    {
+                        "seller_question": seller_question,
+                        "product_names": product_names[:20],
+                        "proposal_context": proposal_context,
+                    },
+                    ensure_ascii=True,
+                ),
+                tools=[
+                    {
+                        "type": "web_search",
+                        "filters": {
+                            "allowed_domains": [
+                                "learn.microsoft.com",
+                                "microsoft.com",
+                            ]
+                        },
+                        "search_context_size": "low",
+                    }
+                ],
+                tool_choice="required",
+                text_format=OfficialProductAnswer,
+                reasoning={"effort": self._reasoning_effort},
+                max_output_tokens=1400,
+                store=False,
+            )
+            if getattr(response, "status", None) == "incomplete":
+                raise IntentInterpretationError(
+                    "The official product answer was incomplete."
+                )
+            parsed = getattr(response, "output_parsed", None)
+            if parsed is None:
+                raise IntentInterpretationError(
+                    "The official product answer was empty."
+                )
+            return OfficialProductAnswer.model_validate(parsed).validated()
+        except IntentInterpretationError:
+            raise
+        except (OpenAIError, ValidationError, AttributeError, TypeError, ValueError) as error:
+            raise IntentInterpretationError(
+                "Official Microsoft product research is temporarily unavailable."
+            ) from error
+
     async def close(self) -> None:
         if self._owns_client:
             await self._client.close()
@@ -266,6 +379,14 @@ Rules:
 - First interpret the seller's latest message in the supplied workflow context. Classify the
   meaning of the complete turn; do not force it into the answer expected by a pending question.
 - Use help for a greeting, a request to start, or a broad question such as "what do you do?".
+  Write a fresh, context-aware response in response_text; do not return a memorized menu or
+  command list. For a new conversation, introduce the SkySecure Microsoft Licensing Advisor,
+  explain only the capabilities relevant to the seller's wording, and end with one natural
+  question inviting the seller to provide a licensing requirement or business need. For a broad
+  capability question, answer what the agent can do using the authoritative workflow facts below
+  and then ask how it can help. If estate_uploaded is true, acknowledge the current saved draft
+  using the supplied line and quantity facts; for a greeting or request to start, ask whether the
+  seller wants to resume it or start fresh. Do not claim that any state changed.
 - Use acknowledge for a standalone courtesy, thanks, acknowledgement, or conversational close
   that does not request a licensing action. Put one natural, context-aware sentence in
   response_text. Do not use acknowledge for "yes", "okay", or similar wording when it answers
@@ -295,8 +416,37 @@ Rules:
 - Use answer_question for a specific question about supported inputs, the workflow, or the
   current proposal. Put a direct, professional answer of no more than three short sentences in
   response_text. Copy quantities and commercial values exactly from the supplied context;
-  never calculate, estimate, or invent them. If the answer is not supported by these facts or
-  the current context, use clarify and ask one direct question instead.
+  never calculate, estimate, or invent them. The context includes separately named captured,
+  confirmed Renew As-Is, and active-proposal line lists. Resolve words such as "these", "those",
+  "the five", "that list", and "the image" to the most recent applicable line list instead of
+  asking the seller to repeat product names already present in context.
+- For a question requiring Microsoft product documentation--feature inclusion, storage,
+  capabilities, service-plan differences, free editions, or whether a named workload such as
+  Teams or Excel is included--use answer_question with detail_label
+  "official_product_question", copy the seller's question into detail_value, put any explicitly
+  named product in product_query, and leave response_text empty. The application will perform
+  read-only research against official Microsoft sources. This is a question, not a request to add
+  or replace a SKU.
+- For a catalogue-wide question asking what can be purchased within a stated annual per-licence
+  budget, use answer_question with detail_label "catalog_budget", put the exact positive budget
+  in amount, and put an optional named product family in product_query. If the seller says
+  "among these" or otherwise refers to proposal lines, answer from the supplied exact proposal
+  price facts instead of searching the wider catalogue.
+- Questions about cheapest, costliest, alphabetical order, line quantities, line prices, totals,
+  included/removed lines, or the current product list are proposal-fact questions. Answer them
+  directly from the supplied deterministic context. Unit-price extrema and alphabetized product
+  names are precomputed there; do not perform new arithmetic.
+- A requested licence quantity is not evidence of how many people historically bought a
+  product. If asked about purchasers or popularity, state that purchase-history data is not
+  available and, when useful, separately identify the proposal quantities.
+- Cloud licence SKUs are not physical inventory. If asked about stock, explain that this workflow
+  does not track stock and distinguish that from a SKU being present in the current maintained
+  annual pricing data. Do not call retained/removed proposal dispositions "in stock" or "out of
+  stock".
+- Questions about warranty, refunds, cancellation rights, order timing, or future price changes
+  must not be guessed from proposal data. Explain that the applicable agreement/provider policy
+  controls the answer and ask for the agreement or route the seller to the licensing owner when
+  the exact term is unavailable.
 - Use out_of_scope for requests unrelated to Microsoft licensing requirement capture,
   annual commercial review, or the active proposal. Put one polite boundary sentence in
   response_text and briefly state what licensing task you can help with. Do not answer the
@@ -359,10 +509,16 @@ Rules:
 - Use help for broad capability questions. Use compare for an explicit Renew As-Is versus
   revised comparison, and compare_enterprise_options only when the seller explicitly asks to
   compare ME3, ME5, and/or ME7 enterprise options.
-- Use request_recommendation when the seller asks for a better SKU or a recommendation
-  without naming a target. Preserve an explicitly stated source line and user count. Do not
+- Use request_recommendation when the seller asks for a better SKU or a recommendation with the
+  intent to upgrade, replace, add, or revise the proposal. Preserve an explicitly stated source
+  line and user count. Do not
   invent a product or migration entitlement; the application will offer higher-tier SKUs from
   the same product family and require the seller to select one.
+- An informational question such as "which of these is best", "is this worth the money", or
+  "which suits a business" is not automatically a replacement request. Explain that different
+  product families serve different needs, use exact proposal facts, and ask for the business
+  priority only when it is genuinely required. Do not force the seller to select a line unless
+  they ask to change or upgrade one.
 - Treat broad licensing prompts such as "any suggestions from your end" as
   request_recommendation, not clarify. The application will enforce baseline confirmation and
   ask which current line to evaluate when that choice is still required.
@@ -376,6 +532,8 @@ Rules:
   short field name in detail_label and the supplied value in detail_value. To remove an
   existing detail, use an empty detail_value. Never infer either field. If either is unclear,
   use clarify and ask one direct question.
+- Never use set_requirement_detail for a Microsoft product name, SKU, plan, service, feature
+  question, or the seller's answer naming a product during a product-information exchange.
 - Fields irrelevant to the action must use "none", an empty string, -1, or -1.0.
 - If the seller has not selected every unresolved uploaded line, use clarify and ask for
   the remaining choices; never guess a SKU match. If the seller says they do not know, do not
@@ -402,9 +560,18 @@ Authoritative workflow facts for answer_question:
 
 Examples:
 - "We need 120 Microsoft 365 E3 licences for one year" -> capture_requirement.
-- "What can this agent do?" -> help.
+- "Hi" -> help with a natural introduction and one context-appropriate question.
+- "What can this agent do?" -> help with a concise capability answer tailored to the wording.
 - "Thank you" or another standalone courtesy -> acknowledge with a short natural reply.
 - "Can I upload a PDF?" -> answer_question with a concise supported answer.
+- "Which of these five products is cheapest?" -> answer_question using the precomputed current
+  proposal price facts.
+- "Which plan has the most storage?" -> answer_question with detail_label
+  official_product_question.
+- "Can I use Teams in these products?" -> answer_question with detail_label
+  official_product_question.
+- "If I have INR 5,000, what can I buy?" -> answer_question with detail_label catalog_budget and
+  amount 5000.
 - "Write a marketing campaign" -> out_of_scope with a concise professional boundary.
 - Questions about people, travel, sports, news, or other unrelated subjects -> out_of_scope,
   including during unfinished capture; do not answer their factual content.
@@ -509,27 +676,89 @@ class OpenAIIntentInterpreter:
             if session.active_scenario is not None
             else None
         )
-        lines = []
-        if active is not None:
-            lines = [
+
+        def serialize_scenario(scenario: object | None) -> list[dict[str, object]]:
+            if scenario is None:
+                return []
+            return [
                 {
                     "line_id": line.line_id,
                     "title": line.sku_title,
                     "quantity": line.proposed_quantity,
+                    "existing_quantity": line.existing_quantity,
+                    "unit_price": str(line.unit_price),
+                    "line_total": str(line.extended_price),
+                    "price_unavailable": line.price_unavailable,
+                    "term": line.term_duration,
+                    "billing": line.billing_plan,
                     "disposition": line.disposition.value,
+                    "category": line.category,
                 }
-                for line in active.lines[:80]
+                for line in scenario.lines[:80]
             ]
-        elif session.estate is not None:
-            lines = [
+
+        captured_lines = (
+            [
                 {
                     "line_id": line.line_id,
                     "title": line.display_title,
                     "quantity": line.renewal_quantity,
-                    "disposition": "captured_requirement",
+                    "term": line.term_duration,
+                    "billing": line.billing_plan,
+                    "renewal_date": (
+                        line.renewal_date.isoformat() if line.renewal_date else None
+                    ),
+                    "expiration_date": (
+                        line.expiration_date.isoformat() if line.expiration_date else None
+                    ),
+                    "match_method": line.match_method,
                 }
                 for line in session.estate.lines[:80]
             ]
+            if session.estate is not None
+            else []
+        )
+        confirmed_lines = serialize_scenario(session.confirmed_as_is)
+        active_lines = serialize_scenario(active)
+        active_included_lines = [
+            line for line in active_lines if int(line["quantity"]) > 0
+        ]
+        reference_lines = active_included_lines or confirmed_lines or captured_lines
+
+        reference_scenario_lines = []
+        if active is not None:
+            reference_scenario_lines = [
+                line for line in active.lines[:80] if line.proposed_quantity > 0
+            ]
+        elif session.confirmed_as_is is not None:
+            reference_scenario_lines = list(session.confirmed_as_is.lines[:80])
+        priced_reference = [
+            line
+            for line in reference_scenario_lines
+            if not line.price_unavailable and line.unit_price > 0
+        ]
+
+        def priced_fact(line: object | None) -> dict[str, object] | None:
+            if line is None:
+                return None
+            return {
+                "line_id": line.line_id,
+                "title": line.sku_title,
+                "quantity": line.proposed_quantity,
+                "annual_unit_price": str(line.unit_price),
+                "line_total": str(line.extended_price),
+            }
+
+        cheapest = priced_fact(
+            min(priced_reference, key=lambda line: line.unit_price)
+            if priced_reference
+            else None
+        )
+        costliest = priced_fact(
+            max(priced_reference, key=lambda line: line.unit_price)
+            if priced_reference
+            else None
+        )
         return {
             "workflow_mode": self._workflow_mode,
             "currency": self._currency,
@@ -570,6 +799,23 @@ class OpenAIIntentInterpreter:
                 else None
             ),
             "active_annual_value": str(active.total_value) if active is not None else None,
+            "confirmed_renew_as_is_lines": confirmed_lines,
+            "captured_requirement_lines": captured_lines,
+            "active_proposal_lines": active_lines,
+            "active_included_lines": active_included_lines,
+            "reference_line_count": len(reference_lines),
+            "reference_total_quantity": sum(
+                int(line.get("quantity", 0)) for line in reference_lines
+            ),
+            "reference_products_alphabetical": sorted(
+                [str(line["title"]) for line in reference_lines],
+                key=str.casefold,
+            ),
+            "reference_cheapest_by_annual_unit_price": cheapest,
+            "reference_costliest_by_annual_unit_price": costliest,
+            "inventory_stock_data_available": False,
+            "historical_purchase_count_available": False,
+            "contract_warranty_refund_terms_available": False,
             "seller_provided_details": (
                 [
                     {"label": item.label, "value": item.value}
@@ -578,6 +824,9 @@ class OpenAIIntentInterpreter:
                 if session.estate
                 else []
             ),
-            "lines": lines,
-            "lines_truncated": bool(active and len(active.lines) > len(lines)),
+            "lines": reference_lines,
+            "lines_truncated": bool(
+                (active and len(active.lines) > len(active_lines))
+                or (session.estate and len(session.estate.lines) > len(captured_lines))
+            ),
         }

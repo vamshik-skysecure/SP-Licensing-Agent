@@ -14,6 +14,7 @@ from app.core.licensing.analysis import (
 from app.core.licensing.agent import (
     AgentIntent,
     IntentInterpretationError,
+    OfficialProductAnswer,
     OfficialRecommendation,
     OpenAIIntentInterpreter,
     OpenAIMicrosoftRecommendationAdvisor,
@@ -850,6 +851,46 @@ class IntentAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["tool_choice"], "required")
         self.assertFalse(request["store"])
         self.assertIs(request["text_format"], OfficialRecommendation)
+        self.assertEqual(
+            request["tools"][0]["filters"]["allowed_domains"],  # type: ignore[index]
+            ["learn.microsoft.com", "microsoft.com"],
+        )
+
+    async def test_official_product_answer_uses_microsoft_only_web_search(self) -> None:
+        expected = OfficialProductAnswer(
+            answer="Microsoft Teams availability depends on the named Microsoft 365 plan.",
+            clarification_question="",
+            source_urls=[
+                "https://learn.microsoft.com/en-us/microsoft-365/enterprise/"
+            ],
+        )
+
+        class FakeResponses:
+            request: dict[str, object] | None = None
+
+            async def parse(self, **kwargs: object) -> object:
+                self.request = kwargs
+                return SimpleNamespace(status="completed", output_parsed=expected)
+
+        client = SimpleNamespace(responses=FakeResponses())
+        advisor = OpenAIMicrosoftRecommendationAdvisor(
+            api_key="test-key",
+            model="gpt-5.6-luna",
+            client=client,
+        )
+
+        actual = await advisor.answer_product_question(
+            seller_question="Can I use Teams in these products?",
+            product_names=["Microsoft 365 E3"],
+            proposal_context="One active proposal line.",
+        )
+
+        self.assertEqual(actual, expected)
+        request = client.responses.request
+        assert request is not None
+        self.assertEqual(request["tool_choice"], "required")
+        self.assertFalse(request["store"])
+        self.assertIs(request["text_format"], OfficialProductAnswer)
         self.assertEqual(
             request["tools"][0]["filters"]["allowed_domains"],  # type: ignore[index]
             ["learn.microsoft.com", "microsoft.com"],

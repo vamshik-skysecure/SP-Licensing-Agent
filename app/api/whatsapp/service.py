@@ -212,6 +212,7 @@ class ServiceConfiguration:
     max_image_bytes: int = 8 * 1024 * 1024
     max_audio_bytes: int = 10 * 1024 * 1024
     currency: str = "INR"
+    simple_price_basis: Literal["marketplace", "distributor_expected"] = "marketplace"
     workflow_mode: Literal[
         "simple_pricing",
         "renewal_only",
@@ -389,6 +390,8 @@ class WhatsAppWebhookService:
             estate,
             appended=append_to_draft,
         )
+        if document.caption and document.caption.strip():
+            await self._handle_text(sender, document.caption.strip())
 
     async def _handle_image(
         self,
@@ -429,6 +432,8 @@ class WhatsAppWebhookService:
             estate,
             appended=append_to_draft,
         )
+        if incoming.caption and incoming.caption.strip():
+            await self._handle_text(sender, incoming.caption.strip())
 
     async def _handle_audio(
         self,
@@ -456,6 +461,20 @@ class WhatsAppWebhookService:
                 sender,
                 "*Voice transcript used for extraction*\n" + captured.transcript[:3000],
             )
+        if not captured.extraction.lines:
+            if not captured.transcript.strip():
+                raise RequirementCaptureError(
+                    "I could not identify speech in that voice note. Please try again or "
+                    "send the request as text."
+                )
+            await self._handle_text(sender, captured.transcript)
+            return
+        session = await self._orchestrator.get_session(sender)
+        if session is not None and session.confirmed_as_is is not None:
+            # Once pricing exists, a voice note may be a question or proposal operation.
+            # Route the transcript through the same conversational intent path as typed text.
+            await self._handle_text(sender, captured.transcript)
+            return
         estate = await self._analyze_captured(
             sender,
             media.filename,
@@ -696,6 +715,157 @@ class WhatsAppWebhookService:
             cleaned.append(character)
         return " ".join("".join(cleaned).split())
 
+    @classmethod
+    def _seller_safe_research_text(cls, value: str) -> str:
+        """Remove source markup while retaining the supported seller-facing answer."""
+
+        without_links = re.sub(
+            r"\[([^\]]+)\]\(https?://[^)]+\)",
+            r"\1",
+            value,
+            flags=re.IGNORECASE,
+        )
+        without_links = re.sub(
+            r"\(https?://[^)]+\)", "", without_links, flags=re.IGNORECASE
+        )
+        without_links = re.sub(
+            r"https?://\S+", "", without_links, flags=re.IGNORECASE
+        )
+        without_links = re.sub(r"【\d+†[^】]+】", "", without_links)
+        return cls._professional_agent_text(without_links)
+
+    @staticmethod
+    def _reference_product_names(
+        session: WorkflowSession | None,
+        explicit_product: str = "",
+    ) -> list[str]:
+        products: list[str] = []
+        if session is not None and session.active_scenario is not None:
+            active = session.scenarios.get(session.active_scenario)
+            if active is not None:
+                products = [
+                    line.sku_title
+                    for line in active.lines
+                    if line.proposed_quantity > 0
+                ]
+        if not products and session is not None and session.confirmed_as_is is not None:
+            products = [
+                line.sku_title
+                for line in session.confirmed_as_is.lines
+                if line.proposed_quantity > 0
+            ]
+        if not products and session is not None and session.estate is not None:
+            products = [line.display_title for line in session.estate.lines]
+        # The model may identify a workload named in the question (for example Teams or
+        # Excel) as product_query while "these products" refers to the proposal. Preserve
+        # both so official research can answer the relationship instead of losing context.
+        if explicit_product.strip():
+            products.insert(0, explicit_product.strip())
+        return list(dict.fromkeys(product for product in products if product.strip()))[:20]
+
+    async def _send_catalog_budget_options(
+        self,
+        sender: str,
+        intent: AgentIntent,
+    ) -> None:
+        budget = Decimal(str(intent.amount))
+        if budget <= 0:
+            await self._send_text(
+                sender,
+                "What annual per-licence budget should I use, and is there a particular "
+                "Microsoft product family you want me to consider?",
+            )
+            return
+        offers = await self._orchestrator.affordable_catalog_offers(
+            budget=budget,
+            price_basis=self._configuration.simple_price_basis,
+            product_query=intent.product_query.strip(),
+        )
+        currency = self._configuration.currency
+        if not offers:
+            qualifier = (
+                f" for {intent.product_query.strip()}" if intent.product_query.strip() else ""
+            )
+            await self._send_text(
+                sender,
+                f"I found no unambiguous one-year annual option{qualifier} at or below "
+                f"{currency} {budget:,.2f} per licence in the current pricing data. "
+                "You can raise the budget or name a different product family.",
+            )
+            return
+        rows = "\n".join(
+            f"{index}. {offer.sku_title} — {currency} {offer.unit_price:,.2f} per licence/year"
+            for index, offer in enumerate(offers, start=1)
+        )
+        await self._send_text_chunks(
+            sender,
+            f"*One-year annual options within {currency} {budget:,.2f} per licence*\n\n"
+            f"{rows}\n\nThese are price-qualified options, not a feature-fit recommendation. "
+            "Tell me the required capability and quantity if you want me to narrow the list.",
+        )
+
+    async def _send_official_product_answer(
+        self,
+        sender: str,
+        intent: AgentIntent,
+        *,
+        original_message: str | None,
+    ) -> None:
+        session = await self._orchestrator.get_session(sender)
+        products = self._reference_product_names(session, intent.product_query)
+        question = intent.detail_value.strip() or (original_message or "").strip()
+        if not question:
+            await self._send_text(
+                sender,
+                "What would you like to know about the selected Microsoft products?",
+            )
+            return
+        if not products:
+            await self._send_text(
+                sender,
+                "Which Microsoft product or plan should I check?",
+            )
+            return
+        if self._recommendation_advisor is None:
+            await self._send_text(
+                sender,
+                "I cannot verify that product feature from official Microsoft information "
+                "in this environment. No proposal change has been made.",
+            )
+            return
+        proposal_context = (
+            f"Active proposal: {session.active_scenario.label if session and session.active_scenario else 'none'}; "
+            f"products supplied by application: {len(products)}."
+        )
+        try:
+            answer = await self._recommendation_advisor.answer_product_question(
+                seller_question=question,
+                product_names=products,
+                proposal_context=proposal_context,
+            )
+        except (IntentInterpretationError, AttributeError):
+            logger.warning("Official Microsoft product research failed safely")
+            await self._send_text(
+                sender,
+                "I could not verify that product detail from official Microsoft information "
+                "just now. No proposal change has been made; please retry the question.",
+            )
+            return
+        seller_answer = self._seller_safe_research_text(answer.answer)
+        clarification = self._seller_safe_research_text(answer.clarification_question)
+        if seller_answer:
+            await self._send_text(sender, seller_answer[:1200])
+        if clarification:
+            await self._orchestrator.set_pending_dialogue(
+                sender,
+                PendingDialogue(
+                    kind="agent_clarification",
+                    question=clarification[:500],
+                    context_message=question[:2000],
+                ),
+            )
+            await self._send_text(sender, clarification[:500])
+
     @staticmethod
     def _scenario_from_request(intent: AgentIntent, message: str | None) -> ScenarioType | None:
         stated = getattr(intent, "scenario", "none")
@@ -914,6 +1084,13 @@ class WhatsAppWebhookService:
         intent = await self._interpret_pending_message(message, session)
         if intent is None:
             return False
+        if intent.action in CONVERSATIONAL_ACTIONS:
+            await self._execute_agent_intent(
+                sender,
+                intent,
+                original_message=message,
+            )
+            return True
         if self._is_clear_non_requirement_turn(message):
             await self._send_non_requirement_boundary(sender)
             return True
@@ -1167,20 +1344,9 @@ class WhatsAppWebhookService:
             await self._send_text(sender, pending.question)
             return True
 
-        seller_context = "\n".join(
-            value
-            for value in (pending.context_message.strip(), message.strip())
-            if value
-        )
-        interpretation_input = (
-            "Resolve the seller's latest answer in the context of the preceding exchange.\n"
-            f"Earlier seller request: {pending.context_message or '(none)'}\n"
-            f"Advisor question: {pending.question}\n"
-            f"Seller answer: {message}"
-        )
         try:
             intent = await self._intent_interpreter.interpret(
-                interpretation_input,
+                message,
                 session,
             )
         except IntentInterpretationError:
@@ -1205,6 +1371,9 @@ class WhatsAppWebhookService:
             )
             return True
         if intent.action in CONVERSATIONAL_ACTIONS:
+            # The seller has changed or closed the subject. Do not let the old question
+            # capture later acknowledgements, questions, or unrelated messages.
+            await self._orchestrator.clear_pending_dialogue(sender)
             await self._execute_agent_intent(
                 sender,
                 intent,
@@ -1212,7 +1381,7 @@ class WhatsAppWebhookService:
             )
             return True
         await self._orchestrator.clear_pending_dialogue(sender)
-        if intent.action == "capture_requirement" and seller_context:
+        if intent.action == "capture_requirement":
             if pending.context_message.strip():
                 await self._orchestrator.remember_capture_message(
                     sender,
@@ -1223,7 +1392,7 @@ class WhatsAppWebhookService:
         await self._execute_agent_intent(
             sender,
             intent,
-            original_message=seller_context or message,
+            original_message=message,
         )
         return True
 
@@ -1491,6 +1660,10 @@ class WhatsAppWebhookService:
             intent = await self._interpret_pending_message(message, session)
             if intent is not None:
                 if intent.action in CONVERSATIONAL_ACTIONS | {"reset_requirement"}:
+                    if intent.action in {"help", "answer_question", "out_of_scope"}:
+                        # A new subject supersedes an unconfirmed scenario edit. Nothing has
+                        # been applied, and a later bare "yes" must not revive the stale choice.
+                        await self._orchestrator.cancel_sku_change(sender)
                     await self._execute_agent_intent(
                         sender,
                         intent,
@@ -1817,7 +1990,7 @@ class WhatsAppWebhookService:
         lowered = command.casefold()
         intro_request = " ".join(lowered.strip(" ?!.,").split())
         session = await self._orchestrator.get_session(sender)
-        if lowered in {"/help", "/start", "/about", "/analyze"} or intro_request in {
+        is_intro_request = lowered in {"/help", "/start", "/about", "/analyze"} or intro_request in {
             "hi",
             "hello",
             "hey",
@@ -1835,7 +2008,20 @@ class WhatsAppWebhookService:
             "tell me about yourself",
             "how do you work",
             "how does this work",
-        }:
+        }
+        if is_intro_request:
+            if self._intent_interpreter is not None:
+                try:
+                    intent = await self._intent_interpreter.interpret(command, session)
+                except IntentInterpretationError:
+                    logger.warning("Dynamic introduction interpretation failed")
+                else:
+                    await self._execute_agent_intent(
+                        sender,
+                        intent,
+                        original_message=command,
+                    )
+                    return
             if (
                 self._configuration.workflow_mode == "simple_pricing"
                 and session is not None
@@ -1843,6 +2029,8 @@ class WhatsAppWebhookService:
             ):
                 await self._show_saved_session_choice(sender, session)
             else:
+                # Emergency fallback for environments where the language service is disabled
+                # or temporarily unavailable. The normal production path above is model-driven.
                 await self._send_text(sender, HELP_TEXT)
             return
         if self._requests_fresh_start(intro_request):
@@ -2291,7 +2479,22 @@ class WhatsAppWebhookService:
         original_message: str | None = None,
     ) -> None:
         if intent.action == "help":
-            await self._send_text(sender, HELP_TEXT)
+            response = self._professional_agent_text(
+                str(getattr(intent, "response_text", ""))
+            )
+            session = await self._orchestrator.get_session(sender)
+            if session is not None and session.estate is not None:
+                await self._orchestrator.set_pending_dialogue(
+                    sender,
+                    PendingDialogue(
+                        kind="resume_session",
+                        question=(
+                            "Would you like to resume this saved draft, or start a fresh "
+                            "requirement?"
+                        ),
+                    ),
+                )
+            await self._send_text(sender, response[:1200] if response else HELP_TEXT)
             return
         if intent.action == "acknowledge":
             response = self._professional_agent_text(intent.response_text)
@@ -2323,6 +2526,17 @@ class WhatsAppWebhookService:
             )
             return
         if intent.action == "answer_question":
+            topic = str(getattr(intent, "detail_label", "")).strip().casefold()
+            if topic == "catalog_budget":
+                await self._send_catalog_budget_options(sender, intent)
+                return
+            if topic == "official_product_question":
+                await self._send_official_product_answer(
+                    sender,
+                    intent,
+                    original_message=original_message,
+                )
+                return
             answer = self._professional_agent_text(intent.response_text)
             await self._send_text(
                 sender,
@@ -2462,6 +2676,17 @@ class WhatsAppWebhookService:
         if intent.action == "set_requirement_detail":
             label = intent.detail_label.strip()
             value = intent.detail_value.strip()
+            possible_product = " ".join(part for part in (label, value) if part).strip()
+            if possible_product:
+                matches = await self._orchestrator.catalog_candidates(possible_product)
+                if matches and matches[0].confidence >= 90:
+                    await self._send_text(
+                        sender,
+                        "I recognized that as a Microsoft product rather than proposal "
+                        "metadata, so I have not added or changed anything. Are you asking "
+                        "about its features, or do you want to add that exact SKU?",
+                    )
+                    return
             estate = await self._orchestrator.set_requirement_detail(
                 sender,
                 label=label,
@@ -3195,7 +3420,7 @@ class WhatsAppWebhookService:
         await self._send_text(
             sender,
             "*Microsoft-documented licensing insight*\n\n"
-            f"{self._professional_agent_text(insight.recommendation)}\n\n"
+            f"{self._seller_safe_research_text(insight.recommendation)}\n\n"
             f"Catalogue option(s) supported for review: {selected}. No change has been "
             "applied. Confirm the exact SKU you want me to use, or describe another "
             "requirement you would like me to evaluate.",
