@@ -886,6 +886,56 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.estate.lines[0].renewal_quantity, 10)
         self.assertEqual(session.stage, WorkflowStage.AWAITING_INITIAL_VALIDATION)
 
+    async def test_me7_quantity_is_captured_even_if_intent_model_calls_it_a_scenario(
+        self,
+    ) -> None:
+        class ScenarioInterpreter:
+            async def interpret(self, *_: object) -> object:
+                return SimpleNamespace(
+                    action="build_scenario",
+                    scenario="me7",
+                    product_query="",
+                    quantity=-1,
+                )
+
+        sender = "me7-shorthand-seller"
+        extractor = SingleTurnRequirementExtractor("ME7", 1)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=ScenarioInterpreter(),  # type: ignore[arg-type]
+            requirement_extractor=extractor,  # type: ignore[arg-type]
+        )
+
+        await service._handle_text(sender, "ME7 1 qty")
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.estate is not None
+        self.assertEqual(extractor.inputs, ["ME7 1 qty"])
+        self.assertEqual(session.estate.lines[0].renewal_quantity, 1)
+        self.assertEqual(session.estate.lines[0].source_product_title, "ME7")
+        self.assertTrue(session.estate.pending_lines)
+        self.assertTrue(
+            all(
+                candidate.sku_title.startswith("Microsoft 365 E7")
+                for candidate in session.estate.pending_lines[0].candidates
+            )
+        )
+        response = "\n".join(
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+        )
+        self.assertIn("Microsoft 365 E7 without Audio Conferencing", response)
+        self.assertNotIn("Azure SQL Edge", response)
+
     async def test_unfinished_capture_allows_out_of_scope_interruptions_then_resumes(self) -> None:
         class IncorrectCaptureInterpreter:
             """Models the exact production failure: every turn is labelled capture."""
@@ -932,6 +982,13 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         assert session is not None
         self.assertEqual(session.capture_messages, ["E3"])
         self.assertEqual(len(extractor.inputs), 1)
+
+        await service._handle_text(sender, "Thanks")
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertEqual(session.capture_messages, ["E3"])
+        self.assertEqual(len(extractor.inputs), 1)
+        self.assertIn("You’re welcome", client.messages[-1].text.body)  # type: ignore[attr-defined]
 
         await service._handle_text(sender, "15")
         session = await self.orchestrator.get_session(sender)

@@ -234,6 +234,26 @@ class V6DistributorWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(all("SKU ID:" in format_sku_candidate(item) for item in exact_title))
 
+    def test_me_suite_shorthand_resolves_only_to_the_microsoft_365_family(self) -> None:
+        expected = {
+            "ME3": "Microsoft 365 E3",
+            "ME5": "Microsoft 365 E5",
+            "ME7": "Microsoft 365 E7",
+        }
+        for query, title_prefix in expected.items():
+            with self.subTest(query=query):
+                candidates = self.catalog.candidates(query, limit=None)
+
+                self.assertTrue(candidates)
+                self.assertTrue(
+                    all(item.sku_title.startswith(title_prefix) for item in candidates)
+                )
+                self.assertTrue(
+                    all(item.product_id == "CFQ7TTC0LFLX" for item in candidates)
+                    if query == "ME3"
+                    else all(item.product_id for item in candidates)
+                )
+
     def test_no_teams_suite_variant_stays_in_its_suite_family(self) -> None:
         self.assertEqual(product_family("Office 365 E1 (no Teams)"), "Office 365")
         self.assertEqual(

@@ -825,7 +825,71 @@ class WhatsAppWebhookService:
             r"^(?:who|what|which|where|when|why|how|did|does|is|are|can|could|would)\b",
             value,
         )
-        return bool(question) and not cls._looks_like_requirement_fragment(message)
+        if not question:
+            return False
+        specific_product = any(
+            marker in value
+            for marker in (
+                "copilot",
+                "power bi",
+                "microsoft 365",
+                "office 365",
+                "teams",
+                "defender",
+                "intune",
+                "entra",
+                "visio",
+                "project plan",
+                "dynamics 365",
+                "windows 11",
+            )
+        ) or bool(re.search(r"\b(?:m?e[1357]|o365|m365)\b", value))
+        licensing_action = bool(
+            re.search(
+                r"\b(?:add|include|replace|remove|change|upgrade|renew|quote|price|"
+                r"want|need|require|use|select|compare)\b",
+                value,
+            )
+        )
+        # "Which licence did Virat Kohli buy?" contains licensing vocabulary but
+        # is not a seller requirement. Conversely, "Can you add ME7?" is a real
+        # licensing instruction expressed as a question.
+        return not (specific_product and licensing_action)
+
+    @staticmethod
+    def _is_gratitude_turn(message: str) -> bool:
+        """Recognize a standalone thank-you without consuming a pending licence turn."""
+
+        value = " ".join(message.casefold().strip(" ?!.,").split())
+        return bool(
+            re.fullmatch(
+                r"(?:ok(?:ay)?\s+)?(?:thanks?|thank\s+you|thankyou|thanx|thx|"
+                r"thaks?)(?:\s+(?:so much|very much|bro|sir))?",
+                value,
+            )
+        )
+
+    async def _send_gratitude_reply(
+        self,
+        sender: str,
+        session: WorkflowSession | None,
+    ) -> None:
+        if session is not None and session.capture_messages:
+            response = (
+                "You’re welcome. I’ve kept the unfinished licence details. Continue with "
+                "the missing product or quantity whenever you are ready."
+            )
+        elif session is not None and session.estate is not None:
+            response = (
+                "You’re welcome. Your current licensing draft remains saved and unchanged. "
+                "Continue whenever you are ready."
+            )
+        else:
+            response = (
+                "You’re welcome. Send a Microsoft licensing requirement whenever you are "
+                "ready."
+            )
+        await self._send_text(sender, response)
 
     async def _send_non_requirement_boundary(self, sender: str) -> None:
         await self._send_text(
@@ -882,10 +946,12 @@ class WhatsAppWebhookService:
         intent = await self._interpret_pending_message(message, session)
         if intent is None:
             return False
+        if self._is_clear_non_requirement_turn(message):
+            await self._send_non_requirement_boundary(sender)
+            return True
+        if self._looks_like_requirement_fragment(message):
+            return False
         if intent.action == "capture_requirement":
-            if self._is_clear_non_requirement_turn(message):
-                await self._send_non_requirement_boundary(sender)
-                return True
             return False
         if intent.action == "clarify":
             if self._looks_like_requirement_fragment(message) or re.fullmatch(
@@ -1348,10 +1414,7 @@ class WhatsAppWebhookService:
                 "capture_requirement",
                 "add_sku",
                 "replace_sku",
-            } or (
-                intent.action == "clarify"
-                and self._looks_like_requirement_fragment(message)
-            ):
+            } or self._looks_like_requirement_fragment(message):
                 if self._is_clear_non_requirement_turn(message):
                     await self._send_non_requirement_boundary(sender)
                     return True
@@ -1484,10 +1547,7 @@ class WhatsAppWebhookService:
                     "capture_requirement",
                     "add_sku",
                     "replace_sku",
-                } or (
-                    intent.action == "clarify"
-                    and self._looks_like_requirement_fragment(message)
-                ):
+                } or self._looks_like_requirement_fragment(message):
                     if self._is_clear_non_requirement_turn(message):
                         await self._send_non_requirement_boundary(sender)
                         return True
@@ -1803,6 +1863,9 @@ class WhatsAppWebhookService:
         lowered = command.casefold()
         intro_request = " ".join(lowered.strip(" ?!.,").split())
         session = await self._orchestrator.get_session(sender)
+        if self._is_gratitude_turn(command):
+            await self._send_gratitude_reply(sender, session)
+            return
         if lowered in {"/help", "/start", "/about", "/analyze"} or intro_request in {
             "hi",
             "hello",
@@ -1945,6 +2008,16 @@ class WhatsAppWebhookService:
             and not lowered.startswith("/")
         ):
             if session is None or session.estate is None:
+                if (
+                    self._looks_like_requirement_fragment(command)
+                    and not re.match(
+                        r"^(?:who|what|which|where|when|why|how|did|does|is|are|"
+                        r"can|could|would)\b",
+                        intro_request,
+                    )
+                ):
+                    await self._capture_typed_requirement(sender, command)
+                    return
                 if self._intent_interpreter is not None:
                     try:
                         intent = await self._intent_interpreter.interpret(command, session)

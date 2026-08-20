@@ -106,6 +106,11 @@ def normalize_product_title(value: str) -> str:
     normalized = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
     normalized = " ".join(normalized.split())
     aliases = (
+        # Sellers commonly use ME3/ME5/ME7 as shorthand for the Microsoft 365
+        # Enterprise suites. Resolve those terms before fuzzy matching so a
+        # quantity such as "ME7 1 qty" cannot make an unrelated "1 year" SKU
+        # look like the closest catalogue result.
+        (r"\bme([357])\b", r"microsoft 365 e\1"),
         (r"\bm365\b", "microsoft 365"),
         (r"\bo365\b", "office 365"),
         (r"\bems\b", "enterprise mobility security"),
