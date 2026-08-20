@@ -983,19 +983,52 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.capture_messages, ["E3"])
         self.assertEqual(len(extractor.inputs), 1)
 
-        await service._handle_text(sender, "Thanks")
-        session = await self.orchestrator.get_session(sender)
-        assert session is not None
-        self.assertEqual(session.capture_messages, ["E3"])
-        self.assertEqual(len(extractor.inputs), 1)
-        self.assertIn("You’re welcome", client.messages[-1].text.body)  # type: ignore[attr-defined]
-
         await service._handle_text(sender, "15")
         session = await self.orchestrator.get_session(sender)
         assert session is not None and session.estate is not None
         self.assertEqual(session.capture_messages, [])
         self.assertEqual(session.estate.lines[0].display_title, "Microsoft 365 E3")
         self.assertEqual(session.estate.lines[0].renewal_quantity, 15)
+
+    async def test_conversational_acknowledgement_preserves_unfinished_context(self) -> None:
+        class ConversationInterpreter:
+            async def interpret(self, message: str, *_: object) -> object:
+                if "thank" in message.casefold():
+                    return SimpleNamespace(
+                        action="acknowledge",
+                        response_text=(
+                            "You’re welcome. I’ve kept the current licensing details."
+                        ),
+                    )
+                return SimpleNamespace(action="capture_requirement")
+
+        sender = "acknowledgement-context-seller"
+        await self.orchestrator.remember_capture_message(sender, "E3")
+        extractor = ContextAwareFragmentExtractor(product="Microsoft 365 E3", quantity=15)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=ConversationInterpreter(),  # type: ignore[arg-type]
+            requirement_extractor=extractor,  # type: ignore[arg-type]
+        )
+
+        await service._handle_text(sender, "Thank you so much")
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertEqual(session.capture_messages, ["E3"])
+        self.assertEqual(extractor.inputs, [])
+        self.assertEqual(
+            client.messages[-1].text.body,  # type: ignore[attr-defined]
+            "You’re welcome. I’ve kept the current licensing details.",
+        )
 
     async def test_complete_product_correction_supersedes_pending_match_without_loop(self) -> None:
         class CorrectionInterpreter:

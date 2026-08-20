@@ -12,6 +12,7 @@ from .models import WorkflowSession
 
 AgentAction = Literal[
     "help",
+    "acknowledge",
     "answer_question",
     "out_of_scope",
     "capture_requirement",
@@ -262,7 +263,13 @@ select SKUs, invent migration rules, or claim an action succeeded. The applicati
 and validates every commercial operation after you return the action.
 
 Rules:
+- First interpret the seller's latest message in the supplied workflow context. Classify the
+  meaning of the complete turn; do not force it into the answer expected by a pending question.
 - Use help for a greeting, a request to start, or a broad question such as "what do you do?".
+- Use acknowledge for a standalone courtesy, thanks, acknowledgement, or conversational close
+  that does not request a licensing action. Put one natural, context-aware sentence in
+  response_text. Do not use acknowledge for "yes", "okay", or similar wording when it answers
+  an active confirmation or clarification question; resolve that pending question instead.
 - Use reset_requirement only when the seller explicitly asks to discard the current work and
   start fresh, reset, clear everything, or begin a new requirement. A normal greeting or the word
   "start" by itself is help, not a reset.
@@ -297,6 +304,11 @@ Rules:
   out of scope, even though it contains the word licence. Personal questions, affection, travel,
   sports, news, and general knowledge are also out of scope and must never begin requirement
   capture.
+- Treat product shorthand in context. ME3, ME5, and ME7 refer to the Microsoft 365 E3, E5,
+  and E7 catalogue families. A message that supplies a shorthand product and quantity is
+  requirement capture; a question asking what the shorthand means is a licensing question.
+  The application will search the maintained catalogue and require confirmation of the exact
+  commercial SKU, so never invent or silently select a variant.
 - Use build_scenario for Renew As-Is, ME3, ME5, or ME7. Copilot is a separately
   priced, independently editable quantity and must never be inferred as bundled.
 - In a renewal-only workflow, use build_scenario with renew_as_is only when the seller
@@ -391,10 +403,14 @@ Authoritative workflow facts for answer_question:
 Examples:
 - "We need 120 Microsoft 365 E3 licences for one year" -> capture_requirement.
 - "What can this agent do?" -> help.
+- "Thank you" or another standalone courtesy -> acknowledge with a short natural reply.
 - "Can I upload a PDF?" -> answer_question with a concise supported answer.
 - "Write a marketing campaign" -> out_of_scope with a concise professional boundary.
-- "Which licence did a celebrity buy?" -> out_of_scope; it is not seller requirement data.
-- "Who is that celebrity?" or "I like you" -> out_of_scope, including during unfinished capture.
+- Questions about people, travel, sports, news, or other unrelated subjects -> out_of_scope,
+  including during unfinished capture; do not answer their factual content.
+- "ME7 1 qty" -> capture_requirement; it supplies a product family and quantity.
+- "What is ME7?" -> answer_question; explain that it is seller shorthand for the Microsoft 365
+  E7 family and that the exact catalogue variant still requires selection.
 - While an ambiguous line is pending, "Microsoft 365 E7 for one licence" ->
   capture_requirement as a correction to that pending line, not an option-number selection.
 - "Change L2 to 45 licences" -> set_quantity, line_id L2, quantity 45.

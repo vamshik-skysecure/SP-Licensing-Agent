@@ -72,6 +72,9 @@ from app.schema.whatsapp import (
 
 logger = get_logger(__name__)
 RESPONSIVE_MESSAGE_LIMIT = 900
+CONVERSATIONAL_ACTIONS = frozenset(
+    {"help", "acknowledge", "answer_question", "out_of_scope"}
+)
 
 
 HELP_TEXT = (
@@ -856,41 +859,6 @@ class WhatsAppWebhookService:
         # licensing instruction expressed as a question.
         return not (specific_product and licensing_action)
 
-    @staticmethod
-    def _is_gratitude_turn(message: str) -> bool:
-        """Recognize a standalone thank-you without consuming a pending licence turn."""
-
-        value = " ".join(message.casefold().strip(" ?!.,").split())
-        return bool(
-            re.fullmatch(
-                r"(?:ok(?:ay)?\s+)?(?:thanks?|thank\s+you|thankyou|thanx|thx|"
-                r"thaks?)(?:\s+(?:so much|very much|bro|sir))?",
-                value,
-            )
-        )
-
-    async def _send_gratitude_reply(
-        self,
-        sender: str,
-        session: WorkflowSession | None,
-    ) -> None:
-        if session is not None and session.capture_messages:
-            response = (
-                "You’re welcome. I’ve kept the unfinished licence details. Continue with "
-                "the missing product or quantity whenever you are ready."
-            )
-        elif session is not None and session.estate is not None:
-            response = (
-                "You’re welcome. Your current licensing draft remains saved and unchanged. "
-                "Continue whenever you are ready."
-            )
-        else:
-            response = (
-                "You’re welcome. Send a Microsoft licensing requirement whenever you are "
-                "ready."
-            )
-        await self._send_text(sender, response)
-
     async def _send_non_requirement_boundary(self, sender: str) -> None:
         await self._send_text(
             sender,
@@ -1173,11 +1141,7 @@ class WhatsAppWebhookService:
                 await self._resume_saved_session(sender, session)
                 return True
             intent = await self._interpret_pending_message(message, session)
-            if intent is not None and intent.action in {
-                "help",
-                "answer_question",
-                "out_of_scope",
-            }:
+            if intent is not None and intent.action in CONVERSATIONAL_ACTIONS:
                 await self._execute_agent_intent(
                     sender,
                     intent,
@@ -1240,7 +1204,7 @@ class WhatsAppWebhookService:
                 f"complete requirement. {pending.question}",
             )
             return True
-        if intent.action in {"help", "answer_question", "out_of_scope"}:
+        if intent.action in CONVERSATIONAL_ACTIONS:
             await self._execute_agent_intent(
                 sender,
                 intent,
@@ -1398,12 +1362,7 @@ class WhatsAppWebhookService:
 
         intent = await self._interpret_pending_message(message, session)
         if intent is not None:
-            if intent.action in {
-                "help",
-                "answer_question",
-                "out_of_scope",
-                "reset_requirement",
-            }:
+            if intent.action in CONVERSATIONAL_ACTIONS | {"reset_requirement"}:
                 await self._execute_agent_intent(
                     sender,
                     intent,
@@ -1531,12 +1490,7 @@ class WhatsAppWebhookService:
         if number is None or number < 1 or number > len(pending.candidates):
             intent = await self._interpret_pending_message(message, session)
             if intent is not None:
-                if intent.action in {
-                    "help",
-                    "answer_question",
-                    "out_of_scope",
-                    "reset_requirement",
-                }:
+                if intent.action in CONVERSATIONAL_ACTIONS | {"reset_requirement"}:
                     await self._execute_agent_intent(
                         sender,
                         intent,
@@ -1863,9 +1817,6 @@ class WhatsAppWebhookService:
         lowered = command.casefold()
         intro_request = " ".join(lowered.strip(" ?!.,").split())
         session = await self._orchestrator.get_session(sender)
-        if self._is_gratitude_turn(command):
-            await self._send_gratitude_reply(sender, session)
-            return
         if lowered in {"/help", "/start", "/about", "/analyze"} or intro_request in {
             "hi",
             "hello",
@@ -2341,6 +2292,27 @@ class WhatsAppWebhookService:
     ) -> None:
         if intent.action == "help":
             await self._send_text(sender, HELP_TEXT)
+            return
+        if intent.action == "acknowledge":
+            response = self._professional_agent_text(intent.response_text)
+            session = await self._orchestrator.get_session(sender)
+            if not response:
+                if session is not None and session.capture_messages:
+                    response = (
+                        "You’re welcome. I’ve kept the unfinished licence details; continue "
+                        "whenever you are ready."
+                    )
+                elif session is not None and session.estate is not None:
+                    response = (
+                        "You’re welcome. The current licensing draft remains saved and "
+                        "unchanged."
+                    )
+                else:
+                    response = (
+                        "You’re welcome. Send a Microsoft licensing requirement whenever "
+                        "you are ready."
+                    )
+            await self._send_text(sender, response[:500])
             return
         if intent.action == "reset_requirement":
             await self._orchestrator.reset_session(sender)
