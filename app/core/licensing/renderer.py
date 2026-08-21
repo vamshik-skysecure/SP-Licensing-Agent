@@ -26,7 +26,6 @@ def format_estate(
 ) -> str:
     lines = [
         "*Captured licensing requirement*",
-        f"Source: {estate.source_file}",
         f"SKU lines: {len(estate.lines)}",
         f"Total licences: {sum(item.total_licenses for item in estate.lines):,}",
     ]

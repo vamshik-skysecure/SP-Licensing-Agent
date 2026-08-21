@@ -5,7 +5,10 @@ import io
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
+from itertools import islice
 from pathlib import Path
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile, ZipFile
 
 from .models import (
     EstateStatus,
@@ -19,6 +22,17 @@ from .rate_card import RateCardCatalog, RateCardProvider
 
 class LicenseAnalysisError(ValueError):
     pass
+
+
+class UnsupportedLicenseLayoutError(LicenseAnalysisError):
+    """A readable file whose tabular layout requires structured extraction."""
+
+
+MAX_CUSTOMER_FILE_ROWS = 1_000
+MAX_CUSTOMER_FILE_COLUMNS = 100
+MAX_PRODUCT_TITLE_CHARS = 500
+MAX_CUSTOMER_XLSX_EXPANDED_BYTES = 100 * 1024 * 1024
+MAX_CUSTOMER_XLSX_MEMBERS = 2_000
 
 
 _HEADER_ALIASES = {
@@ -259,18 +273,55 @@ def _csv_rows(content: bytes) -> Iterable[Sequence[object]]:
         text = content.decode("utf-8-sig")
     except UnicodeDecodeError as error:
         raise LicenseAnalysisError("The customer CSV must be UTF-8 encoded.") from error
-    yield from csv.reader(io.StringIO(text))
+    try:
+        yield from csv.reader(io.StringIO(text))
+    except csv.Error as error:
+        raise LicenseAnalysisError("The customer CSV is malformed.") from error
 
 
 def _xlsx_rows(content: bytes) -> Iterable[Sequence[object]]:
     from openpyxl import load_workbook
+    from openpyxl.utils.exceptions import InvalidFileException
 
-    workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    _validate_xlsx_container(content)
+    try:
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    except (BadZipFile, InvalidFileException, KeyError, OSError, ParseError, ValueError) as error:
+        raise LicenseAnalysisError(
+            "The Excel workbook is damaged or is not a valid XLSX/XLSM file."
+        ) from error
     try:
         worksheet = workbook.active
-        yield from worksheet.iter_rows(values_only=True)
+        # A small compressed XLSX can expand into an enormous worksheet. Bounding both
+        # dimensions keeps malformed customer files from exhausting an App Service worker.
+        yield from worksheet.iter_rows(
+            max_row=MAX_CUSTOMER_FILE_ROWS + 26,
+            max_col=MAX_CUSTOMER_FILE_COLUMNS,
+            values_only=True,
+        )
     finally:
         workbook.close()
+
+
+def _validate_xlsx_container(content: bytes) -> None:
+    """Reject compressed workbooks whose expanded archive is operationally unsafe."""
+
+    try:
+        with ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_CUSTOMER_XLSX_MEMBERS:
+                raise LicenseAnalysisError(
+                    "The Excel workbook contains too many internal files."
+                )
+            expanded = sum(member.file_size for member in members)
+            if expanded > MAX_CUSTOMER_XLSX_EXPANDED_BYTES:
+                raise LicenseAnalysisError(
+                    "The Excel workbook expands beyond the safe processing limit."
+                )
+    except BadZipFile as error:
+        raise LicenseAnalysisError(
+            "The Excel workbook is damaged or is not a valid XLSX/XLSM file."
+        ) from error
 
 
 def _header_key(value: object) -> str:
@@ -321,7 +372,7 @@ def _seller_details_from_preamble(
 
 
 def _parse_rows(rows: Iterable[Sequence[object]]) -> list[ParsedLicenseRow]:
-    materialized = list(rows)
+    materialized = list(islice(rows, MAX_CUSTOMER_FILE_ROWS + 27))
     if not materialized:
         raise LicenseAnalysisError("The uploaded licence file is empty.")
 
@@ -336,8 +387,15 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[ParsedLicenseRow]:
             raw_headers = candidate_headers
             break
     if header_index < 0:
-        raise LicenseAnalysisError(
+        raise UnsupportedLicenseLayoutError(
             "Could not find a header row containing SKU/Product Name and Quantity."
+        )
+
+    data_row_count = len(materialized) - header_index - 1
+    if data_row_count > MAX_CUSTOMER_FILE_ROWS:
+        raise LicenseAnalysisError(
+            f"The licence file contains more than {MAX_CUSTOMER_FILE_ROWS:,} data rows. "
+            "Split it into smaller customer requirements and retry."
         )
 
     columns: dict[int, str] = {}
@@ -365,6 +423,10 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[ParsedLicenseRow]:
         title = str(record.get("product_title") or "").strip()
         if not title:
             raise LicenseAnalysisError(f"Row {row_number}: Product Title is empty.")
+        if len(title) > MAX_PRODUCT_TITLE_CHARS:
+            raise LicenseAnalysisError(
+                f"Row {row_number}: Product Title exceeds {MAX_PRODUCT_TITLE_CHARS} characters."
+            )
         total = _quantity(record.get("total_licenses"), row_number, "Total Licenses")
         expired = _optional_quantity(
             record.get("expired_licenses"), row_number, "Expired Licenses"

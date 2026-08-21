@@ -234,6 +234,16 @@ class V6DistributorWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(all("SKU ID:" in format_sku_candidate(item) for item in exact_title))
 
+    def test_generic_catalogue_wording_asks_for_a_plan_instead_of_flooding_options(
+        self,
+    ) -> None:
+        for query in ("Microsoft", "Microsoft licence", "Microsoft 365", "Office 365"):
+            with self.subTest(query=query):
+                self.assertEqual(self.catalog.candidates(query, limit=None), [])
+
+        self.assertTrue(self.catalog.candidates("Microsoft 365 E3", limit=None))
+        self.assertTrue(self.catalog.candidates("Defender Endpoint", limit=None))
+
     def test_me_suite_shorthand_resolves_only_to_the_microsoft_365_family(self) -> None:
         expected = {
             "ME3": "Microsoft 365 E3",

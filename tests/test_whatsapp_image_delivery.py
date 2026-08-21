@@ -3,7 +3,7 @@ import unittest
 
 from httpx import AsyncClient, MockTransport, Request, Response
 
-from app.core.whatsapp import WhatsAppClient
+from app.core.whatsapp import WhatsAppClient, WhatsAppMediaTooLargeError
 
 
 class WhatsAppImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -55,6 +55,62 @@ class WhatsAppImageDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )
+
+    async def test_inbound_media_is_streamed_and_rejected_at_the_size_limit(self) -> None:
+        def handler(request: Request) -> Response:
+            if request.url.host == "graph.facebook.test":
+                return Response(
+                    200,
+                    json={
+                        "url": "https://lookaside.fbsbx.com/media-object",
+                        "mime_type": "image/png",
+                    },
+                )
+            return Response(200, content=b"1234567890")
+
+        async with AsyncClient(transport=MockTransport(handler)) as http_client:
+            client = WhatsAppClient(
+                http_client=http_client,
+                access_token="test-token",
+                phone_number_id="1164810520058946",
+                base_url="https://graph.facebook.test",
+                api_version="v25.0",
+            )
+            with self.assertRaises(WhatsAppMediaTooLargeError):
+                await client.download_media(
+                    "media-123",
+                    "capture.png",
+                    "image/png",
+                    max_bytes=4,
+                )
+
+    async def test_inbound_media_rejects_non_meta_download_host(self) -> None:
+        def handler(request: Request) -> Response:
+            if request.url.host == "graph.facebook.test":
+                return Response(
+                    200,
+                    json={
+                        "url": "https://internal.example.test/media-object",
+                        "mime_type": "image/png",
+                    },
+                )
+            raise AssertionError("Unsafe media URL must not be requested")
+
+        async with AsyncClient(transport=MockTransport(handler)) as http_client:
+            client = WhatsAppClient(
+                http_client=http_client,
+                access_token="test-token",
+                phone_number_id="1164810520058946",
+                base_url="https://graph.facebook.test",
+                api_version="v25.0",
+            )
+            with self.assertRaisesRegex(Exception, "unsafe media URL"):
+                await client.download_media(
+                    "media-123",
+                    "capture.png",
+                    "image/png",
+                    max_bytes=1024,
+                )
 
 
 if __name__ == "__main__":

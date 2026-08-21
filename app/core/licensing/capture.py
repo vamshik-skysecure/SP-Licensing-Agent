@@ -145,6 +145,8 @@ Extraction rules:
   seller_details with a short label and its exact value. Do not infer missing context.
 - Ignore totals, discounts, margin, distributor pricing, and promotional text in the source.
 - Do not merge differently named SKUs.
+- Preserve seller shorthand such as ME3, ME5, and ME7 as the requested product text. Catalogue
+  matching will expand it and ask the seller to confirm the exact Microsoft 365 commercial SKU.
 """
 
 

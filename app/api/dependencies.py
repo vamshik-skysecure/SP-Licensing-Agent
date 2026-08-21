@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from urllib.parse import urlsplit
 
 import httpx
@@ -55,230 +55,223 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.message_dispatch_backend,
     )
 
-    whatsapp_http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(30.0),
-        transport=httpx.AsyncHTTPTransport(retries=settings.whatsapp_connect_retries),
-    )
-    whatsapp_client = WhatsAppClient(
-        http_client=whatsapp_http_client,
-        access_token=settings.whatsapp_access_token,
-        phone_number_id=settings.whatsapp_phone_number_id,
-        base_url=settings.whatsapp_uri,
-        api_version=settings.whatsapp_uri_version,
-    )
-    logger.info(
-        "WhatsApp endpoint configured host=%s api_version=%s",
-        urlsplit(settings.whatsapp_uri).hostname,
-        settings.whatsapp_uri_version,
-    )
-
-    if settings.whatsapp_validate_credentials_on_startup:
-        try:
-            await whatsapp_client.validate_credentials()
-        except WhatsAppAPIError:
-            logger.exception("WhatsApp credential validation failed")
-            if (
-                settings.environment == "production"
-                or settings.runtime_profile == "local_demo"
-            ):
-                await whatsapp_http_client.aclose()
-                raise
-
-    if settings.rate_card_backend == "azure_blob":
-        rate_card_source = AzureBlobRateCardSource(
-            container_name=settings.rate_card_container_name,
-            blob_name=settings.rate_card_blob_name,
-            account_url=settings.rate_card_storage_account_url,
-            connection_string=settings.rate_card_storage_connection_string,
+    async with AsyncExitStack() as cleanup:
+        whatsapp_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0),
+            transport=httpx.AsyncHTTPTransport(
+                retries=settings.whatsapp_connect_retries
+            ),
         )
-    else:
-        rate_card_source = LocalRateCardSource(settings.rate_card_local_path)
-    rate_cards = RateCardProvider(
-        rate_card_source,
-        sheet_name=settings.rate_card_sheet_name,
-    )
-
-    workflow_store: WorkflowStore
-    if settings.workflow_store_backend == "azure_blob":
-        blob_store = AzureBlobWorkflowStore(
-            container_name=settings.workflow_blob_container_name,
-            prefix=settings.workflow_blob_prefix,
-            account_url=settings.rate_card_storage_account_url,
-            connection_string=settings.rate_card_storage_connection_string,
-            session_ttl_minutes=settings.session_ttl_minutes,
+        cleanup.push_async_callback(whatsapp_http_client.aclose)
+        whatsapp_client = WhatsAppClient(
+            http_client=whatsapp_http_client,
+            access_token=settings.whatsapp_access_token,
+            phone_number_id=settings.whatsapp_phone_number_id,
+            base_url=settings.whatsapp_uri,
+            api_version=settings.whatsapp_uri_version,
         )
-        await blob_store.connect()
-        workflow_store = blob_store
-    else:
-        workflow_store = InMemoryWorkflowStore(
-            session_ttl_minutes=settings.session_ttl_minutes,
+        logger.info(
+            "WhatsApp endpoint configured host=%s api_version=%s",
+            urlsplit(settings.whatsapp_uri).hostname,
+            settings.whatsapp_uri_version,
         )
 
-    analyzer = LicenseAnalyzer(
-        rate_cards,
-        match_threshold=settings.sku_match_threshold,
-        default_term_duration=settings.default_term_duration,
-        default_billing_plan=settings.default_billing_plan,
-    )
-    migration_seeds = (
-        None
-        if settings.workflow_mode == "simple_pricing"
-        else MigrationSeedCatalog.load(settings.migration_seed_path)
-    )
-    scenario_engine = ScenarioEngine(
-        migration_seeds,
-        apply_bundle_rules=settings.workflow_mode == "scenario_comparison",
-        price_basis=(
-            settings.simple_price_basis
+        if settings.whatsapp_validate_credentials_on_startup:
+            try:
+                await whatsapp_client.validate_credentials()
+            except WhatsAppAPIError:
+                logger.exception("WhatsApp credential validation failed")
+                if (
+                    settings.environment == "production"
+                    or settings.runtime_profile == "local_demo"
+                ):
+                    raise
+
+        if settings.rate_card_backend == "azure_blob":
+            rate_card_source = AzureBlobRateCardSource(
+                container_name=settings.rate_card_container_name,
+                blob_name=settings.rate_card_blob_name,
+                account_url=settings.rate_card_storage_account_url,
+                connection_string=settings.rate_card_storage_connection_string,
+            )
+        else:
+            rate_card_source = LocalRateCardSource(settings.rate_card_local_path)
+        rate_cards = RateCardProvider(
+            rate_card_source,
+            sheet_name=settings.rate_card_sheet_name,
+        )
+        cleanup.push_async_callback(rate_cards.close)
+
+        workflow_store: WorkflowStore
+        if settings.workflow_store_backend == "azure_blob":
+            blob_store = AzureBlobWorkflowStore(
+                container_name=settings.workflow_blob_container_name,
+                prefix=settings.workflow_blob_prefix,
+                account_url=settings.rate_card_storage_account_url,
+                connection_string=settings.rate_card_storage_connection_string,
+                session_ttl_minutes=settings.session_ttl_minutes,
+            )
+            workflow_store = blob_store
+        else:
+            workflow_store = InMemoryWorkflowStore(
+                session_ttl_minutes=settings.session_ttl_minutes,
+            )
+        cleanup.push_async_callback(workflow_store.close)
+        if isinstance(workflow_store, AzureBlobWorkflowStore):
+            # Register cleanup before connecting so partial Azure SDK clients are also
+            # closed when RBAC, networking, or container validation fails at startup.
+            await workflow_store.connect()
+
+        analyzer = LicenseAnalyzer(
+            rate_cards,
+            match_threshold=settings.sku_match_threshold,
+            default_term_duration=settings.default_term_duration,
+            default_billing_plan=settings.default_billing_plan,
+        )
+        migration_seeds = (
+            None
             if settings.workflow_mode == "simple_pricing"
-            else "partner_best_offer"
-        ),
-    )
-    catalog = await rate_cards.get()
-    simple_prices_available = any(
-        (
-            item.distributor_price > 0
-            if settings.simple_price_basis == "distributor_expected"
-            else item.marketplace_price > 0
+            else MigrationSeedCatalog.load(settings.migration_seed_path)
         )
-        for item in catalog.items
-    )
-    if settings.workflow_mode == "simple_pricing" and not simple_prices_available:
-        raise ValueError(
-            "The simple pricing workflow requires a populated current-price column."
+        scenario_engine = ScenarioEngine(
+            migration_seeds,
+            apply_bundle_rules=settings.workflow_mode == "scenario_comparison",
+            price_basis=(
+                settings.simple_price_basis
+                if settings.workflow_mode == "simple_pricing"
+                else "partner_best_offer"
+            ),
         )
-    if settings.workflow_mode in {"upgrade_comparison", "scenario_comparison"}:
-        scenario_engine.validate_catalog(
-            catalog,
-            term_duration=settings.default_term_duration,
-            billing_plan=settings.default_billing_plan,
-            segment=settings.default_customer_segment,
+        catalog = await rate_cards.get()
+        simple_prices_available = any(
+            (
+                item.distributor_price > 0
+                if settings.simple_price_basis == "distributor_expected"
+                else item.marketplace_price > 0
+            )
+            for item in catalog.items
         )
-    logger.info(
-        "Rate card validated version=%s rows=%s workflow_mode=%s "
-        "migration_seed_rules=%s approved=%s",
-        catalog.version,
-        len(catalog.items),
-        settings.workflow_mode,
-        len(migration_seeds.rules) if migration_seeds is not None else 0,
-        (
-            sum(rule.approved for rule in migration_seeds.rules)
-            if migration_seeds is not None
-            else 0
-        ),
-    )
-    orchestrator = LicensingOrchestrator(
-        analyzer=analyzer,
-        rate_cards=rate_cards,
-        scenarios=scenario_engine,
-        store=workflow_store,
-        default_term_duration=settings.default_term_duration,
-        default_billing_plan=settings.default_billing_plan,
-        default_segment=settings.default_customer_segment,
-    )
-    intent_interpreter: IntentInterpreter | None = None
-    if settings.ai_intent_backend == "openai":
-        intent_interpreter = OpenAIIntentInterpreter(
-            api_key=settings.openai_api_key,
-            model=settings.openai_model,
-            reasoning_effort=settings.openai_reasoning_effort,
-            workflow_mode=settings.workflow_mode,
-            currency=settings.default_currency,
+        if settings.workflow_mode == "simple_pricing" and not simple_prices_available:
+            raise ValueError(
+                "The simple pricing workflow requires a populated current-price column."
+            )
+        if settings.workflow_mode in {"upgrade_comparison", "scenario_comparison"}:
+            scenario_engine.validate_catalog(
+                catalog,
+                term_duration=settings.default_term_duration,
+                billing_plan=settings.default_billing_plan,
+                segment=settings.default_customer_segment,
+            )
+        logger.info(
+            "Rate card validated version=%s rows=%s workflow_mode=%s "
+            "migration_seed_rules=%s approved=%s",
+            catalog.version,
+            len(catalog.items),
+            settings.workflow_mode,
+            len(migration_seeds.rules) if migration_seeds is not None else 0,
+            (
+                sum(rule.approved for rule in migration_seeds.rules)
+                if migration_seeds is not None
+                else 0
+            ),
         )
-    requirement_extractor: RequirementExtractor | None = None
-    if settings.requirement_capture_backend == "openai":
-        requirement_extractor = OpenAIRequirementExtractor(
-            api_key=settings.openai_api_key,
-            model=settings.openai_model,
-            transcription_model=settings.openai_transcription_model,
-            max_audio_seconds=settings.max_audio_seconds,
-            reasoning_effort=settings.openai_reasoning_effort,
+        orchestrator = LicensingOrchestrator(
+            analyzer=analyzer,
+            rate_cards=rate_cards,
+            scenarios=scenario_engine,
+            store=workflow_store,
+            default_term_duration=settings.default_term_duration,
+            default_billing_plan=settings.default_billing_plan,
+            default_segment=settings.default_customer_segment,
         )
-    recommendation_advisor: RecommendationAdvisor | None = None
-    if settings.official_recommendation_backend == "openai_web":
-        recommendation_advisor = OpenAIMicrosoftRecommendationAdvisor(
-            api_key=settings.openai_api_key,
-            model=settings.openai_model,
-            reasoning_effort=settings.openai_reasoning_effort,
+        intent_interpreter: IntentInterpreter | None = None
+        if settings.ai_intent_backend == "openai":
+            intent_interpreter = OpenAIIntentInterpreter(
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+                reasoning_effort=settings.openai_reasoning_effort,
+                workflow_mode=settings.workflow_mode,
+                currency=settings.default_currency,
+            )
+            cleanup.push_async_callback(intent_interpreter.close)
+        requirement_extractor: RequirementExtractor | None = None
+        if settings.requirement_capture_backend == "openai":
+            requirement_extractor = OpenAIRequirementExtractor(
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+                transcription_model=settings.openai_transcription_model,
+                max_audio_seconds=settings.max_audio_seconds,
+                reasoning_effort=settings.openai_reasoning_effort,
+            )
+            cleanup.push_async_callback(requirement_extractor.close)
+        recommendation_advisor: RecommendationAdvisor | None = None
+        if settings.official_recommendation_backend == "openai_web":
+            recommendation_advisor = OpenAIMicrosoftRecommendationAdvisor(
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+                reasoning_effort=settings.openai_reasoning_effort,
+            )
+            cleanup.push_async_callback(recommendation_advisor.close)
+        if settings.openai_validate_models_on_startup:
+            try:
+                if intent_interpreter is not None:
+                    await intent_interpreter.validate_model_access()
+                if requirement_extractor is not None:
+                    await requirement_extractor.validate_model_access()
+                if recommendation_advisor is not None:
+                    await recommendation_advisor.validate_model_access()
+            except OpenAIError:
+                logger.exception("OpenAI model access validation failed")
+                raise
+            logger.info("OpenAI model access validation completed")
+        webhook_service = WhatsAppWebhookService(
+            whatsapp_client=whatsapp_client,
+            orchestrator=orchestrator,
+            configuration=ServiceConfiguration(
+                seller_allowlist=settings.seller_allowlist,
+                max_document_bytes=settings.max_document_bytes,
+                allow_all_sellers=settings.whatsapp_allow_all_sellers,
+                max_image_bytes=settings.max_image_bytes,
+                max_audio_bytes=settings.max_audio_bytes,
+                currency=settings.default_currency,
+                simple_price_basis=settings.simple_price_basis,
+                workflow_mode=settings.workflow_mode,
+            ),
+            intent_interpreter=intent_interpreter,
+            requirement_extractor=requirement_extractor,
+            recommendation_advisor=recommendation_advisor,
         )
-    if settings.openai_validate_models_on_startup:
-        try:
-            if intent_interpreter is not None:
-                await intent_interpreter.validate_model_access()
-            if requirement_extractor is not None:
-                await requirement_extractor.validate_model_access()
-            if recommendation_advisor is not None:
-                await recommendation_advisor.validate_model_access()
-        except OpenAIError:
-            logger.exception("OpenAI model access validation failed")
-            if intent_interpreter is not None:
-                await intent_interpreter.close()
-            if requirement_extractor is not None:
-                await requirement_extractor.close()
-            if recommendation_advisor is not None:
-                await recommendation_advisor.close()
-            await workflow_store.close()
-            await rate_cards.close()
-            await whatsapp_http_client.aclose()
-            raise
-        logger.info("OpenAI model access validation completed")
-    webhook_service = WhatsAppWebhookService(
-        whatsapp_client=whatsapp_client,
-        orchestrator=orchestrator,
-        configuration=ServiceConfiguration(
-            seller_allowlist=settings.seller_allowlist,
-            max_document_bytes=settings.max_document_bytes,
-            allow_all_sellers=settings.whatsapp_allow_all_sellers,
-            max_image_bytes=settings.max_image_bytes,
-            max_audio_bytes=settings.max_audio_bytes,
-            currency=settings.default_currency,
-            simple_price_basis=settings.simple_price_basis,
-            workflow_mode=settings.workflow_mode,
-        ),
-        intent_interpreter=intent_interpreter,
-        requirement_extractor=requirement_extractor,
-        recommendation_advisor=recommendation_advisor,
-    )
 
-    dispatcher: WebhookDispatcher
-    if settings.message_dispatch_backend == "azure_blob":
-        dispatcher = AzureBlobWebhookDispatcher(
-            container_name=settings.workflow_blob_container_name,
-            prefix=settings.webhook_blob_prefix,
-            account_url=settings.rate_card_storage_account_url,
-            connection_string=settings.rate_card_storage_connection_string,
-            poll_seconds=settings.webhook_blob_poll_seconds,
-            max_delivery_count=settings.webhook_max_delivery_count,
-        )
-    else:
-        dispatcher = DirectWebhookDispatcher()
-    await dispatcher.start(webhook_service)
+        dispatcher: WebhookDispatcher
+        if settings.message_dispatch_backend == "azure_blob":
+            dispatcher = AzureBlobWebhookDispatcher(
+                container_name=settings.workflow_blob_container_name,
+                prefix=settings.webhook_blob_prefix,
+                account_url=settings.rate_card_storage_account_url,
+                connection_string=settings.rate_card_storage_connection_string,
+                poll_seconds=settings.webhook_blob_poll_seconds,
+                max_delivery_count=settings.webhook_max_delivery_count,
+            )
+        else:
+            dispatcher = DirectWebhookDispatcher()
+        cleanup.push_async_callback(dispatcher.close)
+        await dispatcher.start(webhook_service)
 
-    app.state.settings = settings
-    app.state.whatsapp_client = whatsapp_client
-    app.state.rate_cards = rate_cards
-    app.state.scenario_engine = scenario_engine
-    app.state.workflow_store = workflow_store
-    app.state.licensing_orchestrator = orchestrator
-    app.state.whatsapp_webhook_service = webhook_service
-    app.state.webhook_dispatcher = dispatcher
+        app.state.settings = settings
+        app.state.whatsapp_client = whatsapp_client
+        app.state.rate_cards = rate_cards
+        app.state.scenario_engine = scenario_engine
+        app.state.workflow_store = workflow_store
+        app.state.licensing_orchestrator = orchestrator
+        app.state.whatsapp_webhook_service = webhook_service
+        app.state.webhook_dispatcher = dispatcher
 
-    try:
         logger.info("Application startup completed")
-        yield
-    finally:
-        logger.info("Application shutdown started")
-        await dispatcher.close()
-        await workflow_store.close()
-        await rate_cards.close()
-        if intent_interpreter is not None:
-            await intent_interpreter.close()
-        if requirement_extractor is not None:
-            await requirement_extractor.close()
-        if recommendation_advisor is not None:
-            await recommendation_advisor.close()
-        await whatsapp_http_client.aclose()
-        logger.info("Application shutdown completed")
+        try:
+            yield
+        finally:
+            logger.info("Application shutdown started")
+    logger.info("Application shutdown completed")
 
 
 def get_settings(request: Request) -> Settings:

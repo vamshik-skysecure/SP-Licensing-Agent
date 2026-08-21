@@ -1,14 +1,17 @@
+import io
 import unittest
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from app.api.whatsapp.service import ServiceConfiguration, WhatsAppWebhookService
 from app.core.licensing.analysis import (
     LicenseAnalysisError,
     LicenseAnalyzer,
+    MAX_CUSTOMER_FILE_ROWS,
     parse_customer_file,
 )
 from app.core.licensing.agent import (
@@ -34,6 +37,7 @@ from app.core.licensing.models import (
 )
 from app.core.licensing.orchestrator import LicensingOrchestrator
 from app.core.licensing.rate_card import (
+    RateCardError,
     RateCardCatalog,
     RateCardPayload,
     RateCardProvider,
@@ -184,11 +188,63 @@ class ParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(LicenseAnalysisError, "cannot exceed"):
             parse_customer_file(invalid, "invalid.csv")
 
+    def test_customer_parser_rejects_excessive_rows_before_materializing_all_input(self) -> None:
+        content = (
+            "Product Title,Total Licenses\n"
+            + "\n".join("Microsoft 365 E3,1" for _ in range(MAX_CUSTOMER_FILE_ROWS + 1))
+        ).encode()
+
+        with self.assertRaisesRegex(LicenseAnalysisError, "more than 1,000 data rows"):
+            parse_customer_file(content, "oversized.csv")
+
+    def test_customer_parser_returns_safe_error_for_corrupt_workbook(self) -> None:
+        with self.assertRaisesRegex(LicenseAnalysisError, "damaged or is not a valid"):
+            parse_customer_file(b"not-an-xlsx", "customer.xlsx")
+
+    def test_customer_parser_rejects_unsafe_expanded_workbook(self) -> None:
+        content = io.BytesIO()
+        with ZipFile(content, "w", compression=ZIP_DEFLATED) as archive:
+            archive.writestr("xl/worksheets/sheet1.xml", b"x" * 512)
+
+        with patch(
+            "app.core.licensing.analysis.MAX_CUSTOMER_XLSX_EXPANDED_BYTES",
+            128,
+        ):
+            with self.assertRaisesRegex(LicenseAnalysisError, "safe processing limit"):
+                parse_customer_file(content.getvalue(), "customer.xlsx")
+
     def test_rate_card_uses_decimal_values(self) -> None:
         items = parse_rate_card(RATE_CARD, "outcome-sheet.csv")
 
         self.assertEqual(items[0].initial_quote_without_promo, Decimal("100"))
         self.assertIsInstance(items[0].initial_quote_without_promo, Decimal)
+
+    def test_rate_card_parser_rejects_excessive_rows(self) -> None:
+        content = b"""ProductId,SkuId,SkuTitle,TermDuration,BillingPlan,Initial Quote With Promo,Initial Quote Without Promo
+p1,s1,Product 1,P1Y,Annual,10,10
+p2,s2,Product 2,P1Y,Annual,20,20
+p3,s3,Product 3,P1Y,Annual,30,30
+"""
+
+        with patch("app.core.licensing.rate_card.MAX_RATE_CARD_ROWS", 2):
+            with self.assertRaisesRegex(RateCardError, "more than 2 data rows"):
+                parse_rate_card(content, "rate-card.csv")
+
+    def test_rate_card_parser_returns_safe_error_for_corrupt_workbook(self) -> None:
+        with self.assertRaisesRegex(RateCardError, "damaged or invalid"):
+            parse_rate_card(b"not-an-xlsx", "rate-card.xlsx")
+
+    def test_rate_card_parser_rejects_unsafe_expanded_workbook(self) -> None:
+        content = io.BytesIO()
+        with ZipFile(content, "w", compression=ZIP_DEFLATED) as archive:
+            archive.writestr("xl/worksheets/sheet1.xml", b"x" * 512)
+
+        with patch(
+            "app.core.licensing.rate_card.MAX_RATE_CARD_XLSX_EXPANDED_BYTES",
+            128,
+        ):
+            with self.assertRaisesRegex(RateCardError, "safe processing limit"):
+                parse_rate_card(content.getvalue(), "rate-card.xlsx")
 
     def test_blank_price_is_unavailable_but_numeric_zero_is_free(self) -> None:
         content = b"""ProductId,SkuId,SkuTitle,TermDuration,BillingPlan,ERP Price,UnitPrice/Catalogue,Promo (If new to MS),Net to MS,Expected Partner Pricing with Promo,Expected Partner Pricing without Promo,Initial Quote With Promo,Initial Quote Without Promo
@@ -313,6 +369,16 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(estate.lines[0].renewal_quantity, 8)
         self.assertEqual(estate.lines[0].renewal_date.isoformat(), "2027-08-01")  # type: ignore[union-attr]
 
+    async def test_persisted_session_does_not_store_raw_whatsapp_number(self) -> None:
+        sender = "919876543210"
+
+        await self.orchestrator.remember_capture_message(sender, "Microsoft 365 E3")
+        session = await self.orchestrator.get_session(sender)
+
+        assert session is not None
+        self.assertEqual(session.sender, self.orchestrator.thread_id(sender))
+        self.assertNotIn(sender, session.model_dump_json())
+
     async def test_customer_facing_text_uses_valid_unicode(self) -> None:
         estate = await self.analyzer.analyze(
             thread_id="thread-1", filename="customer.csv", content=CUSTOMER
@@ -355,6 +421,27 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scenario.lines[0].category, "base")
         self.assertEqual(scenario.lines[1].category, "additional")
         self.assertEqual(scenario.total_value, Decimal("950.00"))
+
+    async def test_seller_comments_are_bounded_before_session_persistence(self) -> None:
+        estate = await self.analyzer.analyze(
+            thread_id="thread-1", filename="customer.csv", content=CUSTOMER
+        )
+        scenario = self.engine.build(
+            estate=estate,
+            scenario_type=ScenarioType.RENEW_AS_IS,
+            catalog=await self.provider.get(),
+            term_duration="P1Y",
+            billing_plan="Annual",
+            segment="Commercial",
+        )
+
+        with self.assertRaisesRegex(ScenarioError, "1,000 characters"):
+            self.engine.add_comment(scenario, "x" * 1_001)
+
+        for index in range(20):
+            scenario = self.engine.add_comment(scenario, f"Comment {index + 1}")
+        with self.assertRaisesRegex(ScenarioError, "maximum of 20"):
+            self.engine.add_comment(scenario, "One more")
 
     async def test_target_scenario_retains_unmapped_sku_and_requires_decision(self) -> None:
         estate = await self.analyzer.analyze(
@@ -749,6 +836,10 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(session)
         assert session is not None
+        self.assertNotIn("message-1", session.model_dump_json())
+        self.assertTrue(
+            await self.orchestrator.has_processed("911234567890", "message-1")
+        )
         await self.store.save(session, version)
 
         with self.assertRaises(WorkflowConflictError):

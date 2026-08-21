@@ -44,7 +44,7 @@ RUNTIME_PROFILE=local_demo
 ENVIRONMENT=development
 STORAGE_MODE=local
 WORKFLOW_MODE=simple_pricing
-RATE_CARD_LOCAL_PATH=docs/microsoft_sku_v5.xlsx
+RATE_CARD_LOCAL_PATH=docs/microsoft_sku_v6_distributor.xlsx
 RATE_CARD_SHEET_NAME=Outcome Sheet
 SIMPLE_PRICE_BASIS=distributor_expected
 MESSAGE_DISPATCH_BACKEND=direct
@@ -53,6 +53,11 @@ REQUIREMENT_CAPTURE_BACKEND=openai
 OPENAI_MODEL=gpt-5.6-luna
 WHATSAPP_VALIDATE_CREDENTIALS_ON_STARTUP=true
 ```
+
+The V6 `Outcome Sheet` and `SIMPLE_PRICE_BASIS=distributor_expected` are the
+authoritative UAT pricing configuration. Customer spreadsheets are limited to
+1,000 data rows and 100 columns per upload; split larger estates into reviewed
+batches before UAT.
 
 Start this profile with `scripts/start_local_demo.cmd`; its environment override is limited
 to the local process and does not change Azure. Local mode intentionally loses session state

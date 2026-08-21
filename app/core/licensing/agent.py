@@ -403,6 +403,10 @@ Rules:
   or unrelated message interrupts that capture; classify the new turn on its own and do not force
   it into the missing product/quantity slot. Preserve the unfinished licensing facts so the seller
   can return to them later.
+- When capture_messages already contains a product and the latest reply is only a quantity such
+  as "10", "15 licences", or "around 20", use capture_requirement. Never use set_quantity for a
+  quantity-only reply; set_quantity requires the seller to identify an existing captured line or
+  product that is being changed.
 - pending_dialogue contains the exact question the advisor most recently asked. Interpret a
   short reply such as a number, "yes", or "that one" only as the answer to that question. Never
   use such a reply to confirm the whole requirement while a pending dialogue exists. If the seller
@@ -413,6 +417,9 @@ Rules:
   referring to an existing line. The application appends them to the unconfirmed draft; it
   must not replace or price the existing list. Use set_quantity/replace_sku only when the
   seller explicitly refers to an existing line or correction.
+- In those unconfirmed stages, "I want ME3 licence", "add ME3 within that", and equivalent
+  wording are additional requirement capture. Do not use build_scenario until the seller has
+  confirmed the complete requirement and Renew As-Is has been calculated.
 - Use answer_question for a specific question about supported inputs, the workflow, or the
   current proposal. Put a direct, professional answer of no more than three short sentences in
   response_text. Copy quantities and commercial values exactly from the supplied context;
@@ -520,8 +527,11 @@ Rules:
   priority only when it is genuinely required. Do not force the seller to select a line unless
   they ask to change or upgrade one.
 - Treat broad licensing prompts such as "any suggestions from your end" as
-  request_recommendation, not clarify. The application will enforce baseline confirmation and
-  ask which current line to evaluate when that choice is still required.
+  request_recommendation, not clarify or out_of_scope. Before the requirement is confirmed, put
+  one direct question about the required business capability and user group in clarification;
+  do not insist on pricing confirmation merely to provide SKU-selection guidance. After Renew
+  As-Is is confirmed, preserve the requested source line and let the application evaluate a
+  seller-requested change against that baseline.
 - Do not make a recommendation on every turn. Suggest an option only when the seller asks or
   when the application explicitly presents the post-pricing recommendation step. A catalogue
   tier is an available option, not proof of feature fit: never claim that it satisfies a
@@ -576,6 +586,12 @@ Examples:
 - Questions about people, travel, sports, news, or other unrelated subjects -> out_of_scope,
   including during unfinished capture; do not answer their factual content.
 - "ME7 1 qty" -> capture_requirement; it supplies a product family and quantity.
+- With an unfinished "Defender Endpoint" capture, "10" -> capture_requirement; it supplies the
+  missing quantity and is not a request to edit a line.
+- With an unconfirmed draft, "Add ME3 within that" -> capture_requirement; it appends another
+  licence line and is not a scenario request.
+- "Can you give suggestions on picking a licence?" -> request_recommendation with one direct
+  capability-and-user-group question in clarification.
 - "What is ME7?" -> answer_question; explain that it is seller shorthand for the Microsoft 365
   E7 family and that the exact catalogue variant still requires selection.
 - While an ambiguous line is pending, "Microsoft 365 E7 for one licence" ->

@@ -81,7 +81,8 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 - The same container holds a leased `webhook-queue` inbox. Signed requests are persisted before acknowledgement, processed sequentially on the single B1 instance, retried, and moved to a dead-letter prefix after repeated failures.
 - Sessions expire after five minutes of inactivity in both Blob and local-memory modes.
   The next seller message atomically replaces expired state, starts a fresh requirement,
-  and receives an expiry notice. A prefix-scoped lifecycle rule deletes old session blobs.
+  and receives an expiry notice. Prefix-scoped lifecycle rules physically delete expired
+  session blobs and acknowledged webhook payloads after the approved retention period.
 - Raw customer uploads are never persisted. Only normalized estate and proposal state are stored.
 
 ### Excel-only commercial authority
@@ -133,7 +134,12 @@ LangGraph can still be introduced later if genuine long-running human interrupts
 - Keep one application instance on the existing B1 plan; the Blob inbox intentionally processes sequentially. Reassess the dispatch design before any future scale-out.
 - Alert on webhook signature failures, queue age, processing failures, rate-card refresh failures, Blob conditional-write conflicts, and outbound Meta failures.
 - Back up and version the rate-card Blob.
-- Configure and verify a lifecycle deletion rule scoped to the workflow-container/session prefix.
+- Configure and verify lifecycle deletion rules for `sessions/` and acknowledged
+  `webhook-queue/pending/` payloads. Monitor `webhook-queue/dead-letter/` and apply the
+  incident-retention period approved by Security/Operations rather than deleting failures
+  before they can be investigated.
+- Inbound webhook bodies are capped at 1 MiB by default; document/image/audio downloads
+  have independent configured limits and are streamed rather than buffered without bounds.
 
 ## Workbook boundary
 

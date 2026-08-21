@@ -12,6 +12,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from time import monotonic
 from typing import Protocol
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile, ZipFile
 
 from rapidfuzz import fuzz
 
@@ -20,6 +22,14 @@ from .models import RateCardItem, SkuMatchCandidate
 
 class RateCardError(ValueError):
     pass
+
+
+MAX_RATE_CARD_BYTES = 50 * 1024 * 1024
+MAX_RATE_CARD_ROWS = 50_000
+MAX_RATE_CARD_COLUMNS = 100
+MAX_SKU_TITLE_CHARS = 500
+MAX_RATE_CARD_XLSX_EXPANDED_BYTES = 250 * 1024 * 1024
+MAX_RATE_CARD_XLSX_MEMBERS = 5_000
 
 
 @dataclass(frozen=True)
@@ -44,6 +54,11 @@ class LocalRateCardSource:
 
     def _read(self) -> RateCardPayload:
         try:
+            size = self._path.stat().st_size
+            if size > MAX_RATE_CARD_BYTES:
+                raise RateCardError(
+                    f"The rate-card workbook exceeds {MAX_RATE_CARD_BYTES // 1048576} MB."
+                )
             content = self._path.read_bytes()
         except PermissionError as error:
             raise RateCardError(
@@ -90,8 +105,17 @@ class AzureBlobRateCardSource:
 
     async def fetch(self) -> RateCardPayload:
         properties = await self._blob.get_blob_properties()
+        size = int(getattr(properties, "size", 0) or 0)
+        if size > MAX_RATE_CARD_BYTES:
+            raise RateCardError(
+                f"The rate-card workbook exceeds {MAX_RATE_CARD_BYTES // 1048576} MB."
+            )
         stream = await self._blob.download_blob()
         content = await stream.readall()
+        if len(content) > MAX_RATE_CARD_BYTES:
+            raise RateCardError(
+                f"The rate-card workbook exceeds {MAX_RATE_CARD_BYTES // 1048576} MB."
+            )
         version = str(properties.etag or properties.last_modified or len(content))
         return RateCardPayload(content, self._blob_name, version)
 
@@ -131,6 +155,9 @@ _GENERIC_SKU_TOKENS = {
     "plans",
     "product",
     "sku",
+    "microsoft",
+    "office",
+    "365",
     "subscription",
     "subscriptions",
 }
@@ -352,6 +379,13 @@ class RateCardCatalog:
             return matches[:1]
 
         query_tokens = set(normalized.split())
+        informative_query = query_tokens - _GENERIC_SKU_TOKENS
+        if not informative_query:
+            # A phrase such as "Microsoft licence" or "Microsoft 365" is not a
+            # usable product choice. Returning hundreds of weak options is both
+            # unhelpful and unsafe for WhatsApp delivery; the seller should add a
+            # workload or plan (for example E3, Power BI, or Defender Endpoint).
+            return []
         required_qualifiers = query_tokens & _REQUIRED_QUERY_QUALIFIERS
         tiers = _tier_tokens(normalized)
         requested_plans = _plan_tokens(normalized)
@@ -390,7 +424,6 @@ class RateCardCatalog:
                 continue
             if required_qualifiers and not required_qualifiers.issubset(title_tokens):
                 continue
-            informative_query = query_tokens - _GENERIC_SKU_TOKENS
             overlap = len(informative_query & title_tokens)
             if informative_query and overlap == 0:
                 continue
@@ -722,14 +755,42 @@ def parse_rate_card(
 
 def _xlsx_rows(content: bytes, sheet_name: str) -> Iterable[Sequence[object]]:
     from openpyxl import load_workbook
+    from openpyxl.utils.exceptions import InvalidFileException
 
-    workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    _validate_xlsx_container(content)
+    try:
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    except (BadZipFile, InvalidFileException, KeyError, OSError, ParseError, ValueError) as error:
+        raise RateCardError("The rate-card workbook is damaged or invalid.") from error
     try:
         if sheet_name not in workbook.sheetnames:
             raise RateCardError(f"Workbook sheet {sheet_name!r} was not found.")
-        yield from workbook[sheet_name].iter_rows(values_only=True)
+        yield from workbook[sheet_name].iter_rows(
+            max_row=MAX_RATE_CARD_ROWS + 25,
+            max_col=MAX_RATE_CARD_COLUMNS,
+            values_only=True,
+        )
     finally:
         workbook.close()
+
+
+def _validate_xlsx_container(content: bytes) -> None:
+    """Bound workbook expansion as defense in depth against corrupt archives."""
+
+    try:
+        with ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_RATE_CARD_XLSX_MEMBERS:
+                raise RateCardError(
+                    "The rate-card workbook contains too many internal files."
+                )
+            expanded = sum(member.file_size for member in members)
+            if expanded > MAX_RATE_CARD_XLSX_EXPANDED_BYTES:
+                raise RateCardError(
+                    "The rate-card workbook expands beyond the safe processing limit."
+                )
+    except BadZipFile as error:
+        raise RateCardError("The rate-card workbook is damaged or invalid.") from error
 
 
 def _csv_rows(content: bytes) -> Iterable[Sequence[object]]:
@@ -737,7 +798,10 @@ def _csv_rows(content: bytes) -> Iterable[Sequence[object]]:
         text = content.decode("utf-8-sig")
     except UnicodeDecodeError as error:
         raise RateCardError("The rate-card CSV must be UTF-8 encoded.") from error
-    yield from csv.reader(io.StringIO(text))
+    try:
+        yield from csv.reader(io.StringIO(text))
+    except csv.Error as error:
+        raise RateCardError("The rate-card CSV is malformed.") from error
 
 
 def _header_key(value: object) -> str:
@@ -795,6 +859,10 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
 
     items: list[RateCardItem] = []
     for row_number, values in enumerate(iterator, start=header_row_number + 1):
+        if row_number - header_row_number > MAX_RATE_CARD_ROWS:
+            raise RateCardError(
+                f"The rate card contains more than {MAX_RATE_CARD_ROWS:,} data rows."
+            )
         record = {
             field: values[index] if index < len(values) else None
             for index, field in columns.items()
@@ -813,6 +881,10 @@ def _parse_rows(rows: Iterable[Sequence[object]]) -> list[RateCardItem]:
             record[field] = "" if raw_value in (None, "") else str(raw_value).strip()
             if not record[field]:
                 raise RateCardError(f"Rate-card row {row_number} has an empty {field}.")
+        if len(record["sku_title"]) > MAX_SKU_TITLE_CHARS:
+            raise RateCardError(
+                f"Rate-card row {row_number} has an overlong sku_title."
+            )
         raw_term = record.get("term_duration")
         record["term_duration"] = (
             str(raw_term).strip()

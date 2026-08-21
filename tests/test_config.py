@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from pydantic import ValidationError
 
@@ -6,6 +7,21 @@ from app.config.main import Settings
 
 
 class StorageModeSettingsTests(unittest.TestCase):
+    def test_container_packages_the_configured_v6_workbook(self) -> None:
+        root = Path(__file__).parents[1]
+        dockerfile = (root / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        dockerignore = (root / ".dockerignore").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "COPY docs/microsoft_sku_v6_distributor.xlsx ",
+            dockerfile,
+        )
+        self.assertNotIn("COPY docs/microsoft_sku_v5.xlsx ", dockerfile)
+        self.assertIn("!docs/microsoft_sku_v6_distributor.xlsx", dockerignore)
+        self.assertNotIn("!docs/microsoft_sku_v5.xlsx", dockerignore)
+
     def test_local_demo_profile_selects_safe_demo_backends(self) -> None:
         settings = Settings(
             _env_file=None,
@@ -51,7 +67,7 @@ class StorageModeSettingsTests(unittest.TestCase):
         settings = Settings(
             _env_file=None,
             runtime_profile="production",
-            rate_card_storage_account_url="https://storage.example.invalid",
+            rate_card_storage_account_url="https://storage.blob.core.windows.net",
             openai_api_key="not-a-real-secret",
             whatsapp_access_token="not-a-real-secret",
             whatsapp_phone_number_id="123",
@@ -72,7 +88,7 @@ class StorageModeSettingsTests(unittest.TestCase):
         settings = Settings(
             _env_file=None,
             runtime_profile="production",
-            rate_card_storage_account_url="https://storage.example.invalid",
+            rate_card_storage_account_url="https://storage.blob.core.windows.net",
             openai_api_key="not-a-real-secret",
             whatsapp_access_token="not-a-real-secret",
             whatsapp_phone_number_id="123",
@@ -85,6 +101,27 @@ class StorageModeSettingsTests(unittest.TestCase):
         self.assertTrue(settings.whatsapp_allow_all_sellers)
         self.assertEqual(settings.seller_allowlist, frozenset())
 
+    def test_seller_allowlist_normalizes_common_international_formatting(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            whatsapp_seller_allowlist="+91 81972 35267, +1 (555) 204-3780",
+        )
+
+        self.assertEqual(
+            settings.seller_allowlist,
+            frozenset({"918197235267", "15552043780"}),
+        )
+
+    def test_seller_allowlist_rejects_non_phone_values(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "international phone numbers including country code",
+        ):
+            Settings(
+                _env_file=None,
+                whatsapp_seller_allowlist="Vamshik: 918197235267",
+            )
+
     def test_production_rejects_empty_allowlist_without_public_access(self) -> None:
         with self.assertRaisesRegex(
             ValidationError,
@@ -93,7 +130,7 @@ class StorageModeSettingsTests(unittest.TestCase):
             Settings(
                 _env_file=None,
                 runtime_profile="production",
-                rate_card_storage_account_url="https://storage.example.invalid",
+                rate_card_storage_account_url="https://storage.blob.core.windows.net",
                 openai_api_key="not-a-real-secret",
                 whatsapp_access_token="not-a-real-secret",
                 whatsapp_phone_number_id="123",
@@ -135,7 +172,7 @@ class StorageModeSettingsTests(unittest.TestCase):
             storage_mode="azure_blob",
             rate_card_backend="local",
             workflow_store_backend="memory",
-            rate_card_storage_account_url="https://storage.example.invalid",
+            rate_card_storage_account_url="https://storage.blob.core.windows.net",
         )
 
         self.assertEqual(settings.rate_card_backend, "azure_blob")
@@ -192,7 +229,7 @@ class StorageModeSettingsTests(unittest.TestCase):
             _env_file=None,
             environment="production",
             storage_mode="azure_blob",
-            rate_card_storage_account_url="https://storage.example.invalid",
+            rate_card_storage_account_url="https://storage.blob.core.windows.net",
             message_dispatch_backend="azure_blob",
             ai_intent_backend="openai",
             requirement_capture_backend="openai",
@@ -207,6 +244,38 @@ class StorageModeSettingsTests(unittest.TestCase):
 
         self.assertFalse(settings.allow_connection_strings_in_production)
 
+    def test_production_rejects_non_meta_whatsapp_endpoint(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "graph.facebook.com"):
+            Settings(
+                _env_file=None,
+                environment="production",
+                whatsapp_uri="https://attacker.example",
+            )
+
+        with self.assertRaisesRegex(ValidationError, "graph.facebook.com"):
+            Settings(
+                _env_file=None,
+                environment="production",
+                whatsapp_uri="https://graph.facebook.com/unapproved-path",
+            )
+
+    def test_production_rejects_non_azure_storage_endpoint(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "Azure Blob service endpoint"):
+            Settings(
+                _env_file=None,
+                environment="production",
+                rate_card_storage_account_url="https://attacker.example",
+            )
+
+        with self.assertRaisesRegex(ValidationError, "Azure Blob service endpoint"):
+            Settings(
+                _env_file=None,
+                environment="production",
+                rate_card_storage_account_url=(
+                    "https://storage.blob.core.windows.net/container?sig=secret"
+                ),
+            )
+
     def test_production_requires_openai_startup_model_validation(self) -> None:
         with self.assertRaisesRegex(
             ValidationError,
@@ -216,7 +285,7 @@ class StorageModeSettingsTests(unittest.TestCase):
                 _env_file=None,
                 environment="production",
                 storage_mode="azure_blob",
-                rate_card_storage_account_url="https://storage.example.invalid",
+                rate_card_storage_account_url="https://storage.blob.core.windows.net",
                 message_dispatch_backend="azure_blob",
                 ai_intent_backend="openai",
                 requirement_capture_backend="openai",
@@ -237,7 +306,7 @@ class StorageModeSettingsTests(unittest.TestCase):
                 _env_file=None,
                 environment="production",
                 storage_mode="azure_blob",
-                rate_card_storage_account_url="https://storage.example.invalid",
+                rate_card_storage_account_url="https://storage.blob.core.windows.net",
                 message_dispatch_backend="direct",
                 ai_intent_backend="openai",
                 requirement_capture_backend="openai",

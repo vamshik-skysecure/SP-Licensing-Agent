@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlsplit
 
 from httpx import AsyncClient, HTTPStatusError, RequestError
 
@@ -15,6 +16,7 @@ from app.schema.whatsapp import (
 )
 
 logger = get_logger(__name__)
+_META_MEDIA_HOST_SUFFIXES = ("facebook.com", "fbcdn.net", "fbsbx.com")
 
 
 class WhatsAppAPIError(Exception):
@@ -32,6 +34,10 @@ class WhatsAppAPIError(Exception):
         self.status_code = status_code
         self.response_body = response_body
         self.network_error = network_error
+
+
+class WhatsAppMediaTooLargeError(WhatsAppAPIError):
+    """Raised before an inbound media object can exceed the configured memory limit."""
 
 
 @dataclass(frozen=True)
@@ -248,6 +254,7 @@ class WhatsAppClient:
         media_id: str,
         filename: str,
         content_type: str = "application/octet-stream",
+        max_bytes: int | None = None,
     ) -> WhatsAppMedia:
         started_at = perf_counter()
         media_ref = opaque_identifier(media_id)
@@ -266,10 +273,16 @@ class WhatsAppClient:
             media_url = metadata.get("url") if isinstance(metadata, dict) else None
             if not isinstance(media_url, str):
                 raise WhatsAppAPIError("WhatsApp Cloud API did not return a media URL.")
-
-            logger.info("WhatsApp media content download started media_ref=%s", media_ref)
-            media_response = await self._http_client.get(media_url, headers=self._headers)
-            media_response.raise_for_status()
+            parsed_media_url = urlsplit(media_url)
+            media_host = (parsed_media_url.hostname or "").casefold()
+            trusted_media_host = any(
+                media_host == suffix or media_host.endswith(f".{suffix}")
+                for suffix in _META_MEDIA_HOST_SUFFIXES
+            )
+            if parsed_media_url.scheme.casefold() != "https" or not trusted_media_host:
+                raise WhatsAppAPIError(
+                    "WhatsApp Cloud API returned an unsafe media URL."
+                )
         except HTTPStatusError as error:
             logger.warning(
                 "WhatsApp media request rejected media_ref=%s status=%d duration_ms=%.1f",
@@ -302,16 +315,72 @@ class WhatsAppClient:
                 response_body=metadata_response.text,
             ) from error
 
+        logger.info("WhatsApp media content download started media_ref=%s", media_ref)
+        try:
+            media_content = bytearray()
+            async with self._http_client.stream(
+                "GET",
+                media_url,
+                headers=self._headers,
+            ) as media_response:
+                media_response.raise_for_status()
+                advertised_length = media_response.headers.get("content-length")
+                if (
+                    max_bytes is not None
+                    and advertised_length is not None
+                    and int(advertised_length) > max_bytes
+                ):
+                    raise WhatsAppMediaTooLargeError(
+                        f"The uploaded media exceeds the {max_bytes // 1048576} MB limit."
+                    )
+                async for chunk in media_response.aiter_bytes():
+                    if max_bytes is not None and len(media_content) + len(chunk) > max_bytes:
+                        raise WhatsAppMediaTooLargeError(
+                            f"The uploaded media exceeds the {max_bytes // 1048576} MB limit."
+                        )
+                    media_content.extend(chunk)
+                media_status = media_response.status_code
+        except WhatsAppMediaTooLargeError:
+            logger.info("WhatsApp media rejected by size limit media_ref=%s", media_ref)
+            raise
+        except HTTPStatusError as error:
+            logger.warning(
+                "WhatsApp media content rejected media_ref=%s status=%d duration_ms=%.1f",
+                media_ref,
+                error.response.status_code,
+                (perf_counter() - started_at) * 1000,
+            )
+            raise WhatsAppAPIError(
+                "WhatsApp Cloud API rejected the media download request.",
+                status_code=error.response.status_code,
+            ) from error
+        except RequestError as error:
+            logger.error(
+                "WhatsApp media content request failed media_ref=%s duration_ms=%.1f "
+                "error_type=%s",
+                media_ref,
+                (perf_counter() - started_at) * 1000,
+                type(error).__name__,
+            )
+            raise WhatsAppAPIError(
+                "Unable to download media from the WhatsApp Cloud API.",
+                network_error=True,
+            ) from error
+        except ValueError as error:
+            raise WhatsAppAPIError(
+                "WhatsApp Cloud API returned invalid media headers."
+            ) from error
+
         logger.info(
             "WhatsApp media content download completed media_ref=%s status=%d bytes=%d duration_ms=%.1f",
             media_ref,
-            media_response.status_code,
-            len(media_response.content),
+            media_status,
+            len(media_content),
             (perf_counter() - started_at) * 1000,
         )
         metadata_content_type = metadata.get("mime_type")
         return WhatsAppMedia(
-            content=media_response.content,
+            content=bytes(media_content),
             filename=filename,
             content_type=(
                 metadata_content_type

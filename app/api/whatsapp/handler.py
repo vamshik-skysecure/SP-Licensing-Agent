@@ -53,7 +53,7 @@ async def receive_webhook(
     dispatcher: Annotated[WebhookDispatcher, Depends(get_webhook_dispatcher)],
 ) -> dict[str, str]:
     logger.info("Webhook request received")
-    raw_body = await request.body()
+    raw_body = await _read_bounded_body(request, settings.max_webhook_bytes)
     _validate_signature(raw_body, request.headers.get("X-Hub-Signature-256"), settings)
     logger.info("Webhook signature validated bytes=%d", len(raw_body))
 
@@ -74,6 +74,32 @@ async def receive_webhook(
     await dispatcher.dispatch(raw_body, webhook, background_tasks)
     logger.info("Webhook processing dispatched")
     return {"status": "ok"}
+
+
+async def _read_bounded_body(request: Request, max_bytes: int) -> bytes:
+    """Read the signed Meta payload without permitting unbounded request buffering."""
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = -1
+        if declared_length > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="Webhook payload is too large.",
+            )
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="Webhook payload is too large.",
+            )
+        body.extend(chunk)
+    return bytes(body)
 
 
 def _validate_signature(raw_body: bytes, signature: str | None, settings: Settings) -> None:

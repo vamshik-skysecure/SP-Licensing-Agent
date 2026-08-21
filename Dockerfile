@@ -17,7 +17,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY app ./app
 COPY config ./config
-COPY docs/microsoft_sku_v5.xlsx ./docs/microsoft_sku_v5.xlsx
+COPY docs/microsoft_sku_v6_distributor.xlsx ./docs/microsoft_sku_v6_distributor.xlsx
 COPY main.py ./main.py
 
 FROM python:3.12-slim-bookworm AS runtime

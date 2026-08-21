@@ -1,5 +1,7 @@
 from pathlib import Path
+import re
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -57,6 +59,7 @@ class Settings(BaseSettings):
     webhook_blob_prefix: str = "webhook-queue"
     webhook_blob_poll_seconds: float = Field(default=1.0, ge=0.1, le=60)
     webhook_max_delivery_count: int = Field(default=5, ge=1, le=100)
+    max_webhook_bytes: int = Field(default=1024 * 1024, gt=0, le=5 * 1024 * 1024)
     allow_connection_strings_in_production: bool = False
 
     ai_intent_backend: Literal["disabled", "openai"] = "disabled"
@@ -87,7 +90,7 @@ class Settings(BaseSettings):
     @property
     def seller_allowlist(self) -> frozenset[str]:
         return frozenset(
-            value.strip().lstrip("+")
+            re.sub(r"\D", "", value)
             for value in self.whatsapp_seller_allowlist.split(",")
             if value.strip()
         )
@@ -101,6 +104,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_backends(self) -> "Settings":
+        invalid_seller_numbers = []
+        for supplied_number in self.whatsapp_seller_allowlist.split(","):
+            supplied_number = supplied_number.strip()
+            if not supplied_number:
+                continue
+            normalized_number = re.sub(r"\D", "", supplied_number)
+            if (
+                re.fullmatch(r"[+\d\s()\-]+", supplied_number) is None
+                or re.fullmatch(r"[1-9]\d{7,14}", normalized_number) is None
+            ):
+                invalid_seller_numbers.append(supplied_number)
+        if invalid_seller_numbers:
+            raise ValueError(
+                "WHATSAPP_SELLER_ALLOWLIST entries must be international phone numbers "
+                "including country code."
+            )
+
         if self.runtime_profile == "local_demo":
             self.environment = "development"
             self.storage_mode = "local"
@@ -182,6 +202,34 @@ class Settings(BaseSettings):
                     + ", ".join(missing_demo_settings)
                 )
         if self.environment == "production":
+            whatsapp_endpoint = urlsplit(self.whatsapp_uri)
+            if (
+                whatsapp_endpoint.scheme.casefold() != "https"
+                or (whatsapp_endpoint.hostname or "").casefold()
+                != "graph.facebook.com"
+                or whatsapp_endpoint.port not in {None, 443}
+                or whatsapp_endpoint.path not in {"", "/"}
+                or bool(whatsapp_endpoint.query or whatsapp_endpoint.fragment)
+                or bool(whatsapp_endpoint.username or whatsapp_endpoint.password)
+            ):
+                raise ValueError(
+                    "Production WHATSAPP_URI must be https://graph.facebook.com."
+                )
+            if self.rate_card_storage_account_url:
+                storage_endpoint = urlsplit(self.rate_card_storage_account_url)
+                storage_host = (storage_endpoint.hostname or "").casefold()
+                if (
+                    storage_endpoint.scheme.casefold() != "https"
+                    or not storage_host.endswith(".blob.core.windows.net")
+                    or storage_endpoint.port not in {None, 443}
+                    or storage_endpoint.path not in {"", "/"}
+                    or bool(storage_endpoint.query or storage_endpoint.fragment)
+                    or bool(storage_endpoint.username or storage_endpoint.password)
+                ):
+                    raise ValueError(
+                        "Production RATE_CARD_STORAGE_ACCOUNT_URL must be an HTTPS "
+                        "Azure Blob service endpoint."
+                    )
             if not self.allow_connection_strings_in_production and (
                 self.rate_card_storage_connection_string
             ):

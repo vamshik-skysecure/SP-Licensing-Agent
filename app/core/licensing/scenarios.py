@@ -472,6 +472,12 @@ class ScenarioEngine:
         cleaned = comment.strip()
         if not cleaned:
             raise ScenarioError("Comment cannot be empty.")
+        if len(cleaned) > 1_000:
+            raise ScenarioError("Seller comments are limited to 1,000 characters.")
+        if len(scenario.comments) >= 20:
+            raise ScenarioError(
+                "This proposal already contains the maximum of 20 seller comments."
+            )
         return scenario.model_copy(
             update={
                 "comments": [*scenario.comments, cleaned],

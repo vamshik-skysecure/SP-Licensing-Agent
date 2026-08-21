@@ -7,7 +7,7 @@ App Service and its Blob data unchanged.
 
 | Profile | Pricing source | Sessions | Webhook handling | Intended use |
 |---|---|---|---|---|
-| `local_demo` | `docs/microsoft_sku_v5.xlsx` | In memory | Direct | ngrok + Meta test number |
+| `local_demo` | `docs/microsoft_sku_v6_distributor.xlsx` | In memory | Direct | ngrok + Meta test number |
 | `production` | Azure Blob | Azure Blob | Durable Blob inbox | Azure App Service |
 
 `RUNTIME_PROFILE` overrides the related low-level backend settings as a group. If it is
@@ -21,6 +21,10 @@ Keep real secrets only in the ignored `.env` file. For local demo mode it must c
 - credentials for a Meta test app/number that is safe to point at ngrok;
 - `WHATSAPP_SELLER_ALLOWLIST` containing the presenter's WhatsApp number;
 - `WORKFLOW_MODE=simple_pricing`.
+
+The local V6 workbook uses the final `Outcome Sheet` and the
+`Expectec Disti Price to Skysecure` column (`SIMPLE_PRICE_BASIS=distributor_expected`).
+It is the same commercial basis configured for the deployed workflow.
 
 Do not redirect the active company Marketplace webhook to ngrok. Use a Meta test app or a
 dedicated test number whose callback can be changed without affecting another service.

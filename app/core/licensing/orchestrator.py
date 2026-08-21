@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -63,6 +64,10 @@ class LicensingOrchestrator:
     def thread_id(sender: str) -> str:
         digest = hashlib.sha256(sender.lstrip("+").encode("utf-8")).hexdigest()[:24]
         return f"wa-{digest}"
+
+    @staticmethod
+    def processed_message_id(message_id: str) -> str:
+        return hashlib.sha256(message_id.encode("utf-8")).hexdigest()
 
     async def get_session(self, sender: str) -> WorkflowSession | None:
         session, _ = await self._store.get(self.thread_id(sender))
@@ -165,7 +170,9 @@ class LicensingOrchestrator:
             fresh = WorkflowSession(
                 id=thread_id,
                 thread_id=thread_id,
-                sender=sender,
+                # Keep the persisted compatibility field opaque. The raw WhatsApp
+                # number is needed only while handling the current request.
+                sender=thread_id,
             )
             try:
                 await self._store.save(fresh, version)
@@ -265,16 +272,28 @@ class LicensingOrchestrator:
 
     async def has_processed(self, sender: str, message_id: str) -> bool:
         session = await self.get_session(sender)
-        return bool(session and message_id in session.processed_message_ids)
+        if session is None:
+            return False
+        digest = self.processed_message_id(message_id)
+        # Accept legacy raw entries during a rolling deployment; the next mutation
+        # replaces the retained history with opaque digests.
+        return message_id in session.processed_message_ids or digest in session.processed_message_ids
 
     async def mark_processed(self, sender: str, message_id: str) -> None:
+        digest = self.processed_message_id(message_id)
+
         await self._mutate(
             sender,
             lambda session: session.model_copy(
                 update={
                     "processed_message_ids": [
-                        *session.processed_message_ids[-999:],
-                        message_id,
+                        *[
+                            value
+                            if re.fullmatch(r"[0-9a-f]{64}", value)
+                            else self.processed_message_id(value)
+                            for value in session.processed_message_ids[-999:]
+                        ],
+                        digest,
                     ],
                     "updated_at": datetime.now(UTC),
                 }
@@ -1694,9 +1713,9 @@ class LicensingOrchestrator:
                 session = WorkflowSession(
                     id=thread_id,
                     thread_id=thread_id,
-                    sender=sender,
+                    sender=thread_id,
                 )
-            updated = operation(session)
+            updated = operation(session).model_copy(update={"sender": thread_id})
             try:
                 await self._store.save(updated, version)
                 return updated

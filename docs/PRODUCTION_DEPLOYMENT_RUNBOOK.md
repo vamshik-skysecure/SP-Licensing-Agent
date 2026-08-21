@@ -186,6 +186,11 @@ When the production Meta number and system-user token are available:
 7. Restart the app after persisting a test message and verify processing resumes from Blob.
 8. Confirm a duplicate Meta delivery does not apply an edit twice.
 9. Inspect `webhook-queue/pending` and `webhook-queue/dead-letter` for stuck work.
+10. Verify lifecycle management covers expired `sessions/` blobs and acknowledged
+    `webhook-queue/pending/` payloads. Apply the Security/Operations retention decision to
+    `webhook-queue/dead-letter/`; do not silently delete uninvestigated failures.
+11. Send a webhook larger than `MAX_WEBHOOK_BYTES` in a non-production test and confirm it
+    is rejected with HTTP 413 before parsing or persistence.
 
 ## 10. Rollback
 

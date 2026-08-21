@@ -17,6 +17,6 @@ scripts/
 tests/
 .github/
 docs/*
-!docs/microsoft_sku_v5.xlsx
+!docs/microsoft_sku_v6_distributor.xlsx
 build/
 dist/

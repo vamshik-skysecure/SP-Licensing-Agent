@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class TextContent(BaseModel):
-    body: str
+    body: str = Field(min_length=1, max_length=32_768)
     preview_url: bool = False
 
 
@@ -104,28 +104,28 @@ class WhatsAppInteractiveMessage(BaseModel):
 
 
 class IncomingWhatsAppDocument(BaseModel):
-    id: str
-    filename: str = "document"
-    mime_type: str = "application/octet-stream"
-    caption: str | None = None
+    id: str = Field(min_length=1, max_length=512)
+    filename: str = Field(default="document", min_length=1, max_length=255)
+    mime_type: str = Field(default="application/octet-stream", max_length=128)
+    caption: str | None = Field(default=None, max_length=4096)
 
 
 class IncomingWhatsAppImage(BaseModel):
-    id: str
-    mime_type: str = "image/jpeg"
-    caption: str | None = None
+    id: str = Field(min_length=1, max_length=512)
+    mime_type: str = Field(default="image/jpeg", max_length=128)
+    caption: str | None = Field(default=None, max_length=4096)
 
 
 class IncomingWhatsAppAudio(BaseModel):
-    id: str
-    mime_type: str = "audio/ogg"
+    id: str = Field(min_length=1, max_length=512)
+    mime_type: str = Field(default="audio/ogg", max_length=128)
     voice: bool = False
 
 
 class IncomingInteractiveReply(BaseModel):
-    id: str
-    title: str
-    description: str | None = None
+    id: str = Field(min_length=1, max_length=512)
+    title: str = Field(max_length=200)
+    description: str | None = Field(default=None, max_length=500)
 
 
 class IncomingInteractive(BaseModel):
@@ -137,10 +137,10 @@ class IncomingInteractive(BaseModel):
 class IncomingWhatsAppMessage(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    id: str
-    sender: str = Field(alias="from")
-    timestamp: str | None = None
-    type: str
+    id: str = Field(min_length=1, max_length=512)
+    sender: str = Field(alias="from", min_length=8, max_length=32)
+    timestamp: str | None = Field(default=None, max_length=32)
+    type: str = Field(max_length=32)
     text: TextContent | None = None
     document: IncomingWhatsAppDocument | None = None
     image: IncomingWhatsAppImage | None = None
@@ -149,7 +149,7 @@ class IncomingWhatsAppMessage(BaseModel):
 
 
 class WhatsAppWebhookValue(BaseModel):
-    messages: list[IncomingWhatsAppMessage] = Field(default_factory=list)
+    messages: list[IncomingWhatsAppMessage] = Field(default_factory=list, max_length=100)
 
 
 class WhatsAppWebhookChange(BaseModel):
@@ -157,9 +157,9 @@ class WhatsAppWebhookChange(BaseModel):
 
 
 class WhatsAppWebhookEntry(BaseModel):
-    changes: list[WhatsAppWebhookChange] = Field(default_factory=list)
+    changes: list[WhatsAppWebhookChange] = Field(default_factory=list, max_length=100)
 
 
 class WhatsAppWebhookPayload(BaseModel):
-    object: str
-    entry: list[WhatsAppWebhookEntry] = Field(default_factory=list)
+    object: str = Field(max_length=100)
+    entry: list[WhatsAppWebhookEntry] = Field(default_factory=list, max_length=100)
