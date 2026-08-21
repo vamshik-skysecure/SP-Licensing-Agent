@@ -228,6 +228,7 @@ class PendingDialogue(BaseModel):
     kind: Literal["resume_session", "agent_clarification"]
     question: str = Field(min_length=1, max_length=500)
     context_message: str = Field(default="", max_length=2000)
+    failed_attempts: int = Field(default=0, ge=0, le=2)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -263,8 +264,10 @@ class WorkflowSession(BaseModel):
     confirmed_as_is: CommercialScenario | None = None
     pending_sku_change: PendingSkuChange | None = None
     pending_dialogue: PendingDialogue | None = None
+    pending_match_prompt_suspended: bool = False
     capture_messages: list[str] = Field(default_factory=list, max_length=8)
     processed_message_ids: list[str] = Field(default_factory=list)
+    failure_notified_message_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 

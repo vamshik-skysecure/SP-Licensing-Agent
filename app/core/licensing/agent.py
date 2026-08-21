@@ -140,13 +140,30 @@ class OfficialProductAnswer(BaseModel):
 
     answer: str
     clarification_question: str
+    table_title: str
+    table_headers: list[str]
+    table_rows: list[list[str]]
     source_urls: list[str]
 
     def validated(self) -> "OfficialProductAnswer":
-        if not self.answer.strip() and not self.clarification_question.strip():
+        has_table = bool(self.table_headers or self.table_rows or self.table_title.strip())
+        if not self.answer.strip() and not self.clarification_question.strip() and not has_table:
             raise IntentInterpretationError(
                 "The official product answer contained no usable response."
             )
+        if has_table:
+            if not (2 <= len(self.table_headers) <= 5):
+                raise IntentInterpretationError(
+                    "The product comparison table must contain two to five columns."
+                )
+            if not self.table_rows or len(self.table_rows) > 30:
+                raise IntentInterpretationError(
+                    "The product comparison table must contain one to thirty rows."
+                )
+            if any(len(row) != len(self.table_headers) for row in self.table_rows):
+                raise IntentInterpretationError(
+                    "The product comparison table contains inconsistent row widths."
+                )
         for value in self.source_urls:
             host = (urlsplit(value).hostname or "").casefold()
             if host != "microsoft.com" and not host.endswith(".microsoft.com"):
@@ -209,11 +226,19 @@ about the product names supplied by the application.
 Rules:
 - Answer the question directly in no more than four short sentences. Compare named products only
   when the official evidence supports the comparison.
+- Product names explicitly written in seller_question are authoritative for that turn and take
+  precedence over older proposal products supplied as context. Never silently substitute a
+  different product list.
+- When the seller asks for a table, columns, a neat format, an item-by-item list, or a comparison
+  covering multiple products, return the comparison in table_title, table_headers, and table_rows.
+  Use two to five short columns and no more than thirty rows. Do not place a Markdown table inside
+  answer. When no table is needed, return an empty title, empty headers, and empty rows.
 - Distinguish product features from the customer's purchased quantities and from historical sales.
 - Do not invent inventory or stock status, purchase counts, warranty terms, refunds, cancellation
   rights, future prices, eligibility, entitlements, or customer-specific contract terms.
 - If the answer depends on a contract, tenant configuration, plan variant, geography, or an
-  unspecified product, say so and ask one direct clarification question.
+  unspecified product, say so and ask one direct clarification question only when that missing
+  fact prevents a useful answer. Do not ask again for a fact already supplied by the seller.
 - Never calculate or quote price, discounts, promotions, margins, or commercial adjustments.
 - source_urls must contain only the official Microsoft pages actually supporting the answer.
 - Do not place URLs, citations, markdown links, or source names inside answer or
@@ -480,8 +505,11 @@ Rules:
 - For set_quantity/set_copilot/add_sku, a stated quantity is mandatory. For replace_sku,
   use -1 when no quantity is stated; the application will retain the selected source line's
   existing quantity. Never guess it.
-- For disposition changes, a line ID is required; valid values are retain, remove, migrate,
-  and included.
+- Disposition changes require an internal line_id in structured output, but the seller does not
+  need to know it. Resolve the line from the named product and supplied session context. If more
+  than one line remains genuinely possible, ask which product they mean and list the full product
+  names; never ask the seller to provide a line ID. Valid dispositions are retain, remove,
+  migrate, and included.
 - If an add/replace/edit request is ambiguous or missing a required value, use clarify and
   put one short, direct question in clarification without introductory wording. Ask only for
   information needed for the current decision and never claim that the seller chose a SKU.

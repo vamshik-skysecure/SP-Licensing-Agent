@@ -112,6 +112,60 @@ def render_estate_table_images(
     return images
 
 
+def render_information_table_images(
+    *,
+    title: str,
+    headers: list[str],
+    rows: list[list[str]],
+    note: str = "",
+) -> list[bytes]:
+    """Render a seller-facing advisory table for WhatsApp's mobile viewport."""
+
+    if not (2 <= len(headers) <= 5):
+        raise ValueError("Information tables require two to five columns.")
+    if not rows or any(len(row) != len(headers) for row in rows):
+        raise ValueError("Information table rows must match the supplied headers.")
+    page_size = 6
+    page_count = max(1, ceil(len(rows) / page_size))
+    widths = _information_column_widths(headers)
+    images: list[bytes] = []
+    for page_index in range(page_count):
+        page_rows = rows[page_index * page_size : (page_index + 1) * page_size]
+        images.append(
+            _render_report(
+                title=title or "Microsoft licensing guidance",
+                subtitle=(
+                    f"Structured product review | Page {page_index + 1} of {page_count}"
+                ),
+                blocks=[
+                    TableBlock(
+                        title="Product information",
+                        headers=headers,
+                        rows=page_rows,
+                        widths=widths,
+                        alignments=["left"] * len(headers),
+                    )
+                ],
+                callout_title="Important note" if note else None,
+                callout_lines=[note] if note else [],
+            )
+        )
+    return images
+
+
+def _information_column_widths(headers: list[str]) -> list[int]:
+    """Allocate more room to product names and descriptive information."""
+
+    if len(headers) == 2:
+        return [360, TABLE_WIDTH - 360]
+    if len(headers) == 3:
+        return [300, 430, TABLE_WIDTH - 730]
+    base = TABLE_WIDTH // len(headers)
+    widths = [base] * len(headers)
+    widths[-1] += TABLE_WIDTH - sum(widths)
+    return widths
+
+
 def render_scenario_table_images(
     scenario: CommercialScenario,
     currency: str = "INR",

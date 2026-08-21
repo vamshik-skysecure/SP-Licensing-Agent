@@ -220,7 +220,9 @@ class LicensingOrchestrator:
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
                     "pending_dialogue": None,
+                    "pending_match_prompt_suspended": False,
                     "capture_messages": [],
+                    "failure_notified_message_ids": [],
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -270,6 +272,46 @@ class LicensingOrchestrator:
             ),
         )
 
+    async def record_pending_dialogue_failure(self, sender: str) -> int:
+        """Count one unanswered clarification without replaying it indefinitely."""
+
+        attempts = 0
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal attempts
+            pending = session.pending_dialogue
+            if pending is None:
+                return session
+            attempts = min(pending.failed_attempts + 1, 2)
+            return session.model_copy(
+                update={
+                    "pending_dialogue": pending.model_copy(
+                        update={"failed_attempts": attempts}
+                    ),
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        return attempts
+
+    async def set_pending_match_prompt_suspended(
+        self,
+        sender: str,
+        suspended: bool,
+    ) -> WorkflowSession:
+        """Pause a repeated catalogue gate while retaining every unresolved line."""
+
+        return await self._mutate(
+            sender,
+            lambda session: session.model_copy(
+                update={
+                    "pending_match_prompt_suspended": suspended,
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
+        )
+
     async def has_processed(self, sender: str, message_id: str) -> bool:
         session = await self.get_session(sender)
         if session is None:
@@ -293,6 +335,33 @@ class LicensingOrchestrator:
                             else self.processed_message_id(value)
                             for value in session.processed_message_ids[-999:]
                         ],
+                        digest,
+                    ],
+                    "failure_notified_message_ids": [
+                        value
+                        for value in session.failure_notified_message_ids[-999:]
+                        if value != digest
+                    ],
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
+        )
+
+    async def has_failure_notification(self, sender: str, message_id: str) -> bool:
+        session = await self.get_session(sender)
+        if session is None:
+            return False
+        digest = self.processed_message_id(message_id)
+        return digest in session.failure_notified_message_ids
+
+    async def mark_failure_notified(self, sender: str, message_id: str) -> None:
+        digest = self.processed_message_id(message_id)
+        await self._mutate(
+            sender,
+            lambda session: session.model_copy(
+                update={
+                    "failure_notified_message_ids": [
+                        *session.failure_notified_message_ids[-999:],
                         digest,
                     ],
                     "updated_at": datetime.now(UTC),
@@ -323,6 +392,7 @@ class LicensingOrchestrator:
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
                     "pending_dialogue": None,
+                    "pending_match_prompt_suspended": False,
                     "capture_messages": [],
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
@@ -361,6 +431,7 @@ class LicensingOrchestrator:
                     "confirmed_as_is": None,
                     "pending_sku_change": None,
                     "pending_dialogue": None,
+                    "pending_match_prompt_suspended": False,
                     "capture_messages": [],
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
@@ -593,6 +664,7 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "estate": result,
+                    "pending_match_prompt_suspended": False,
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
                         if result.pending_lines
@@ -1139,15 +1211,32 @@ class LicensingOrchestrator:
         sender: str,
         line_id: str,
     ) -> LicenseEstate:
+        return await self.remove_requirement_lines(sender, [line_id])
+
+    async def remove_requirement_lines(
+        self,
+        sender: str,
+        line_ids: list[str],
+    ) -> LicenseEstate:
+        """Remove several original line IDs atomically without shifting the selection."""
+
         result: LicenseEstate | None = None
-        normalized_id = line_id.upper()
+        normalized_ids = {
+            line_id.strip().upper() for line_id in line_ids if line_id.strip()
+        }
+        if not normalized_ids:
+            raise ScenarioError("Specify at least one requirement line to remove.")
 
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
             estate = self._editable_requirement(session)
-            lines = [line for line in estate.lines if line.line_id != normalized_id]
-            if len(lines) == len(estate.lines):
-                raise ScenarioError(f"Requirement line {normalized_id!r} was not found.")
+            available_ids = {line.line_id for line in estate.lines}
+            missing = sorted(normalized_ids - available_ids)
+            if missing:
+                raise ScenarioError(
+                    "Requirement line(s) not found: " + ", ".join(missing) + "."
+                )
+            lines = [line for line in estate.lines if line.line_id not in normalized_ids]
             if not lines:
                 raise ScenarioError("A requirement must contain at least one SKU line.")
             pending = any(line.match_method == "unresolved" for line in lines)
@@ -1166,6 +1255,7 @@ class LicensingOrchestrator:
                 update={
                     "estate": result,
                     "pending_sku_change": None,
+                    "pending_dialogue": None,
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
                         if pending

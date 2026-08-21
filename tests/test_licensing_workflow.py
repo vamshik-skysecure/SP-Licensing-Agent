@@ -951,6 +951,9 @@ class IntentAdapterTests(unittest.IsolatedAsyncioTestCase):
         expected = OfficialProductAnswer(
             answer="Microsoft Teams availability depends on the named Microsoft 365 plan.",
             clarification_question="",
+            table_title="",
+            table_headers=[],
+            table_rows=[],
             source_urls=[
                 "https://learn.microsoft.com/en-us/microsoft-365/enterprise/"
             ],
