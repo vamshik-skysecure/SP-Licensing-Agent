@@ -1,5 +1,6 @@
 import re
 import unittest
+from unittest.mock import AsyncMock, patch
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
@@ -12,6 +13,7 @@ from pypdf import PdfReader
 from app.api.whatsapp.service import HELP_TEXT, ServiceConfiguration, WhatsAppWebhookService
 from app.core.licensing.analysis import LicenseAnalyzer
 from app.core.licensing.agent import (
+    AgentIntent,
     OfficialProductAnswer,
     OfficialRecommendation,
     OpenAIIntentInterpreter,
@@ -41,7 +43,7 @@ from app.core.licensing.renderer import (
     render_proposal_pdf,
     render_simple_commercial_pdf,
 )
-from app.core.licensing.scenarios import ScenarioEngine
+from app.core.licensing.scenarios import ScenarioEngine, ScenarioError
 from app.core.licensing.store import InMemoryWorkflowStore
 from app.core.whatsapp import WhatsAppMedia
 from app.schema.whatsapp import WhatsAppWebhookPayload
@@ -318,6 +320,36 @@ def _webhook(message: dict[str, object]) -> WhatsAppWebhookPayload:
             "entry": [{"changes": [{"value": {"messages": [message]}}]}],
         }
     )
+
+
+def _agent_intent(action: str, **updates: object) -> AgentIntent:
+    """Build a complete structured intent for state-machine regression tests."""
+
+    values: dict[str, object] = {
+        "action": action,
+        "scenario": "none",
+        "line_id": "",
+        "quantity": -1,
+        "copilot_quantity": -1,
+        "product_query": "",
+        "disposition": "none",
+        "boolean_value": "none",
+        "percentage": -1.0,
+        "amount": -1.0,
+        "term_duration": "",
+        "billing_plan": "",
+        "segment": "",
+        "currency": "",
+        "candidate_number": -1,
+        "match_selections": [],
+        "comment": "",
+        "detail_label": "",
+        "detail_value": "",
+        "response_text": "",
+        "clarification": "",
+    }
+    values.update(updates)
+    return AgentIntent.model_validate(values)
 
 
 class OpenAIRequirementCaptureContractTests(unittest.IsolatedAsyncioTestCase):
@@ -3430,6 +3462,500 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         assert session.pending_sku_change is not None
         self.assertEqual(session.pending_sku_change.product_query, "Visio Plan 2")
         self.assertEqual(session.pending_sku_change.quantity, 10)
+
+    async def _prepare_single_copilot_baseline(self, sender: str) -> None:
+        content = (
+            "Product Title,Total Licenses,Expired Licenses,Assigned licenses\n"
+            "Microsoft 365 Copilot,51,0,0\n"
+        ).encode()
+        estate = await self.orchestrator.analyze_document(
+            sender=sender,
+            filename="copilot-requirement.csv",
+            content=content,
+        )
+        self.assertFalse(estate.pending_lines)
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        renew = await self.orchestrator.build_scenario(sender, ScenarioType.RENEW_AS_IS)
+        await self.orchestrator.save_confirmed_as_is(sender, renew)
+
+    async def test_postpricing_add_product_then_quantity_survives_set_copilot_misroute(
+        self,
+    ) -> None:
+        class MisclassifyingFollowupInterpreter:
+            async def interpret(self, message: str, *_: object) -> AgentIntent:
+                normalized = " ".join(message.casefold().split())
+                if normalized == "add more sku":
+                    return _agent_intent("add_sku")
+                if normalized == "microsoft 365 copilot":
+                    return _agent_intent(
+                        "add_sku",
+                        product_query="Microsoft 365 Copilot",
+                    )
+                if normalized == "51":
+                    # This is the production failure captured in the CEO transcript: the
+                    # stateless model sees "Copilot" in the question and misclassifies the
+                    # missing add quantity as the generated-scenario Copilot control.
+                    return _agent_intent("set_copilot", copilot_quantity=51)
+                raise AssertionError(f"Unexpected message: {message}")
+
+        sender = "ceo-add-copilot-followup"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        renew = await self.orchestrator.build_scenario(sender, ScenarioType.RENEW_AS_IS)
+        await self.orchestrator.save_confirmed_as_is(sender, renew)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=MisclassifyingFollowupInterpreter(),
+        )
+
+        await service._handle_text(sender, "Add more SKU")
+        await service._handle_text(sender, "MICROSOFT 365 COPILOT")
+        await service._handle_text(sender, "51")
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.active_scenario is not None
+        if session.pending_sku_change is not None:
+            self.assertEqual(session.pending_sku_change.action, "add")
+            self.assertEqual(
+                session.pending_sku_change.product_query,
+                "Microsoft 365 Copilot",
+            )
+            self.assertEqual(session.pending_sku_change.quantity, 51)
+        else:
+            scenario = session.scenarios[session.active_scenario]
+            self.assertTrue(
+                any(
+                    line.sku_title == "Microsoft 365 Copilot"
+                    and line.proposed_quantity == 51
+                    for line in scenario.lines
+                )
+            )
+        seller_text = "\n".join(
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+        )
+        self.assertNotIn("Scenario line", seller_text)
+        self.assertNotIn("'COPILOT' was not found", seller_text)
+
+    async def test_change_sku_dimension_keeps_source_until_target_product_arrives(
+        self,
+    ) -> None:
+        class ChangeSkuInterpreter:
+            async def interpret(self, message: str, *_: object) -> AgentIntent:
+                normalized = " ".join(message.casefold().split())
+                if normalized in {"sku", "i want to change the sku"}:
+                    return _agent_intent("replace_sku", line_id="L1")
+                if normalized == "power bi pro":
+                    # A product-only answer can be classified as fresh capture by the model;
+                    # the deterministic pending operation must still treat it as the target.
+                    return _agent_intent(
+                        "capture_requirement",
+                        product_query="Power BI Pro",
+                    )
+                raise AssertionError(f"Unexpected message: {message}")
+
+        sender = "ceo-change-sku-followup"
+        await self._prepare_single_copilot_baseline(sender)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=ChangeSkuInterpreter(),
+        )
+        await service._execute_agent_intent(
+            sender,
+            _agent_intent(
+                "clarify",
+                clarification=(
+                    "What would you like to change about Microsoft 365 Copilot: its "
+                    "quantity, SKU, or disposition?"
+                ),
+            ),
+            original_message="Change Microsoft 365 Copilot",
+        )
+
+        await service._handle_text(sender, "SKU")
+        await service._handle_text(sender, "I want to change the SKU")
+        await service._handle_text(sender, "Power BI Pro")
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.active_scenario is not None
+        self.assertIsNone(session.pending_dialogue)
+        if session.pending_sku_change is not None:
+            self.assertEqual(session.pending_sku_change.action, "replace")
+            self.assertEqual(session.pending_sku_change.source_line_id, "L1")
+            self.assertEqual(session.pending_sku_change.product_query, "Power BI Pro")
+        else:
+            scenario = session.scenarios[session.active_scenario]
+            source = next(line for line in scenario.lines if line.line_id == "L1")
+            replacement = next(
+                line for line in scenario.lines if line.sku_title == "Power BI Pro"
+            )
+            self.assertEqual(source.proposed_quantity, 0)
+            self.assertEqual(source.disposition.value, "remove")
+            self.assertEqual(replacement.proposed_quantity, 51)
+            self.assertEqual(replacement.disposition.value, "add")
+        questions = [
+            message.text.body  # type: ignore[attr-defined]
+            for message in client.messages
+            if getattr(message, "text", None) is not None
+        ]
+        self.assertFalse(
+            any(
+                "what would you like to change about the microsoft 365 copilot sku"
+                in question.casefold()
+                for question in questions
+            )
+        )
+
+    async def test_set_copilot_resolves_unique_real_copilot_line_without_pseudo_id(
+        self,
+    ) -> None:
+        sender = "real-copilot-line-quantity"
+        await self._prepare_single_copilot_baseline(sender)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._execute_agent_intent(
+            sender,
+            _agent_intent("set_copilot", copilot_quantity=52),
+            original_message="Change Microsoft 365 Copilot to 52 licences",
+        )
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.active_scenario is not None
+        scenario = session.scenarios[session.active_scenario]
+        self.assertFalse(any(line.line_id == "COPILOT" for line in scenario.lines))
+        actual = next(line for line in scenario.lines if line.line_id == "L1")
+        self.assertEqual(actual.sku_title, "Microsoft 365 Copilot")
+        self.assertEqual(actual.proposed_quantity, 52)
+
+    async def test_set_copilot_updates_existing_zero_quantity_synthetic_line(
+        self,
+    ) -> None:
+        sender = "zero-copilot-line-quantity"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        renew = await self.orchestrator.build_scenario(
+            sender,
+            ScenarioType.RENEW_AS_IS,
+        )
+        await self.orchestrator.save_confirmed_as_is(sender, renew)
+        initial = await self.orchestrator.build_scenario(
+            sender,
+            ScenarioType.ME5_COPILOT,
+            copilot_quantity=0,
+        )
+        copilot = next(line for line in initial.lines if line.line_id == "COPILOT")
+        self.assertEqual(copilot.proposed_quantity, 0)
+
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service._execute_agent_intent(
+            sender,
+            _agent_intent(
+                "set_copilot",
+                scenario="me5_copilot",
+                copilot_quantity=30,
+            ),
+            original_message="Set Copilot to 30 licences",
+        )
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None and session.active_scenario is not None
+        scenario = session.scenarios[session.active_scenario]
+        updated = next(line for line in scenario.lines if line.line_id == "COPILOT")
+        self.assertEqual(updated.proposed_quantity, 30)
+        self.assertIsNone(session.pending_dialogue)
+
+    async def test_scenario_error_is_sanitized_before_seller_delivery(self) -> None:
+        class ScenarioFailureService(WhatsAppWebhookService):
+            async def _handle_text(self, *_: object) -> None:
+                raise ScenarioError("Scenario line 'COPILOT' was not found.")
+
+        sender = "safe-scenario-error-seller"
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = ScenarioFailureService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "safe-scenario-error",
+                    "from": sender,
+                    "type": "text",
+                    "text": {"body": "51"},
+                }
+            )
+        )
+
+        self.assertEqual(len(client.messages), 1)
+        response = client.messages[0].text.body  # type: ignore[attr-defined]
+        self.assertNotIn("COPILOT", response)
+        self.assertNotIn("Scenario line", response)
+        self.assertNotIn("was not found", response)
+
+    async def test_plural_requirement_line_error_is_sanitized_before_delivery(
+        self,
+    ) -> None:
+        class PluralLineFailureService(WhatsAppWebhookService):
+            async def _handle_text(self, *_: object) -> None:
+                raise ScenarioError("Requirement line(s) not found: L42, L99.")
+
+        sender = "safe-plural-line-error-seller"
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = PluralLineFailureService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "safe-plural-line-error",
+                    "from": sender,
+                    "type": "text",
+                    "text": {"body": "Remove the old lines"},
+                }
+            )
+        )
+
+        self.assertEqual(len(client.messages), 1)
+        response = client.messages[0].text.body  # type: ignore[attr-defined]
+        self.assertNotIn("Requirement line(s)", response)
+        self.assertNotIn("L42", response)
+        self.assertNotIn("L99", response)
+        self.assertNotIn("not found", response.casefold())
+
+    async def test_proposal_target_reply_preserves_complete_pending_add_or_replace(
+        self,
+    ) -> None:
+        class ProposalTargetInterpreter:
+            async def interpret(self, message: str, *_: object) -> AgentIntent:
+                self_message = " ".join(message.casefold().split())
+                if self_message != "me5":
+                    raise AssertionError(f"Unexpected message: {message}")
+                # Deliberately reproduce a plausible model mistake. The proposal name is
+                # emitted as a fresh product instead of as the target scenario; deterministic
+                # pending state must preserve the original operation slots.
+                return _agent_intent(
+                    "capture_requirement",
+                    product_query="ME5",
+                )
+
+        cases = (
+            ("add_sku", "Visio Plan 2", 17, ""),
+            ("replace_sku", "Power BI Pro", 19, "L1"),
+        )
+        for action, product, quantity, source_line_id in cases:
+            with self.subTest(action=action):
+                sender = f"proposal-target-{action}"
+                await self.orchestrator.analyze_document(
+                    sender=sender,
+                    filename=CUSTOMER.name,
+                    content=CUSTOMER.read_bytes(),
+                )
+                await self.orchestrator.request_requirement_validation(sender)
+                await self.orchestrator.confirm_requirement(sender)
+                renew = await self.orchestrator.build_scenario(
+                    sender,
+                    ScenarioType.RENEW_AS_IS,
+                )
+                await self.orchestrator.save_confirmed_as_is(sender, renew)
+                await self.orchestrator.build_scenario(
+                    sender,
+                    ScenarioType.ME5_COPILOT,
+                )
+                await self.orchestrator.build_scenario(
+                    sender,
+                    ScenarioType.RENEW_AS_IS,
+                )
+                client = FakeWhatsAppClient(
+                    WhatsAppMedia(b"", "unused", "text/plain")
+                )
+                service = WhatsAppWebhookService(
+                    client,  # type: ignore[arg-type]
+                    self.orchestrator,
+                    ServiceConfiguration(
+                        frozenset(),
+                        10 * 1024 * 1024,
+                        allow_all_sellers=True,
+                        workflow_mode="simple_pricing",
+                    ),
+                    intent_interpreter=ProposalTargetInterpreter(),
+                )
+
+                await service._execute_agent_intent(
+                    sender,
+                    _agent_intent(
+                        action,
+                        line_id=source_line_id,
+                        product_query=product,
+                        quantity=quantity,
+                    ),
+                    original_message=(
+                        f"Add {quantity} {product} licences"
+                        if action == "add_sku"
+                        else f"Replace L1 with {product} for {quantity} licences"
+                    ),
+                )
+                before = await self.orchestrator.get_session(sender)
+                assert before is not None and before.pending_dialogue is not None
+                self.assertEqual(before.pending_dialogue.operation, action)
+                self.assertEqual(before.pending_dialogue.product_query, product)
+                self.assertEqual(before.pending_dialogue.quantity, quantity)
+                self.assertEqual(
+                    before.pending_dialogue.source_line_id,
+                    source_line_id,
+                )
+
+                await service._handle_text(sender, "ME5")
+
+                after = await self.orchestrator.get_session(sender)
+                assert after is not None and after.active_scenario is not None
+                self.assertEqual(after.active_scenario, ScenarioType.ME5_COPILOT)
+                self.assertIsNone(after.pending_dialogue)
+                if after.pending_sku_change is not None:
+                    expected_action = "add" if action == "add_sku" else "replace"
+                    self.assertEqual(after.pending_sku_change.action, expected_action)
+                    self.assertEqual(after.pending_sku_change.product_query, product)
+                    self.assertEqual(after.pending_sku_change.quantity, quantity)
+                    self.assertEqual(
+                        after.pending_sku_change.scenario_type,
+                        ScenarioType.ME5_COPILOT,
+                    )
+                else:
+                    scenario = after.scenarios[ScenarioType.ME5_COPILOT]
+                    selected = next(
+                        line
+                        for line in scenario.lines
+                        if line.sku_title == product and line.proposed_quantity == quantity
+                    )
+                    self.assertEqual(selected.proposed_quantity, quantity)
+                seller_text = "\n".join(
+                    message.text.body  # type: ignore[attr-defined]
+                    for message in client.messages
+                    if getattr(message, "text", None) is not None
+                )
+                self.assertNotIn("How many ME5", seller_text)
+                self.assertNotIn("add ME5", seller_text.casefold())
+
+    async def test_failed_completed_pending_operation_remains_available_for_retry(
+        self,
+    ) -> None:
+        class QuantityMisrouteInterpreter:
+            async def interpret(self, message: str, *_: object) -> AgentIntent:
+                if message.strip() != "10":
+                    raise AssertionError(f"Unexpected message: {message}")
+                return _agent_intent("set_copilot", copilot_quantity=10)
+
+        sender = "pending-operation-safe-retry"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        renew = await self.orchestrator.build_scenario(sender, ScenarioType.RENEW_AS_IS)
+        await self.orchestrator.save_confirmed_as_is(sender, renew)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=QuantityMisrouteInterpreter(),
+        )
+        await service._execute_agent_intent(
+            sender,
+            _agent_intent(
+                "add_sku",
+                product_query="Visio Plan 2",
+            ),
+            original_message="Add Visio Plan 2",
+        )
+        before = await self.orchestrator.get_session(sender)
+        assert before is not None and before.pending_dialogue is not None
+        expected_pending = before.pending_dialogue
+
+        failing_add = AsyncMock(
+            side_effect=ScenarioError("Synthetic add failure after slot completion.")
+        )
+        with patch.object(self.orchestrator, "add_sku", failing_add):
+            with self.assertRaises(ScenarioError):
+                await service._handle_text(sender, "10")
+
+        after = await self.orchestrator.get_session(sender)
+        assert after is not None and after.pending_dialogue is not None
+        self.assertEqual(after.pending_dialogue, expected_pending)
+        self.assertEqual(after.pending_dialogue.operation, "add_sku")
+        self.assertEqual(after.pending_dialogue.product_query, "Visio Plan 2")
+        self.assertEqual(after.pending_dialogue.quantity, -1)
+        failing_add.assert_awaited_once()
 
     async def test_out_of_scope_request_receives_a_professional_boundary(self) -> None:
         client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))

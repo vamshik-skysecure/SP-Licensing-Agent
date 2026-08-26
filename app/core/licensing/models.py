@@ -228,6 +228,33 @@ class PendingDialogue(BaseModel):
     kind: Literal["resume_session", "agent_clarification"]
     question: str = Field(min_length=1, max_length=500)
     context_message: str = Field(default="", max_length=2000)
+    operation: Literal[
+        "none",
+        "choose_change",
+        "add_sku",
+        "replace_sku",
+        "set_quantity",
+        "set_copilot",
+        "set_disposition",
+        "build_scenario",
+        "set_term",
+        "set_billing",
+        "set_segment",
+        "set_currency",
+        "add_comment",
+        "request_recommendation",
+        "compare_enterprise_options",
+    ] = "none"
+    scope: Literal["none", "requirement", "scenario"] = "none"
+    scenario_type: ScenarioType | None = None
+    source_line_id: str = Field(default="", max_length=64)
+    product_query: str = Field(default="", max_length=500)
+    quantity: int = Field(default=-1, ge=-1)
+    copilot_quantity: int = Field(default=-1, ge=-1)
+    disposition: Literal[
+        "retain", "remove", "migrate", "included", "none"
+    ] = "none"
+    detail_value: str = Field(default="", max_length=2000)
     failed_attempts: int = Field(default=0, ge=0, le=2)
     created_at: datetime = Field(default_factory=utc_now)
 

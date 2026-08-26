@@ -813,6 +813,19 @@ class OpenAIIntentInterpreter:
                     "kind": session.pending_dialogue.kind,
                     "question": session.pending_dialogue.question,
                     "context_message": session.pending_dialogue.context_message,
+                    "operation": session.pending_dialogue.operation,
+                    "scope": session.pending_dialogue.scope,
+                    "scenario_type": (
+                        session.pending_dialogue.scenario_type.value
+                        if session.pending_dialogue.scenario_type is not None
+                        else "none"
+                    ),
+                    "source_line_id": session.pending_dialogue.source_line_id,
+                    "product_query": session.pending_dialogue.product_query,
+                    "quantity": session.pending_dialogue.quantity,
+                    "copilot_quantity": session.pending_dialogue.copilot_quantity,
+                    "disposition": session.pending_dialogue.disposition,
+                    "detail_value": session.pending_dialogue.detail_value,
                 }
                 if session.pending_dialogue is not None
                 else None

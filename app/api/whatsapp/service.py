@@ -295,15 +295,23 @@ class WhatsAppWebhookService:
                     "Send a requirement as text, voice, image, or a supported document.",
                 )
             await self._orchestrator.mark_processed(sender, message.id)
+        except ScenarioError as error:
+            logger.info("User-correctable workflow error type=%s", type(error).__name__)
+            await self._send_text(sender, self._seller_safe_scenario_error(error))
+            await self._orchestrator.mark_processed(sender, message.id)
         except (
             LicenseAnalysisError,
             RequirementCaptureError,
-            ScenarioError,
             WhatsAppMediaTooLargeError,
             ValueError,
         ) as error:
             logger.info("User-correctable workflow error type=%s", type(error).__name__)
-            await self._send_text(sender, str(error))
+            response = (
+                self._seller_safe_workflow_error(error)
+                if isinstance(error, ValueError)
+                else str(error)
+            )
+            await self._send_text(sender, response)
             await self._orchestrator.mark_processed(sender, message.id)
         except WorkflowConflictError:
             logger.warning("Workflow concurrency conflict message_ref=%s", message_ref)
@@ -753,6 +761,49 @@ class WhatsAppWebhookService:
         return " ".join("".join(cleaned).split())
 
     @staticmethod
+    def _seller_safe_scenario_error(error: ScenarioError) -> str:
+        """Hide internal scenario identifiers while giving the seller a recovery step."""
+
+        return WhatsAppWebhookService._seller_safe_workflow_error(error)
+
+    @staticmethod
+    def _seller_safe_workflow_error(error: Exception) -> str:
+        """Translate internal workflow state errors into actionable seller language."""
+
+        message = str(error).strip()
+        if re.search(
+            r"\b(?:(?:scenario|requirement|existing)\s+)?line(?:\(s\))?\b"
+            r".*\bnot found\b",
+            message,
+            re.I,
+        ):
+            return (
+                "I could not identify that licence in the active proposal, so no change was "
+                "made. Send the product name you want to change, or tell me the product and "
+                "quantity you want to add."
+            )
+        if "no rate-card sku matched" in message.casefold():
+            return (
+                "I could not find an approved catalogue match for that product. Send the "
+                "complete Microsoft product name or choose from the available SKU options."
+            )
+        if any(
+            phrase in message.casefold()
+            for phrase in (
+                "active scenario could not be found",
+                "initial proposal could not be found",
+                "pending sku change has no scenario",
+                "revised configuration could not be found",
+                "selected proposal is no longer available",
+            )
+        ):
+            return (
+                "The active proposal changed or is no longer available. Review the current "
+                "proposal, then retry the change."
+            )
+        return message
+
+    @staticmethod
     def _trailing_question(value: str) -> str:
         """Return the final direct question so a short seller reply keeps its context."""
 
@@ -1041,14 +1092,14 @@ class WhatsAppWebhookService:
             return False
         available = ", ".join(item.label for item in ScenarioType if item in session.scenarios)
         question = f"Which proposal should I update: {available}?"
-        await self._orchestrator.set_pending_dialogue(
+        pending = await self._pending_dialogue_for_intent(
             sender,
-            PendingDialogue(
-                kind="agent_clarification",
-                question=question,
-                context_message=(original_message or "")[:2000],
-            ),
+            intent,
+            question=question,
+            original_message=original_message,
+            scope="scenario",
         )
+        await self._orchestrator.set_pending_dialogue(sender, pending)
         await self._send_text(sender, question)
         return True
 
@@ -1060,6 +1111,7 @@ class WhatsAppWebhookService:
         requirement: bool,
         operation: str,
         original_message: str | None,
+        pending_intent: AgentIntent | None = None,
     ) -> str | None:
         """Infer a sole line or ask a contextual question instead of leaking an ID error."""
 
@@ -1102,14 +1154,22 @@ class WhatsAppWebhookService:
                 "Which licence should I update? Send the product name or first add a "
                 "licence to the requirement."
             )
-        await self._orchestrator.set_pending_dialogue(
-            sender,
-            PendingDialogue(
+        if pending_intent is not None:
+            pending = await self._pending_dialogue_for_intent(
+                sender,
+                pending_intent,
+                question=question,
+                original_message=original_message,
+                scope="requirement" if requirement else "scenario",
+            )
+        else:
+            pending = PendingDialogue(
                 kind="agent_clarification",
                 question=question,
                 context_message=(original_message or "")[:2000],
-            ),
-        )
+                scope="requirement" if requirement else "scenario",
+            )
+        await self._orchestrator.set_pending_dialogue(sender, pending)
         await self._send_text(sender, question)
         return None
 
@@ -1180,6 +1240,84 @@ class WhatsAppWebhookService:
         winners = {line_id for score, line_id in scored if score == best_score}
         return next(iter(winners)) if len(winners) == 1 else None
 
+    async def _pending_dialogue_for_intent(
+        self,
+        sender: str,
+        intent: AgentIntent,
+        *,
+        question: str,
+        original_message: str | None,
+        operation: str | None = None,
+        scope: Literal["none", "requirement", "scenario"] | None = None,
+    ) -> PendingDialogue:
+        """Capture every known operation slot before asking a follow-up question."""
+
+        session = await self._orchestrator.get_session(sender)
+        inferred_scope: Literal["none", "requirement", "scenario"] = "none"
+        if session is not None:
+            if session.confirmed_as_is is None:
+                inferred_scope = "requirement"
+            elif session.active_scenario is not None:
+                inferred_scope = "scenario"
+
+        def integer(name: str) -> int:
+            try:
+                return int(getattr(intent, name, -1) or -1)
+            except (TypeError, ValueError):
+                return -1
+
+        disposition = str(getattr(intent, "disposition", "none") or "none")
+        if disposition not in {"retain", "remove", "migrate", "included", "none"}:
+            disposition = "none"
+        action = operation or str(getattr(intent, "action", "none") or "none")
+        allowed_operations = {
+            "none",
+            "choose_change",
+            "add_sku",
+            "replace_sku",
+            "set_quantity",
+            "set_copilot",
+            "set_disposition",
+            "build_scenario",
+            "set_term",
+            "set_billing",
+            "set_segment",
+            "set_currency",
+            "add_comment",
+            "request_recommendation",
+            "compare_enterprise_options",
+        }
+        if action not in allowed_operations:
+            action = "none"
+        detail_value = ""
+        detail_fields = {
+            "set_term": "term_duration",
+            "set_billing": "billing_plan",
+            "set_segment": "segment",
+            "set_currency": "currency",
+            "add_comment": "comment",
+        }
+        if action in detail_fields:
+            detail_value = str(getattr(intent, detail_fields[action], "") or "").strip()
+
+        source_line_id = str(getattr(intent, "line_id", "") or "").strip().upper()
+        if source_line_id.casefold() == "none":
+            source_line_id = ""
+        return PendingDialogue(
+            kind="agent_clarification",
+            question=question[:500],
+            context_message=(original_message or "")[:2000],
+            operation=action,  # type: ignore[arg-type]
+            scope=scope or inferred_scope,
+            scenario_type=self._scenario_from_request(intent, original_message),
+            source_line_id=source_line_id,
+            product_query=str(getattr(intent, "product_query", "") or "").strip(),
+            quantity=integer("quantity"),
+            copilot_quantity=integer("copilot_quantity"),
+            disposition=disposition,  # type: ignore[arg-type]
+            detail_value=detail_value,
+        )
+
     async def _pause_for_missing_intent_detail(
         self,
         sender: str,
@@ -1236,14 +1374,13 @@ class WhatsAppWebhookService:
         if not question:
             return False
 
-        await self._orchestrator.set_pending_dialogue(
+        pending = await self._pending_dialogue_for_intent(
             sender,
-            PendingDialogue(
-                kind="agent_clarification",
-                question=question,
-                context_message=(original_message or "")[:2000],
-            ),
+            intent,
+            question=question,
+            original_message=original_message,
         )
+        await self._orchestrator.set_pending_dialogue(sender, pending)
         await self._send_text(sender, question)
         return True
 
@@ -1723,6 +1860,564 @@ class WhatsAppWebhookService:
             "a four-option comparison, or ask me to finalize the active proposal.",
         )
 
+    @classmethod
+    def _quantity_from_reply(cls, message: str) -> int:
+        if not cls._is_quantity_only_reply(message):
+            return -1
+        match = re.search(r"\b(\d+)\b", message)
+        return int(match.group(1)) if match else -1
+
+    @staticmethod
+    def _product_from_reply(message: str, intent: AgentIntent) -> str:
+        """Return a product-like answer, excluding operation words such as bare 'SKU'."""
+
+        interpreted = str(getattr(intent, "product_query", "") or "").strip()
+        candidates = [interpreted, message.strip()]
+        generic = {
+            "a",
+            "about",
+            "add",
+            "an",
+            "change",
+            "current",
+            "i",
+            "it",
+            "licence",
+            "licences",
+            "license",
+            "licenses",
+            "more",
+            "new",
+            "plan",
+            "please",
+            "product",
+            "replace",
+            "sku",
+            "the",
+            "this",
+            "to",
+            "want",
+            "with",
+        }
+        markers = (
+            "copilot",
+            "defender",
+            "dynamics",
+            "entra",
+            "exchange",
+            "intune",
+            "microsoft",
+            "office",
+            "power bi",
+            "project",
+            "teams",
+            "visio",
+            "windows",
+        )
+        for index, candidate in enumerate(candidates):
+            normalized = normalize_product_title(candidate)
+            if not normalized or re.fullmatch(r"\d+", normalized):
+                continue
+            if re.match(r"^(?:who|what|where|when|why|how)\b", normalized):
+                continue
+            meaningful = set(normalized.split()) - generic
+            has_marker = any(marker in normalized for marker in markers)
+            has_code = bool(re.search(r"\b(?:m?e\d+|p\d+|f\d+|o365|m365)\b", normalized))
+            if has_marker or has_code or (
+                index == 0 and bool(interpreted) and len(meaningful) >= 2
+            ):
+                cleaned = re.sub(
+                    r"^(?:please\s+)?(?:i\s+)?(?:want|need)\s+(?:to\s+)?"
+                    r"(?:(?:add|use|replace|change)\s+)?",
+                    "",
+                    candidate,
+                    flags=re.IGNORECASE,
+                ).strip(" .")
+                return cleaned or candidate.strip()
+        return ""
+
+    @staticmethod
+    def _change_dimension(message: str) -> Literal["sku", "quantity", "disposition", "none"]:
+        value = " ".join(message.casefold().strip(" ?!.,").split())
+        if re.search(r"\b(?:sku|product|plan|replace|replacement)\b", value):
+            return "sku"
+        if re.search(r"\b(?:quantity|qty|count|licences|licenses|seats|users)\b", value):
+            return "quantity"
+        if re.search(r"\b(?:disposition|retain|remove|migrate|included)\b", value):
+            return "disposition"
+        return "none"
+
+    @staticmethod
+    def _questions_semantically_equivalent(left: str, right: str) -> bool:
+        stop_words = {
+            "a",
+            "about",
+            "and",
+            "do",
+            "i",
+            "is",
+            "it",
+            "like",
+            "please",
+            "the",
+            "to",
+            "what",
+            "which",
+            "would",
+            "you",
+            "your",
+        }
+        left_tokens = set(normalize_product_title(left).split()) - stop_words
+        right_tokens = set(normalize_product_title(right).split()) - stop_words
+        if not left_tokens or not right_tokens:
+            return False
+        overlap = len(left_tokens & right_tokens)
+        return overlap / max(len(left_tokens), len(right_tokens)) >= 0.6
+
+    @staticmethod
+    def _agent_intent_with(
+        source: AgentIntent,
+        **updates: object,
+    ) -> AgentIntent:
+        defaults: dict[str, object] = {
+            "action": "clarify",
+            "scenario": "none",
+            "line_id": "",
+            "quantity": -1,
+            "copilot_quantity": -1,
+            "product_query": "",
+            "disposition": "none",
+            "boolean_value": "none",
+            "percentage": -1.0,
+            "amount": 0.0,
+            "term_duration": "",
+            "billing_plan": "",
+            "segment": "",
+            "currency": "",
+            "candidate_number": -1,
+            "match_selections": [],
+            "comment": "",
+            "detail_label": "",
+            "detail_value": "",
+            "response_text": "",
+            "clarification": "",
+        }
+        for field in AgentIntent.model_fields:
+            if hasattr(source, field):
+                defaults[field] = getattr(source, field)
+        defaults.update(updates)
+        return AgentIntent.model_validate(defaults)
+
+    @staticmethod
+    def _pending_lines(
+        session: WorkflowSession,
+        scope: Literal["none", "requirement", "scenario"],
+    ) -> tuple[list, bool]:
+        requirement = scope == "requirement"
+        if requirement and session.estate is not None:
+            return list(session.estate.lines), True
+        if session.active_scenario is not None:
+            scenario = session.scenarios.get(session.active_scenario)
+            if scenario is not None:
+                return [line for line in scenario.lines if line.proposed_quantity > 0], False
+        return [], requirement
+
+    def _pending_line_id(
+        self,
+        pending: PendingDialogue,
+        session: WorkflowSession,
+        message: str,
+        intent: AgentIntent,
+    ) -> str:
+        lines, requirement = self._pending_lines(session, pending.scope)
+        available = {line.line_id for line in lines}
+        for supplied in (
+            pending.source_line_id,
+            str(getattr(intent, "line_id", "") or "").strip().upper(),
+        ):
+            if supplied in available:
+                return supplied
+        inferred = self._line_reference_from_message(
+            lines,
+            message,
+            requirement=requirement,
+        )
+        if inferred is not None:
+            return inferred
+        inferred = self._line_reference_from_message(
+            lines,
+            f"{pending.context_message} {pending.question}",
+            requirement=requirement,
+        )
+        if inferred is not None:
+            return inferred
+        return lines[0].line_id if len(lines) == 1 else ""
+
+    def _pending_line_title(
+        self,
+        pending: PendingDialogue,
+        session: WorkflowSession,
+        line_id: str,
+    ) -> str:
+        lines, requirement = self._pending_lines(session, pending.scope)
+        for line in lines:
+            if line.line_id == line_id:
+                return line.display_title if requirement else line.sku_title
+        return "the selected licence"
+
+    async def _repeat_or_release_pending(
+        self,
+        sender: str,
+        pending: PendingDialogue,
+        question: str,
+    ) -> None:
+        attempts = pending.failed_attempts + 1
+        if attempts >= 2:
+            await self._orchestrator.clear_pending_dialogue(sender)
+            await self._send_text(
+                sender,
+                "No change was made because the required detail was not supplied. You can "
+                "continue with another request, or send the exact product and quantity in one "
+                "message when ready.",
+            )
+            return
+        updated = pending.model_copy(
+            update={"question": question[:500], "failed_attempts": attempts}
+        )
+        await self._orchestrator.set_pending_dialogue(sender, updated)
+        await self._send_text(sender, question[:500])
+
+    async def _clear_pending_if_unchanged(
+        self,
+        sender: str,
+        pending: PendingDialogue,
+    ) -> None:
+        current = await self._orchestrator.get_session(sender)
+        if current is not None and current.pending_dialogue == pending:
+            await self._orchestrator.clear_pending_dialogue(sender)
+
+    async def _execute_completed_pending(
+        self,
+        sender: str,
+        pending: PendingDialogue,
+        intent: AgentIntent,
+        message: str,
+    ) -> None:
+        await self._execute_agent_intent(sender, intent, original_message=message)
+        await self._clear_pending_if_unchanged(sender, pending)
+
+    async def _resolve_structured_pending_dialogue(
+        self,
+        sender: str,
+        message: str,
+        session: WorkflowSession,
+        pending: PendingDialogue,
+        interpreted: AgentIntent,
+    ) -> bool:
+        """Merge a short answer into the saved operation instead of reclassifying it."""
+
+        operation = pending.operation
+        if operation == "none":
+            return False
+
+        if operation == "choose_change":
+            dimension = self._change_dimension(message)
+            line_id = self._pending_line_id(pending, session, message, interpreted)
+            title = self._pending_line_title(pending, session, line_id)
+            if dimension == "sku":
+                replacement = self._product_from_reply(message, interpreted)
+                if replacement:
+                    completed = self._agent_intent_with(
+                        interpreted,
+                        action="replace_sku",
+                        line_id=line_id,
+                        product_query=replacement,
+                        quantity=-1,
+                    )
+                    await self._execute_completed_pending(
+                        sender, pending, completed, message
+                    )
+                    return True
+                question = f"Which Microsoft product should replace {title}?"
+                await self._orchestrator.set_pending_dialogue(
+                    sender,
+                    pending.model_copy(
+                        update={
+                            "operation": "replace_sku",
+                            "source_line_id": line_id,
+                            "question": question,
+                            "failed_attempts": 0,
+                        }
+                    ),
+                )
+                await self._send_text(sender, question)
+                return True
+            if dimension == "quantity":
+                quantity = self._quantity_from_reply(message)
+                interpreted_quantity = int(
+                    getattr(interpreted, "quantity", -1) or -1
+                )
+                if quantity < 0 and interpreted_quantity >= 0:
+                    quantity = interpreted_quantity
+                if quantity >= 0:
+                    completed = self._agent_intent_with(
+                        interpreted,
+                        action="set_quantity",
+                        line_id=line_id,
+                        quantity=quantity,
+                    )
+                    await self._execute_completed_pending(
+                        sender, pending, completed, message
+                    )
+                    return True
+                question = f"What quantity should I set for {title}?"
+                await self._orchestrator.set_pending_dialogue(
+                    sender,
+                    pending.model_copy(
+                        update={
+                            "operation": "set_quantity",
+                            "source_line_id": line_id,
+                            "question": question,
+                            "failed_attempts": 0,
+                        }
+                    ),
+                )
+                await self._send_text(sender, question)
+                return True
+            if dimension == "disposition":
+                disposition = str(
+                    getattr(interpreted, "disposition", "none") or "none"
+                )
+                if disposition == "none":
+                    normalized = " ".join(message.casefold().split())
+                    disposition = next(
+                        (
+                            value
+                            for value in ("retain", "remove", "migrate", "included")
+                            if re.search(rf"\b{value}\b", normalized)
+                        ),
+                        "none",
+                    )
+                if disposition != "none":
+                    completed = self._agent_intent_with(
+                        interpreted,
+                        action="set_disposition",
+                        line_id=line_id,
+                        disposition=disposition,
+                    )
+                    await self._execute_completed_pending(
+                        sender, pending, completed, message
+                    )
+                    return True
+                question = f"Should I retain, remove, or replace {title}?"
+                await self._orchestrator.set_pending_dialogue(
+                    sender,
+                    pending.model_copy(
+                        update={
+                            "operation": "set_disposition",
+                            "source_line_id": line_id,
+                            "question": question,
+                            "failed_attempts": 0,
+                        }
+                    ),
+                )
+                await self._send_text(sender, question)
+                return True
+            await self._repeat_or_release_pending(sender, pending, pending.question)
+            return True
+
+        scenario_type = pending.scenario_type
+        selecting_scenario = (
+            scenario_type is None
+            and pending.question.casefold().startswith("which proposal should i update")
+        )
+        if selecting_scenario:
+            scenario_type = self._scenario_from_request(interpreted, message)
+            if scenario_type is None:
+                await self._repeat_or_release_pending(sender, pending, pending.question)
+                return True
+
+        line_id = pending.source_line_id
+        selecting_line = (
+            operation in {"replace_sku", "set_quantity", "set_disposition"}
+            and not line_id
+        )
+        if operation in {"replace_sku", "set_quantity", "set_disposition"}:
+            line_id = self._pending_line_id(pending, session, message, interpreted)
+            if not line_id:
+                await self._repeat_or_release_pending(sender, pending, pending.question)
+                return True
+
+        quantity = pending.quantity
+        reply_quantity = self._quantity_from_reply(message)
+        if reply_quantity >= 0:
+            quantity = reply_quantity
+        elif quantity < 0 and int(getattr(interpreted, "quantity", -1) or -1) >= 0:
+            quantity = int(interpreted.quantity)
+
+        product = pending.product_query
+        reply_product = self._product_from_reply(message, interpreted)
+        if reply_product and not selecting_scenario and not (
+            selecting_line and bool(product)
+        ):
+            product = reply_product
+
+        if operation == "add_sku":
+            if not product:
+                question = "Which exact Microsoft product should I add?"
+            elif quantity <= 0:
+                question = f"How many {product} licences should I add?"
+            else:
+                completed = self._agent_intent_with(
+                    interpreted,
+                    action="add_sku",
+                    scenario=scenario_type.value if scenario_type else "none",
+                    product_query=product,
+                    quantity=quantity,
+                )
+                await self._execute_completed_pending(
+                    sender, pending, completed, message
+                )
+                return True
+            progressed = product != pending.product_query or quantity != pending.quantity
+            updated = pending.model_copy(
+                update={
+                    "product_query": product,
+                    "quantity": quantity,
+                    "scenario_type": scenario_type,
+                    "question": question,
+                    "failed_attempts": 0 if progressed else pending.failed_attempts,
+                }
+            )
+            if progressed:
+                await self._orchestrator.set_pending_dialogue(sender, updated)
+                await self._send_text(sender, question)
+            else:
+                await self._repeat_or_release_pending(sender, updated, question)
+            return True
+
+        if operation == "replace_sku":
+            if not product:
+                title = self._pending_line_title(pending, session, line_id)
+                question = f"Which Microsoft product should replace {title}?"
+                await self._repeat_or_release_pending(sender, pending, question)
+                return True
+            completed = self._agent_intent_with(
+                interpreted,
+                action="replace_sku",
+                scenario=scenario_type.value if scenario_type else "none",
+                line_id=line_id,
+                product_query=product,
+                quantity=quantity,
+            )
+            await self._execute_completed_pending(sender, pending, completed, message)
+            return True
+
+        if operation == "set_quantity":
+            if quantity < 0:
+                title = self._pending_line_title(pending, session, line_id)
+                await self._repeat_or_release_pending(
+                    sender, pending, f"What quantity should I set for {title}?"
+                )
+                return True
+            completed = self._agent_intent_with(
+                interpreted,
+                action="set_quantity",
+                scenario=scenario_type.value if scenario_type else "none",
+                line_id=line_id,
+                quantity=quantity,
+            )
+            await self._execute_completed_pending(sender, pending, completed, message)
+            return True
+
+        if operation == "set_copilot":
+            copilot_quantity = pending.copilot_quantity
+            if reply_quantity >= 0:
+                copilot_quantity = reply_quantity
+            elif copilot_quantity < 0:
+                copilot_quantity = int(
+                    getattr(interpreted, "copilot_quantity", -1) or -1
+                )
+            if copilot_quantity < 0:
+                await self._repeat_or_release_pending(
+                    sender,
+                    pending,
+                    "How many Copilot licences should the proposal include?",
+                )
+                return True
+            completed = self._agent_intent_with(
+                interpreted,
+                action="set_copilot",
+                scenario=scenario_type.value if scenario_type else "none",
+                copilot_quantity=copilot_quantity,
+            )
+            await self._execute_completed_pending(sender, pending, completed, message)
+            return True
+
+        if operation == "set_disposition":
+            disposition = pending.disposition
+            interpreted_disposition = str(
+                getattr(interpreted, "disposition", "none") or "none"
+            )
+            if interpreted_disposition != "none":
+                disposition = interpreted_disposition  # type: ignore[assignment]
+            if disposition == "none":
+                await self._repeat_or_release_pending(
+                    sender,
+                    pending,
+                    "Should I retain, remove, migrate, or include the selected licence?",
+                )
+                return True
+            completed = self._agent_intent_with(
+                interpreted,
+                action="set_disposition",
+                scenario=scenario_type.value if scenario_type else "none",
+                line_id=line_id,
+                disposition=disposition,
+            )
+            await self._execute_completed_pending(sender, pending, completed, message)
+            return True
+
+        if operation == "build_scenario":
+            selected = scenario_type or self._scenario_from_request(interpreted, message)
+            if selected is None:
+                await self._repeat_or_release_pending(sender, pending, pending.question)
+                return True
+            completed = self._agent_intent_with(
+                interpreted,
+                action="build_scenario",
+                scenario=selected.value,
+                quantity=pending.quantity,
+                copilot_quantity=pending.copilot_quantity,
+            )
+            await self._execute_completed_pending(sender, pending, completed, message)
+            return True
+
+        detail_fields = {
+            "set_term": "term_duration",
+            "set_billing": "billing_plan",
+            "set_segment": "segment",
+            "set_currency": "currency",
+            "add_comment": "comment",
+        }
+        if operation in detail_fields:
+            field = detail_fields[operation]
+            supplied = str(getattr(interpreted, field, "") or "").strip()
+            detail = pending.detail_value or supplied or message.strip()
+            if not detail:
+                await self._repeat_or_release_pending(sender, pending, pending.question)
+                return True
+            completed = self._agent_intent_with(
+                interpreted,
+                action=operation,
+                scenario=scenario_type.value if scenario_type else "none",
+                **{field: detail},
+            )
+            await self._execute_completed_pending(sender, pending, completed, message)
+            return True
+
+        return False
+
     async def _resolve_pending_dialogue(
         self,
         sender: str,
@@ -1825,6 +2520,44 @@ class WhatsAppWebhookService:
             await self._release_pending_dialogue(sender, session)
             return True
 
+        if pending.operation == "none":
+            normalized_question = " ".join(pending.question.casefold().split())
+            if all(
+                marker in normalized_question
+                for marker in ("quantity", "sku", "disposition")
+            ):
+                inferred_scope: Literal["requirement", "scenario"] = (
+                    "requirement" if session.confirmed_as_is is None else "scenario"
+                )
+                upgraded = pending.model_copy(
+                    update={
+                        "operation": "choose_change",
+                        "scope": inferred_scope,
+                    }
+                )
+                inferred_line = self._pending_line_id(
+                    upgraded,
+                    session,
+                    pending.context_message or pending.question,
+                    intent,
+                )
+                pending = upgraded.model_copy(
+                    update={"source_line_id": inferred_line}
+                )
+                await self._orchestrator.set_pending_dialogue(sender, pending)
+
+        if (
+            intent.action not in CONVERSATIONAL_ACTIONS
+            and await self._resolve_structured_pending_dialogue(
+                sender,
+                message,
+                session,
+                pending,
+                intent,
+            )
+        ):
+            return True
+
         if (
             session.confirmed_as_is is None
             and self._pending_is_recommendation_guidance(pending)
@@ -1885,8 +2618,18 @@ class WhatsAppWebhookService:
             next_question = self._professional_agent_text(intent.clarification)
             normalized_pending = " ".join(pending.question.casefold().split())
             normalized_next = " ".join(next_question.casefold().split())
-            if normalized_next and normalized_next == normalized_pending:
-                await self._release_pending_dialogue(sender, session)
+            if normalized_next and (
+                normalized_next == normalized_pending
+                or self._questions_semantically_equivalent(
+                    pending.question,
+                    next_question,
+                )
+            ):
+                await self._repeat_or_release_pending(
+                    sender,
+                    pending,
+                    next_question,
+                )
                 return True
         await self._orchestrator.clear_pending_dialogue(sender)
         if intent.action == "capture_requirement":
@@ -3220,6 +3963,22 @@ class WhatsAppWebhookService:
             if original_message and await self._has_open_requirement_draft(sender):
                 await self._capture_typed_requirement(sender, original_message)
                 return
+            product = self._product_from_reply(original_message or "", intent)
+            if product:
+                quantity = int(getattr(intent, "quantity", -1) or -1)
+                if quantity < 0:
+                    quantity = self._quantity_from_reply(original_message or "")
+                await self._execute_agent_intent(
+                    sender,
+                    self._agent_intent_with(
+                        intent,
+                        action="add_sku",
+                        product_query=product,
+                        quantity=quantity,
+                    ),
+                    original_message=original_message,
+                )
+                return
             await self._send_text(
                 sender,
                 "The confirmed requirement is no longer in capture mode. Should this licence "
@@ -3247,14 +4006,45 @@ class WhatsAppWebhookService:
                 if question
                 else "Which proposal, line, or quantity would you like to change?"
             )
-            await self._orchestrator.set_pending_dialogue(
+            normalized_question = " ".join(resolved_question.casefold().split())
+            original_dimension = self._change_dimension(original_message or "")
+            pending_operation = "none"
+            if all(
+                marker in normalized_question
+                for marker in ("quantity", "sku", "disposition")
+            ):
+                pending_operation = "choose_change"
+            elif (
+                original_dimension == "sku"
+                and re.search(r"\b(?:product|sku|replace)\b", normalized_question)
+            ):
+                pending_operation = "replace_sku"
+            elif (
+                original_dimension == "quantity"
+                and "quantity" in normalized_question
+            ):
+                pending_operation = "set_quantity"
+            pending = await self._pending_dialogue_for_intent(
                 sender,
-                PendingDialogue(
-                    kind="agent_clarification",
-                    question=resolved_question,
-                    context_message=(original_message or "")[:2000],
-                ),
+                intent,
+                question=resolved_question,
+                original_message=original_message,
+                operation=pending_operation,
             )
+            if (
+                pending_operation != "none"
+                and clarification_session is not None
+            ):
+                inferred_line = self._pending_line_id(
+                    pending,
+                    clarification_session,
+                    original_message or resolved_question,
+                    intent,
+                )
+                pending = pending.model_copy(
+                    update={"source_line_id": inferred_line}
+                )
+            await self._orchestrator.set_pending_dialogue(sender, pending)
             await self._send_text(
                 sender,
                 resolved_question,
@@ -3420,6 +4210,7 @@ class WhatsAppWebhookService:
                     requirement=True,
                     operation="change",
                     original_message=original_message,
+                    pending_intent=intent,
                 )
                 if line_id is None:
                     return
@@ -3445,6 +4236,7 @@ class WhatsAppWebhookService:
                     requirement=True,
                     operation="replace",
                     original_message=original_message,
+                    pending_intent=intent,
                 )
                 if line_id is None:
                     return
@@ -3465,6 +4257,7 @@ class WhatsAppWebhookService:
                     requirement=True,
                     operation="remove",
                     original_message=original_message,
+                    pending_intent=intent,
                 )
                 if line_id is None:
                     return
@@ -3526,6 +4319,7 @@ class WhatsAppWebhookService:
                 requirement=False,
                 operation="change",
                 original_message=original_message,
+                pending_intent=intent,
             )
             if line_id is None:
                 return
@@ -3536,10 +4330,74 @@ class WhatsAppWebhookService:
             await self._send_scenario(sender, scenario)
             return
         if intent.action == "set_copilot":
+            quantity = self._required_quantity(intent.copilot_quantity)
+            current = await self._orchestrator.get_session(sender)
+            active = (
+                current.scenarios.get(current.active_scenario)
+                if current is not None and current.active_scenario is not None
+                else None
+            )
+            all_lines = list(active.lines) if active is not None else []
+            visible_lines = [line for line in all_lines if line.proposed_quantity > 0]
+            synthetic = next(
+                (line for line in all_lines if line.line_id == "COPILOT"),
+                None,
+            )
+            real_copilot_lines = [
+                line
+                for line in visible_lines
+                if line.line_id != "COPILOT"
+                and "copilot" in normalize_product_title(line.sku_title)
+            ]
+            target_line_id = synthetic.line_id if synthetic is not None else ""
+            if not target_line_id and len(real_copilot_lines) == 1:
+                target_line_id = real_copilot_lines[0].line_id
+            if not target_line_id and len(real_copilot_lines) > 1:
+                choices = "; ".join(line.sku_title for line in real_copilot_lines)
+                question = (
+                    "Which Copilot licence should I change? Reply with the product name: "
+                    f"{choices}"
+                )
+                pending = await self._pending_dialogue_for_intent(
+                    sender,
+                    self._agent_intent_with(
+                        intent,
+                        action="set_quantity",
+                        quantity=quantity,
+                    ),
+                    question=question,
+                    original_message=original_message,
+                    operation="set_quantity",
+                    scope="scenario",
+                )
+                await self._orchestrator.set_pending_dialogue(sender, pending)
+                await self._send_text(sender, question)
+                return
+            if not target_line_id:
+                question = (
+                    "There is no Copilot licence in the active proposal. Which exact "
+                    "Microsoft Copilot product should I add?"
+                )
+                pending = await self._pending_dialogue_for_intent(
+                    sender,
+                    self._agent_intent_with(
+                        intent,
+                        action="add_sku",
+                        product_query="",
+                        quantity=quantity,
+                    ),
+                    question=question,
+                    original_message=original_message,
+                    operation="add_sku",
+                    scope="scenario",
+                )
+                await self._orchestrator.set_pending_dialogue(sender, pending)
+                await self._send_text(sender, question)
+                return
             scenario = await self._orchestrator.edit_quantity(
                 sender,
-                "COPILOT",
-                self._required_quantity(intent.copilot_quantity),
+                target_line_id,
+                quantity,
             )
             await self._send_scenario(sender, scenario)
             return
@@ -3550,6 +4408,7 @@ class WhatsAppWebhookService:
                 requirement=False,
                 operation=("remove" if intent.disposition == "remove" else "update"),
                 original_message=original_message,
+                pending_intent=intent,
             )
             if line_id is None:
                 return
@@ -3583,6 +4442,7 @@ class WhatsAppWebhookService:
                 requirement=False,
                 operation="replace",
                 original_message=original_message,
+                pending_intent=intent,
             )
             if line_id is None:
                 return
