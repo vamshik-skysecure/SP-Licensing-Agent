@@ -586,12 +586,13 @@ class ScenarioEngine:
         lines: list[ScenarioLine] = []
         unresolved: list[str] = []
         base_keys = self._core_suite_keys(catalog)
-        copilot_key: tuple[str, str] | None = None
+        copilot_key: tuple[str, str, str] | None = None
         try:
             copilot_selector = self._exact_selector(catalog, COPILOT_TITLE)
             copilot_key = self._identity_key(
                 copilot_selector.product_id,
                 copilot_selector.sku_id,
+                copilot_selector.sku_title,
             )
         except ScenarioError:
             pass
@@ -631,7 +632,11 @@ class ScenarioEngine:
                 price_unavailable = True
                 note = str(error)
                 unresolved.append(f"{source.line_id}: {error}")
-            source_key = self._identity_key(source.product_id, source.sku_id)
+            source_key = self._identity_key(
+                source.product_id,
+                source.sku_id,
+                source.display_title,
+            )
             if source_key in base_keys:
                 category = "base"
             elif copilot_key is not None and source_key == copilot_key:
@@ -693,6 +698,7 @@ class ScenarioEngine:
         target_key = self._identity_key(
             target_selector.product_id,
             target_selector.sku_id,
+            target_selector.sku_title,
         )
         core_suite_keys = self._core_suite_keys(catalog)
 
@@ -702,7 +708,11 @@ class ScenarioEngine:
             else None
         )
         copilot_key = (
-            self._identity_key(copilot_selector.product_id, copilot_selector.sku_id)
+            self._identity_key(
+                copilot_selector.product_id,
+                copilot_selector.sku_id,
+                copilot_selector.sku_title,
+            )
             if copilot_selector
             else None
         )
@@ -718,7 +728,11 @@ class ScenarioEngine:
         base_sources: list[int] = []
         copilot_sources: list[int] = []
         for source in estate.lines:
-            source_key = self._identity_key(source.product_id, source.sku_id)
+            source_key = self._identity_key(
+                source.product_id,
+                source.sku_id,
+                source.display_title,
+            )
             if source_key in core_suite_keys:
                 base_sources.append(source.renewal_quantity)
                 if source_key == target_key:
@@ -1020,18 +1034,36 @@ class ScenarioEngine:
     def _identity_key(
         product_id: str | None,
         sku_id: str | None,
-    ) -> tuple[str, str]:
-        return ((product_id or "").casefold(), (sku_id or "").casefold())
+        sku_title: str | None = None,
+    ) -> tuple[str, str, str]:
+        normalized_product_id = (product_id or "").casefold()
+        normalized_sku_id = (sku_id or "").casefold()
+        # A complete ProductId+SkuId remains the canonical identity for backward
+        # compatibility. When either identifier is unavailable, the maintained
+        # product title prevents unrelated name-only rows from collapsing into one
+        # synthetic blank identity.
+        title_identity = (
+            ""
+            if normalized_product_id and normalized_sku_id
+            else normalize_product_title(sku_title or "")
+        )
+        return normalized_product_id, normalized_sku_id, title_identity
 
-    def _core_suite_keys(self, catalog: RateCardCatalog) -> set[tuple[str, str]]:
-        keys: set[tuple[str, str]] = set()
+    def _core_suite_keys(self, catalog: RateCardCatalog) -> set[tuple[str, str, str]]:
+        keys: set[tuple[str, str, str]] = set()
         for definition in SCENARIO_DEFINITIONS.values():
             try:
                 selector = self._exact_selector(catalog, definition.base_title)
             except ScenarioError:
                 # Only exact, unambiguous identities can be categorized automatically.
                 continue
-            keys.add(self._identity_key(selector.product_id, selector.sku_id))
+            keys.add(
+                self._identity_key(
+                    selector.product_id,
+                    selector.sku_id,
+                    selector.sku_title,
+                )
+            )
         return keys
 
     @staticmethod
@@ -1071,22 +1103,11 @@ class ScenarioEngine:
     ) -> RateCardItem:
         product_id = selector.product_id
         sku_id = selector.sku_id
-        if not product_id or not sku_id:
-            candidates = catalog.candidates(selector.sku_title, limit=3)
-            if not candidates or candidates[0].confidence < 90:
-                raise ScenarioError(f"No rate-card SKU matched {selector.sku_title!r}.")
-            if len(candidates) > 1 and abs(
-                candidates[0].confidence - candidates[1].confidence
-            ) < 0.001:
-                titles = ", ".join(item.sku_title for item in candidates)
-                raise ScenarioError(
-                    f"Multiple SKUs match {selector.sku_title!r}: {titles}."
-                )
-            product_id = candidates[0].product_id
-            sku_id = candidates[0].sku_id
+        if not selector.sku_title.strip():
+            raise ScenarioError("A catalogue product title is required for pricing.")
         rows = catalog.price_rows(
-            product_id=product_id,
-            sku_id=sku_id,
+            product_id=product_id or "",
+            sku_id=sku_id or "",
             sku_title=selector.sku_title,
             term_duration=term_duration,
             billing_plan=billing_plan,

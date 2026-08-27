@@ -148,7 +148,20 @@ class IncomingWhatsAppMessage(BaseModel):
     interactive: IncomingInteractive | None = None
 
 
+class IncomingWhatsAppMetadata(BaseModel):
+    """Meta asset that received an inbound WhatsApp event.
+
+    A webhook signature authenticates the Meta app, not a particular phone-number
+    asset.  Keeping the target phone ID in the validated payload lets a single-number
+    deployment reject events for other numbers attached to the same Meta app/WABA.
+    """
+
+    display_phone_number: str | None = Field(default=None, max_length=32)
+    phone_number_id: str = Field(min_length=1, max_length=32, pattern=r"^\d+$")
+
+
 class WhatsAppWebhookValue(BaseModel):
+    metadata: IncomingWhatsAppMetadata | None = None
     messages: list[IncomingWhatsAppMessage] = Field(default_factory=list, max_length=100)
 
 

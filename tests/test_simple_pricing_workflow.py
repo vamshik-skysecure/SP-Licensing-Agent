@@ -516,6 +516,163 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             client.messages[0].text.body,  # type: ignore[attr-defined]
         )
 
+    async def test_stale_authorized_message_gets_safe_reply_without_mutating_state(self) -> None:
+        sender = "stale-meta-seller"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        thread_id = self.orchestrator.thread_id(sender)
+        before, before_version = await self.store.get_raw(thread_id)
+        assert before is not None and before_version is not None
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                seller_allowlist=frozenset(),
+                max_document_bytes=10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+                session_ttl_minutes=5,
+            ),
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "delayed-start-fresh",
+                    "from": sender,
+                    "timestamp": str(
+                        int((datetime.now(UTC) - timedelta(minutes=6)).timestamp())
+                    ),
+                    "type": "text",
+                    "text": {"body": "Start fresh"},
+                }
+            )
+        )
+
+        after, after_version = await self.store.get_raw(thread_id)
+        self.assertEqual(after_version, before_version)
+        self.assertEqual(after, before)
+        self.assertEqual(len(client.messages), 1)
+        self.assertIn(
+            "outside the five-minute processing window",
+            client.messages[0].text.body,  # type: ignore[attr-defined]
+        )
+        self.assertIn(
+            "did not apply it",
+            client.messages[0].text.body,  # type: ignore[attr-defined]
+        )
+
+    async def test_stale_unauthorized_message_remains_silent(self) -> None:
+        sender = "919999999999"
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                seller_allowlist=frozenset({"918888888888"}),
+                max_document_bytes=10 * 1024 * 1024,
+                workflow_mode="simple_pricing",
+                session_ttl_minutes=5,
+            ),
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "stale-unauthorized",
+                    "from": sender,
+                    "timestamp": str(
+                        int((datetime.now(UTC) - timedelta(minutes=6)).timestamp())
+                    ),
+                    "type": "text",
+                    "text": {"body": "Start fresh"},
+                }
+            )
+        )
+
+        self.assertEqual(client.messages, [])
+        session, version = await self.store.get_raw(
+            self.orchestrator.thread_id(sender)
+        )
+        self.assertIsNone(session)
+        self.assertIsNone(version)
+
+    async def test_small_future_meta_clock_skew_is_accepted(self) -> None:
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                seller_allowlist=frozenset(),
+                max_document_bytes=10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+                session_ttl_minutes=5,
+            ),
+        )
+
+        await service.handle(
+            _webhook(
+                {
+                    "id": "small-future-skew",
+                    "from": "future-skew-seller",
+                    "timestamp": str(
+                        int((datetime.now(UTC) + timedelta(seconds=60)).timestamp())
+                    ),
+                    "type": "text",
+                    "text": {"body": "/help"},
+                }
+            )
+        )
+
+        self.assertEqual(len(client.messages), 1)
+
+    async def test_far_future_or_malformed_meta_timestamp_is_silently_ignored(self) -> None:
+        for index, timestamp in enumerate(
+            (
+                str(int((datetime.now(UTC) + timedelta(minutes=6)).timestamp())),
+                "not-a-timestamp",
+            )
+        ):
+            with self.subTest(timestamp=timestamp):
+                sender = f"invalid-time-seller-{index}"
+                client = FakeWhatsAppClient(
+                    WhatsAppMedia(b"", "unused", "text/plain")
+                )
+                service = WhatsAppWebhookService(
+                    client,  # type: ignore[arg-type]
+                    self.orchestrator,
+                    ServiceConfiguration(
+                        seller_allowlist=frozenset(),
+                        max_document_bytes=10 * 1024 * 1024,
+                        allow_all_sellers=True,
+                        workflow_mode="simple_pricing",
+                    ),
+                )
+
+                await service.handle(
+                    _webhook(
+                        {
+                            "id": f"invalid-time-{index}",
+                            "from": sender,
+                            "timestamp": timestamp,
+                            "type": "text",
+                            "text": {"body": "/help"},
+                        }
+                    )
+                )
+
+                self.assertEqual(client.messages, [])
+                session, version = await self.store.get_raw(
+                    self.orchestrator.thread_id(sender)
+                )
+                self.assertIsNone(session)
+                self.assertIsNone(version)
+
     async def test_unexpected_retry_notifies_seller_only_once(self) -> None:
         class FailingService(WhatsAppWebhookService):
             async def _handle_text(self, *_: object) -> None:
@@ -543,17 +700,19 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         for _ in range(2):
-            with self.assertRaisesRegex(RuntimeError, "synthetic unexpected failure"):
-                await service.handle(payload)
+            await service.handle(payload)
 
         self.assertEqual(len(client.messages), 1)
         self.assertIn(
-            "please do not resend the same message",
+            "stopped automatic replay",
             client.messages[0].text.body,  # type: ignore[attr-defined]
         )
         session = await self.orchestrator.get_session(sender)
         assert session is not None
-        self.assertEqual(len(session.failure_notified_message_ids), 1)
+        self.assertEqual(len(session.failure_notified_message_ids), 0)
+        self.assertTrue(
+            await self.orchestrator.has_processed(sender, "unexpected-retry-once")
+        )
 
     async def test_five_minute_inactivity_starts_a_clean_requirement(self) -> None:
         sender = "expired-session-seller"
@@ -834,11 +993,9 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(len(client.messages), 1)
-        self.assertEqual(
-            client.messages[0].text.body,  # type: ignore[attr-defined]
-            "This WhatsApp number is not authorized.",
-        )
+        self.assertEqual(client.messages, [])
+        session = await self.orchestrator.get_session("911111111111")
+        self.assertIsNone(session)
 
     async def test_confirmation_precedes_marketplace_pricing_and_revision(self) -> None:
         client = FakeWhatsAppClient(
@@ -1352,7 +1509,7 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.estate.lines[1].renewal_quantity, 15)
         self.assertIsNone(session.confirmed_as_is)
         self.assertEqual(session.scenarios, {})
-        self.assertEqual(interpreter.calls, [])
+        self.assertEqual(interpreter.calls, ["Add ME3 within that"])
         response = "\n".join(
             message.text.body  # type: ignore[attr-defined]
             for message in client.messages
@@ -3405,6 +3562,58 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
             str(advisor.calls[0]["seller_question"]),
         )
 
+    async def test_recommendation_followup_with_user_count_is_guidance_not_capture(
+        self,
+    ) -> None:
+        class RecommendationFollowupInterpreter:
+            async def interpret(self, *_: object) -> object:
+                return SimpleNamespace(action="request_recommendation")
+
+            async def close(self) -> None:
+                return None
+
+        sender = "qa-rec-count-followup"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.set_pending_dialogue(
+            sender,
+            PendingDialogue(
+                kind="agent_clarification",
+                question="Which business capability and user group should it support?",
+                context_message="Recommend a suitable Microsoft licence.",
+            ),
+        )
+        advisor = FakeRecommendationAdvisor()
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+            intent_interpreter=RecommendationFollowupInterpreter(),  # type: ignore[arg-type]
+            recommendation_advisor=advisor,
+        )
+
+        await service._handle_text(sender, "endpoint protection for 100 users")
+
+        session = await self.orchestrator.get_session(sender)
+        assert session is not None
+        self.assertIsNone(session.pending_dialogue)
+        self.assertEqual(session.capture_messages, [])
+        self.assertEqual(len(advisor.calls), 1)
+        self.assertIn(
+            "endpoint protection for 100 users",
+            str(advisor.calls[0]["seller_question"]),
+        )
+
     async def test_incomplete_postpricing_addition_keeps_context_for_quantity_reply(
         self,
     ) -> None:
@@ -3956,6 +4165,126 @@ class SimplePricingWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after.pending_dialogue.product_query, "Visio Plan 2")
         self.assertEqual(after.pending_dialogue.quantity, -1)
         failing_add.assert_awaited_once()
+
+    async def test_post_commit_delivery_failure_does_not_rearm_completed_question(
+        self,
+    ) -> None:
+        sender = "pending-post-commit-failure"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        renew = await self.orchestrator.build_scenario(sender, ScenarioType.RENEW_AS_IS)
+        await self.orchestrator.save_confirmed_as_is(sender, renew)
+        source = renew.lines[0]
+        pending = PendingDialogue(
+            kind="agent_clarification",
+            question=f"What quantity should I set for {source.sku_title}?",
+            context_message=f"Change {source.sku_title}",
+            operation="set_quantity",
+            awaiting_slot="quantity",
+            scope="scenario",
+            source_line_id=source.line_id,
+        )
+        await self.orchestrator.set_pending_dialogue(sender, pending)
+        client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))
+        service = WhatsAppWebhookService(
+            client,  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+        new_quantity = source.proposed_quantity + 7
+
+        with patch.object(
+            service,
+            "_send_scenario",
+            AsyncMock(side_effect=RuntimeError("synthetic delivery failure")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "synthetic delivery failure"):
+                await service._execute_completed_pending(
+                    sender,
+                    pending,
+                    _agent_intent(
+                        "set_quantity",
+                        line_id=source.line_id,
+                        quantity=new_quantity,
+                    ),
+                    str(new_quantity),
+                )
+
+        after = await self.orchestrator.get_session(sender)
+        assert after is not None and after.active_scenario is not None
+        changed = next(
+            line
+            for line in after.scenarios[after.active_scenario].lines
+            if line.line_id == source.line_id
+        )
+        self.assertEqual(changed.proposed_quantity, new_quantity)
+        self.assertIsNone(after.pending_dialogue)
+
+    async def test_fuzzy_choice_survives_output_failure_without_old_question_restore(
+        self,
+    ) -> None:
+        sender = "pending-fuzzy-output-failure"
+        await self.orchestrator.analyze_document(
+            sender=sender,
+            filename=CUSTOMER.name,
+            content=CUSTOMER.read_bytes(),
+        )
+        await self.orchestrator.request_requirement_validation(sender)
+        await self.orchestrator.confirm_requirement(sender)
+        renew = await self.orchestrator.build_scenario(sender, ScenarioType.RENEW_AS_IS)
+        await self.orchestrator.save_confirmed_as_is(sender, renew)
+        pending = PendingDialogue(
+            kind="agent_clarification",
+            question="How many Power BI Premium licences should I add?",
+            context_message="Add Power BI Premium",
+            operation="add_sku",
+            awaiting_slot="quantity",
+            scope="scenario",
+            product_query="Power BI Premium",
+        )
+        await self.orchestrator.set_pending_dialogue(sender, pending)
+        service = WhatsAppWebhookService(
+            FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain")),  # type: ignore[arg-type]
+            self.orchestrator,
+            ServiceConfiguration(
+                frozenset(),
+                10 * 1024 * 1024,
+                allow_all_sellers=True,
+                workflow_mode="simple_pricing",
+            ),
+        )
+
+        with patch.object(
+            service,
+            "_send_sku_change_result",
+            AsyncMock(side_effect=RuntimeError("synthetic candidate delivery failure")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "candidate delivery failure"):
+                await service._execute_completed_pending(
+                    sender,
+                    pending,
+                    _agent_intent(
+                        "add_sku",
+                        product_query="Power BI Premium",
+                        quantity=10,
+                    ),
+                    "10",
+                )
+
+        after = await self.orchestrator.get_session(sender)
+        assert after is not None
+        self.assertIsNotNone(after.pending_sku_change)
+        self.assertIsNone(after.pending_dialogue)
 
     async def test_out_of_scope_request_receives_a_professional_boundary(self) -> None:
         client = FakeWhatsAppClient(WhatsAppMedia(b"", "unused", "text/plain"))

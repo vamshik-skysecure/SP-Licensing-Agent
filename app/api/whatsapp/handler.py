@@ -33,7 +33,8 @@ async def verify_webhook(
     logger.info("Webhook verification requested mode=%s", hub_mode)
     if (
         hub_mode != "subscribe"
-        or hub_verify_token != settings.whatsapp_webhook_verify_token
+        or hub_verify_token
+        != settings.whatsapp_webhook_verify_token.get_secret_value()
         or hub_challenge is None
     ):
         logger.warning("Webhook verification rejected")
@@ -70,8 +71,20 @@ async def receive_webhook(
         logger.info("Webhook ignored object=%s", webhook.object)
         return {"status": "ignored"}
 
-    logger.info("Webhook payload accepted entries=%d", len(webhook.entry))
-    await dispatcher.dispatch(raw_body, webhook, background_tasks)
+    targeted_webhook = _filter_configured_phone_number(
+        webhook,
+        settings.whatsapp_phone_number_id,
+    )
+    if targeted_webhook is None:
+        # The HMAC proves that Meta sent the event, but an app-level webhook may receive
+        # events for several phone-number assets.  A single-number deployment must never
+        # process a seller message using credentials for a different number.  Return 200
+        # so Meta does not retry an event this service intentionally does not own.
+        logger.warning("Webhook ignored because its target phone asset is not configured")
+        return {"status": "ignored"}
+
+    logger.info("Webhook payload accepted entries=%d", len(targeted_webhook.entry))
+    await dispatcher.dispatch(raw_body, targeted_webhook, background_tasks)
     logger.info("Webhook processing dispatched")
     return {"status": "ok"}
 
@@ -104,7 +117,7 @@ async def _read_bounded_body(request: Request, max_bytes: int) -> bytes:
 
 def _validate_signature(raw_body: bytes, signature: str | None, settings: Settings) -> None:
     expected_signature = "sha256=" + hmac.new(
-        settings.whatsapp_app_secret.encode(),
+        settings.whatsapp_app_secret.get_secret_value().encode(),
         raw_body,
         hashlib.sha256,
     ).hexdigest()
@@ -114,3 +127,40 @@ def _validate_signature(raw_body: bytes, signature: str | None, settings: Settin
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid WhatsApp webhook signature.",
         )
+
+
+def _filter_configured_phone_number(
+    webhook: WhatsAppWebhookPayload,
+    configured_phone_number_id: str,
+) -> WhatsAppWebhookPayload | None:
+    """Keep only message changes targeting this deployment's WhatsApp phone asset.
+
+    Meta can batch changes for several phone-number assets in one signed request.  The
+    request signature authenticates the app-level batch, so rejecting the whole batch
+    when one change belongs to a different asset would also discard valid messages for
+    this deployment.  Filtering occurs only after HMAC and schema validation.
+    """
+
+    configured = configured_phone_number_id.strip()
+    if not configured:
+        return None
+
+    filtered_entries = []
+    for entry in webhook.entry:
+        filtered_changes = []
+        for change in entry.changes:
+            if not change.value.messages:
+                continue
+            metadata = change.value.metadata
+            if metadata is None or not hmac.compare_digest(
+                metadata.phone_number_id,
+                configured,
+            ):
+                continue
+            filtered_changes.append(change)
+        if filtered_changes:
+            filtered_entries.append(entry.model_copy(update={"changes": filtered_changes}))
+
+    if not filtered_entries:
+        return None
+    return webhook.model_copy(update={"entry": filtered_entries})

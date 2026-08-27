@@ -14,11 +14,17 @@ class WorkflowConflictError(RuntimeError):
 class WorkflowStore(Protocol):
     async def get(self, thread_id: str) -> tuple[WorkflowSession | None, str | None]: ...
 
+    async def get_raw(
+        self, thread_id: str
+    ) -> tuple[WorkflowSession | None, str | None]: ...
+
     async def save(
         self,
         session: WorkflowSession,
         expected_version: str | None,
     ) -> str: ...
+
+    async def check_health(self) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -41,6 +47,22 @@ class InMemoryWorkflowStore:
                 return None, str(version)
             return session.model_copy(deep=True), str(version)
 
+    async def get_raw(
+        self, thread_id: str
+    ) -> tuple[WorkflowSession | None, str | None]:
+        """Return persisted state without applying the conversational TTL.
+
+        Message de-duplication must outlive the five-minute conversation window; otherwise
+        a delayed Meta retry can replay an already-applied commercial mutation.
+        """
+
+        async with self._lock:
+            stored = self._documents.get(thread_id)
+            if stored is None:
+                return None, None
+            session, version = stored
+            return session.model_copy(deep=True), str(version)
+
     async def save(
         self,
         session: WorkflowSession,
@@ -57,6 +79,12 @@ class InMemoryWorkflowStore:
                 next_version,
             )
             return str(next_version)
+
+    async def check_health(self) -> None:
+        """Prove the in-process store lock is reachable without changing a session."""
+
+        async with self._lock:
+            return None
 
     async def close(self) -> None:
         self._documents.clear()
@@ -103,7 +131,22 @@ class AzureBlobWorkflowStore:
     async def connect(self) -> None:
         await self._container.get_container_properties()
 
+    async def check_health(self) -> None:
+        """Verify the configured workflow container remains reachable."""
+
+        await self._container.get_container_properties()
+
     async def get(self, thread_id: str) -> tuple[WorkflowSession | None, str | None]:
+        session, version = await self.get_raw(thread_id)
+        if session is None:
+            return None, version
+        if session.updated_at + self._session_ttl <= datetime.now(UTC):
+            return None, version
+        return session, version
+
+    async def get_raw(
+        self, thread_id: str
+    ) -> tuple[WorkflowSession | None, str | None]:
         from azure.core.exceptions import ResourceNotFoundError
 
         blob = self._blob(thread_id)
@@ -115,8 +158,6 @@ class AzureBlobWorkflowStore:
         session = WorkflowSession.model_validate_json(content)
         etag = getattr(getattr(stream, "properties", None), "etag", None)
         version = str(etag) if etag else None
-        if session.updated_at + self._session_ttl <= datetime.now(UTC):
-            return None, version
         return session, version
 
     async def save(

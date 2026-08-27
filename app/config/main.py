@@ -3,7 +3,7 @@ import re
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, computed_field, model_validator
+from pydantic import Field, SecretStr, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,6 +12,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     # Optional high-level profile for safe, one-setting runtime selection. When it is
@@ -20,13 +21,13 @@ class Settings(BaseSettings):
     runtime_profile: Literal["local_demo", "production"] | None = None
     environment: Literal["development", "test", "production"] = "development"
 
-    whatsapp_access_token: str = ""
+    whatsapp_access_token: SecretStr = SecretStr("")
     whatsapp_phone_number_id: str = ""
     whatsapp_uri: str = "https://graph.facebook.com"
     whatsapp_uri_version: str = "v25.0"
     whatsapp_connect_retries: int = 3
-    whatsapp_webhook_verify_token: str = ""
-    whatsapp_app_secret: str = ""
+    whatsapp_webhook_verify_token: SecretStr = SecretStr("")
+    whatsapp_app_secret: SecretStr = SecretStr("")
     whatsapp_seller_allowlist: str = ""
     whatsapp_allow_all_sellers: bool = False
     whatsapp_validate_credentials_on_startup: bool = True
@@ -47,7 +48,7 @@ class Settings(BaseSettings):
     rate_card_local_path: Path = Path("docs/microsoft_sku_v6_distributor.xlsx")
     rate_card_sheet_name: str = "Outcome Sheet"
     rate_card_storage_account_url: str | None = None
-    rate_card_storage_connection_string: str | None = None
+    rate_card_storage_connection_string: SecretStr | None = None
     rate_card_container_name: str = "pricing-workbooks"
     rate_card_blob_name: str = "active/Microsoft_SKU_V6.0_Distributor.xlsx"
 
@@ -65,7 +66,7 @@ class Settings(BaseSettings):
     ai_intent_backend: Literal["disabled", "openai"] = "disabled"
     requirement_capture_backend: Literal["disabled", "openai"] = "disabled"
     official_recommendation_backend: Literal["disabled", "openai_web"] = "disabled"
-    openai_api_key: str = ""
+    openai_api_key: SecretStr = SecretStr("")
     openai_model: str = "gpt-5.6-luna"
     openai_transcription_model: str = "gpt-transcribe"
     openai_reasoning_effort: Literal["none", "low", "medium", "high"] = "none"

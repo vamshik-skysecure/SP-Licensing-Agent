@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -126,6 +127,7 @@ class NormalizedLicenseLine(BaseModel):
     match_confidence: float | None = Field(default=None, ge=0, le=100)
     match_method: Literal["exact", "fuzzy", "seller_confirmed", "unresolved"]
     candidates: list[SkuMatchCandidate] = Field(default_factory=list)
+    candidate_narrowing_required: bool = False
 
     @property
     def display_title(self) -> str:
@@ -144,6 +146,7 @@ class SellerProvidedDetail(BaseModel):
 class LicenseEstate(BaseModel):
     id: str
     thread_id: str
+    capture_token: str = Field(default_factory=lambda: uuid4().hex)
     source_file: str
     status: EstateStatus
     lines: list[NormalizedLicenseLine]
@@ -217,6 +220,12 @@ class PendingSkuChange(BaseModel):
     quantity: int = Field(gt=0)
     source_line_id: str | None = None
     candidates: list[SkuMatchCandidate] = Field(min_length=1)
+    candidate_narrowing_required: bool = False
+    failed_attempts: int = Field(default=0, ge=0, le=2)
+    # Requirement-scoped choices are not protected by a CommercialScenario revision.
+    # Bind them to the exact captured estate so a delayed conversational turn cannot
+    # restore and apply a choice after quantities or lines have changed.
+    requirement_fingerprint: str | None = Field(default=None, max_length=64)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -244,6 +253,22 @@ class PendingDialogue(BaseModel):
         "add_comment",
         "request_recommendation",
         "compare_enterprise_options",
+    ] = "none"
+    awaiting_slot: Literal[
+        "none",
+        "resume_choice",
+        "change_dimension",
+        "scenario",
+        "line",
+        "product",
+        "quantity",
+        "disposition",
+        "term",
+        "billing",
+        "segment",
+        "currency",
+        "comment",
+        "recommendation_context",
     ] = "none"
     scope: Literal["none", "requirement", "scenario"] = "none"
     scenario_type: ScenarioType | None = None
@@ -289,11 +314,15 @@ class WorkflowSession(BaseModel):
     scenarios: dict[ScenarioType, CommercialScenario] = Field(default_factory=dict)
     active_scenario: ScenarioType | None = None
     confirmed_as_is: CommercialScenario | None = None
+    # AWAITING_SCENARIO is also used by legacy preview flows, so the stage alone
+    # cannot prove that the seller approved the latest captured requirement.
+    requirement_confirmed: bool = False
     pending_sku_change: PendingSkuChange | None = None
     pending_dialogue: PendingDialogue | None = None
     pending_match_prompt_suspended: bool = False
     capture_messages: list[str] = Field(default_factory=list, max_length=8)
     processed_message_ids: list[str] = Field(default_factory=list)
+    inflight_message_ids: list[str] = Field(default_factory=list)
     failure_notified_message_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

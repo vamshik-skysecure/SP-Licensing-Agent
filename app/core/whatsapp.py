@@ -88,11 +88,11 @@ class WhatsAppClient:
                 "WhatsApp credential validation failed.",
                 status_code=error.response.status_code,
                 response_body=error.response.text,
-            ) from error
-        except RequestError as error:
+            ) from None
+        except RequestError:
             raise WhatsAppAPIError(
                 "Unable to validate WhatsApp credentials.", network_error=True
-            ) from error
+            ) from None
 
         self._credentials_valid = True
         logger.info("WhatsApp credential validation completed")
@@ -125,16 +125,16 @@ class WhatsAppClient:
                 "WhatsApp Cloud API rejected the message request.",
                 status_code=error.response.status_code,
                 response_body=error.response.text,
-            ) from error
+            ) from None
         except RequestError as error:
             logger.error(
-                "WhatsApp API send request failed duration_ms=%.1f error=%s",
+                "WhatsApp API send request failed duration_ms=%.1f error_type=%s",
                 (perf_counter() - started_at) * 1000,
-                error,
+                type(error).__name__,
             )
             raise WhatsAppAPIError(
                 "Unable to reach the WhatsApp Cloud API.", network_error=True
-            ) from error
+            ) from None
 
         logger.info(
             "WhatsApp API send request completed status=%d duration_ms=%.1f",
@@ -148,7 +148,7 @@ class WhatsAppClient:
                 "WhatsApp Cloud API returned an invalid JSON response.",
                 status_code=response.status_code,
                 response_body=response.text,
-            ) from error
+            ) from None
 
         if not isinstance(payload, dict):
             raise WhatsAppAPIError(
@@ -236,18 +236,18 @@ class WhatsAppClient:
                 "WhatsApp Cloud API rejected the media upload.",
                 status_code=error.response.status_code,
                 response_body=error.response.text,
-            ) from error
-        except RequestError as error:
+            ) from None
+        except RequestError:
             raise WhatsAppAPIError(
                 "Unable to upload media to the WhatsApp Cloud API.",
                 network_error=True,
-            ) from error
-        except ValueError as error:
+            ) from None
+        except ValueError:
             raise WhatsAppAPIError(
                 "WhatsApp Cloud API returned invalid media metadata.",
                 status_code=response.status_code,
                 response_body=response.text,
-            ) from error
+            ) from None
 
     async def download_media(
         self,
@@ -294,7 +294,7 @@ class WhatsAppClient:
                 "WhatsApp Cloud API rejected the media download request.",
                 status_code=error.response.status_code,
                 response_body=error.response.text,
-            ) from error
+            ) from None
         except RequestError as error:
             logger.error(
                 "WhatsApp media request failed media_ref=%s duration_ms=%.1f "
@@ -306,14 +306,14 @@ class WhatsAppClient:
             raise WhatsAppAPIError(
                 "Unable to download media from the WhatsApp Cloud API.",
                 network_error=True,
-            ) from error
-        except ValueError as error:
+            ) from None
+        except ValueError:
             logger.error("WhatsApp media metadata was invalid media_ref=%s", media_ref)
             raise WhatsAppAPIError(
                 "WhatsApp Cloud API returned invalid media metadata.",
                 status_code=metadata_response.status_code,
                 response_body=metadata_response.text,
-            ) from error
+            ) from None
 
         logger.info("WhatsApp media content download started media_ref=%s", media_ref)
         try:
@@ -353,7 +353,7 @@ class WhatsAppClient:
             raise WhatsAppAPIError(
                 "WhatsApp Cloud API rejected the media download request.",
                 status_code=error.response.status_code,
-            ) from error
+            ) from None
         except RequestError as error:
             logger.error(
                 "WhatsApp media content request failed media_ref=%s duration_ms=%.1f "
@@ -365,11 +365,11 @@ class WhatsAppClient:
             raise WhatsAppAPIError(
                 "Unable to download media from the WhatsApp Cloud API.",
                 network_error=True,
-            ) from error
-        except ValueError as error:
+            ) from None
+        except ValueError:
             raise WhatsAppAPIError(
                 "WhatsApp Cloud API returned invalid media headers."
-            ) from error
+            ) from None
 
         logger.info(
             "WhatsApp media content download completed media_ref=%s status=%d bytes=%d duration_ms=%.1f",

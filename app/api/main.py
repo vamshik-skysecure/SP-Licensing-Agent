@@ -1,8 +1,11 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from app.api.dependencies import lifespan
 from app.api.router import api_router
+from app.config import get_logger
+
+logger = get_logger(__name__)
 
 app = FastAPI(
     title="SkySecure Microsoft Licensing Advisor",
@@ -43,21 +46,43 @@ async def liveness() -> dict[str, str]:
 
 @app.get("/health/ready", tags=["health"])
 async def readiness(request: Request) -> dict[str, str | int]:
-    catalog = await request.app.state.rate_cards.get()
     settings = request.app.state.settings
-    request.app.state.scenario_engine.validate_catalog(
-        catalog,
-        term_duration=settings.default_term_duration,
-        billing_plan=settings.default_billing_plan,
-        segment=settings.default_customer_segment,
-    )
+    whatsapp_client = request.app.state.whatsapp_client
+    dispatcher = request.app.state.webhook_dispatcher
+    if not whatsapp_client.credentials_valid:
+        logger.warning("Readiness check failed component=whatsapp_credentials")
+        raise HTTPException(status_code=503, detail="Service dependencies are not ready.")
+    if not dispatcher.is_running:
+        logger.warning("Readiness check failed component=webhook_dispatcher")
+        raise HTTPException(status_code=503, detail="Service dependencies are not ready.")
+    try:
+        await request.app.state.workflow_store.check_health()
+        catalog = await request.app.state.rate_cards.get()
+        request.app.state.scenario_engine.validate_catalog(
+            catalog,
+            term_duration=settings.default_term_duration,
+            billing_plan=settings.default_billing_plan,
+            segment=settings.default_customer_segment,
+        )
+    except Exception as error:
+        logger.warning(
+            "Readiness dependency check failed error_type=%s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Service dependencies are not ready.",
+        ) from None
     return {
         "status": "ready",
         "runtime_profile": settings.effective_runtime_profile,
         "rate_card_version": catalog.version,
         "price_rows": len(catalog.items),
         "workflow_store": request.app.state.settings.workflow_store_backend,
+        "workflow_store_status": "ready",
         "dispatch": request.app.state.settings.message_dispatch_backend,
+        "dispatcher_status": "running",
+        "whatsapp_credentials": "valid",
     }
 
 

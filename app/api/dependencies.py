@@ -41,6 +41,15 @@ from app.core.whatsapp import WhatsAppAPIError, WhatsAppClient
 logger = get_logger(__name__)
 
 
+def _secret_value(value: object) -> str | None:
+    """Reveal a configured secret only at the dependency boundary that consumes it."""
+
+    if value is None:
+        return None
+    reveal = getattr(value, "get_secret_value", None)
+    return reveal() if callable(reveal) else str(value)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = Settings()
@@ -65,7 +74,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cleanup.push_async_callback(whatsapp_http_client.aclose)
         whatsapp_client = WhatsAppClient(
             http_client=whatsapp_http_client,
-            access_token=settings.whatsapp_access_token,
+            access_token=_secret_value(settings.whatsapp_access_token) or "",
             phone_number_id=settings.whatsapp_phone_number_id,
             base_url=settings.whatsapp_uri,
             api_version=settings.whatsapp_uri_version,
@@ -92,7 +101,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 container_name=settings.rate_card_container_name,
                 blob_name=settings.rate_card_blob_name,
                 account_url=settings.rate_card_storage_account_url,
-                connection_string=settings.rate_card_storage_connection_string,
+                connection_string=_secret_value(
+                    settings.rate_card_storage_connection_string
+                ),
             )
         else:
             rate_card_source = LocalRateCardSource(settings.rate_card_local_path)
@@ -108,7 +119,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 container_name=settings.workflow_blob_container_name,
                 prefix=settings.workflow_blob_prefix,
                 account_url=settings.rate_card_storage_account_url,
-                connection_string=settings.rate_card_storage_connection_string,
+                connection_string=_secret_value(
+                    settings.rate_card_storage_connection_string
+                ),
                 session_ttl_minutes=settings.session_ttl_minutes,
             )
             workflow_store = blob_store
@@ -187,7 +200,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         intent_interpreter: IntentInterpreter | None = None
         if settings.ai_intent_backend == "openai":
             intent_interpreter = OpenAIIntentInterpreter(
-                api_key=settings.openai_api_key,
+                api_key=_secret_value(settings.openai_api_key) or "",
                 model=settings.openai_model,
                 reasoning_effort=settings.openai_reasoning_effort,
                 workflow_mode=settings.workflow_mode,
@@ -197,7 +210,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         requirement_extractor: RequirementExtractor | None = None
         if settings.requirement_capture_backend == "openai":
             requirement_extractor = OpenAIRequirementExtractor(
-                api_key=settings.openai_api_key,
+                api_key=_secret_value(settings.openai_api_key) or "",
                 model=settings.openai_model,
                 transcription_model=settings.openai_transcription_model,
                 max_audio_seconds=settings.max_audio_seconds,
@@ -207,7 +220,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         recommendation_advisor: RecommendationAdvisor | None = None
         if settings.official_recommendation_backend == "openai_web":
             recommendation_advisor = OpenAIMicrosoftRecommendationAdvisor(
-                api_key=settings.openai_api_key,
+                api_key=_secret_value(settings.openai_api_key) or "",
                 model=settings.openai_model,
                 reasoning_effort=settings.openai_reasoning_effort,
             )
@@ -236,6 +249,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 currency=settings.default_currency,
                 simple_price_basis=settings.simple_price_basis,
                 workflow_mode=settings.workflow_mode,
+                session_ttl_minutes=settings.session_ttl_minutes,
             ),
             intent_interpreter=intent_interpreter,
             requirement_extractor=requirement_extractor,
@@ -248,7 +262,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 container_name=settings.workflow_blob_container_name,
                 prefix=settings.webhook_blob_prefix,
                 account_url=settings.rate_card_storage_account_url,
-                connection_string=settings.rate_card_storage_connection_string,
+                connection_string=_secret_value(
+                    settings.rate_card_storage_connection_string
+                ),
                 poll_seconds=settings.webhook_blob_poll_seconds,
                 max_delivery_count=settings.webhook_max_delivery_count,
             )

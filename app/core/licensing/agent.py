@@ -170,7 +170,7 @@ class OfficialProductAnswer(BaseModel):
                 raise IntentInterpretationError(
                     "The product answer contained a non-Microsoft source."
                 )
-        if self.answer.strip() and not self.source_urls:
+        if (self.answer.strip() or has_table) and not self.source_urls:
             raise IntentInterpretationError(
                 "The product answer did not contain an official Microsoft source."
             )
@@ -403,6 +403,11 @@ and validates every commercial operation after you return the action.
 Rules:
 - First interpret the seller's latest message in the supplied workflow context. Classify the
   meaning of the complete turn; do not force it into the answer expected by a pending question.
+- If one turn requests two or more independent commercial mutations (for example, remove one
+  product and add another), never return only one of them. Because the structured contract
+  represents one mutation at a time, use clarify, briefly restate every recognized change, and
+  ask the seller which one to apply first. A replacement plus its stated target quantity is one
+  operation and may be returned as replace_sku with quantity.
 - Use help for a greeting, a request to start, or a broad question such as "what do you do?".
   Write a fresh, context-aware response in response_text; do not return a memorized menu or
   command list. For a new conversation, introduce the SkySecure Microsoft Licensing Advisor,
@@ -417,8 +422,9 @@ Rules:
   response_text. Do not use acknowledge for "yes", "okay", or similar wording when it answers
   an active confirmation or clarification question; resolve that pending question instead.
 - Use reset_requirement only when the seller explicitly asks to discard the current work and
-  start fresh, reset, clear everything, or begin a new requirement. A normal greeting or the word
-  "start" by itself is help, not a reset.
+  start fresh, reset, clear everything, or begin a new requirement. A normal greeting, the word
+  "start" by itself, a question about what reset does, or a negated request such as "do not reset"
+  is not a reset.
 - When no estate is loaded, use capture_requirement if the seller mentions licence/SKU
   requirement data, even when a quantity or term is missing. The extraction step will ask for
   missing requirement details. Never treat a greeting or question as licence data.
@@ -526,7 +532,8 @@ Rules:
   set_adjustment for a seller-stated positive or negative monetary adjustment.
 - Use set_term, set_billing, set_segment, and set_currency for those commercial settings.
 - Use confirm_sku with candidate_number for an explicit numbered add/replace SKU choice;
-  use cancel_sku when the seller cancels that pending change.
+  use cancel_sku when the seller affirmatively cancels that pending change. A question about
+  cancellation or a request not to cancel is not cancellation.
 - Use confirm_matches when the seller selects a candidate for one or more unresolved uploaded
   lines. Put each supplied line and one-based option number in match_selections. A full
   candidate product name, "yes" to a single offered candidate, or one option number for one
@@ -534,16 +541,19 @@ Rules:
 - Use add_comment only for an explicit note or assumption.
 - Use finalize only when the seller explicitly asks to start finalization. The application
   will show a final validation summary and ask for a second confirmation.
-- Use confirm_validation when the seller explicitly approves the displayed analysis/pricing
-  during awaiting_initial_validation, or explicitly approves finalization during
-  awaiting_final_validation.
+- Use confirm_validation only for an affirmative seller assertion that explicitly approves the
+  displayed analysis/pricing during awaiting_initial_validation, or explicitly approves
+  finalization during awaiting_final_validation. A question containing words such as confirm,
+  approve, proceed, or price is not approval. A negated, conditional, hypothetical, or quoted
+  statement is never approval.
 - Use reject_validation when the seller reports that the displayed initial details are
   incorrect, cancels finalization, or asks to continue editing at a validation gate.
 - A bare "yes" means confirm_validation only when the current stage is one of the two
   validation stages. Otherwise use clarify.
 - Use help for broad capability questions. Use compare for an explicit Renew As-Is versus
   revised comparison, and compare_enterprise_options only when the seller explicitly asks to
-  compare ME3, ME5, and/or ME7 enterprise options.
+  compare ME3, ME5, and/or ME7 enterprise options. Questions about what a comparison means and
+  negated requests not to compare are informational turns, not comparison actions.
 - Use request_recommendation when the seller asks for a better SKU or a recommendation with the
   intent to upgrade, replace, add, or revise the proposal. Preserve an explicitly stated source
   line and user count. Do not
@@ -814,6 +824,7 @@ class OpenAIIntentInterpreter:
                     "question": session.pending_dialogue.question,
                     "context_message": session.pending_dialogue.context_message,
                     "operation": session.pending_dialogue.operation,
+                    "awaiting_slot": session.pending_dialogue.awaiting_slot,
                     "scope": session.pending_dialogue.scope,
                     "scenario_type": (
                         session.pending_dialogue.scenario_type.value
@@ -828,6 +839,30 @@ class OpenAIIntentInterpreter:
                     "detail_value": session.pending_dialogue.detail_value,
                 }
                 if session.pending_dialogue is not None
+                else None
+            ),
+            "pending_sku_change": (
+                {
+                    "confirmation_id": session.pending_sku_change.id,
+                    "scope": session.pending_sku_change.scope,
+                    "action": session.pending_sku_change.action,
+                    "source_line_id": session.pending_sku_change.source_line_id,
+                    "product_query": session.pending_sku_change.product_query,
+                    "quantity": session.pending_sku_change.quantity,
+                    "candidates": [
+                        {
+                            "number": index,
+                            "title": candidate.sku_title,
+                            "product_id": candidate.product_id,
+                            "sku_id": candidate.sku_id,
+                        }
+                        for index, candidate in enumerate(
+                            session.pending_sku_change.candidates,
+                            start=1,
+                        )
+                    ],
+                }
+                if session.pending_sku_change is not None
                 else None
             ),
             "active_scenario": (

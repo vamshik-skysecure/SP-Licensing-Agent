@@ -67,6 +67,9 @@ class _FakeBlob:
         self._container.documents[self.name] = bytes(content)
         self._container.metadata[self.name] = dict(options.get("metadata") or {})
 
+    async def exists(self) -> bool:
+        return self.name in self._container.documents
+
     async def download_blob(self, **_: Any) -> "_FakeStream":
         return _FakeStream(self._container.documents[self.name])
 
@@ -169,9 +172,15 @@ class BlobInboxTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(container.documents), 3)
         names = sorted(container.documents)
-        self.assertIn("/pending/1700000001-", names[0])
-        self.assertIn("/pending/1700000002-", names[1])
-        self.assertIn("/pending/1700000003-", names[2])
+        for name in names:
+            self.assertRegex(
+                name,
+                r"/pending/[0-9a-f]{64}/170000000[123]-000[012]-[0-9a-f]{64}\.json$",
+            )
+        self.assertEqual(
+            {name.rsplit("/", 1)[-1].split("-", 1)[0] for name in names},
+            {"1700000001", "1700000002", "1700000003"},
+        )
         for content in container.documents.values():
             persisted = WhatsAppWebhookPayload.model_validate_json(content)
             messages = [
@@ -224,7 +233,12 @@ class BlobInboxTests(unittest.IsolatedAsyncioTestCase):
         await dispatcher._process(pending_name)
 
         self.assertEqual(handler.handled, 1)
-        self.assertEqual(container.documents, {})
+        self.assertFalse(any("/pending/" in name for name in container.documents))
+        terminal_names = [
+            name for name in container.documents if "/terminal/" in name
+        ]
+        self.assertEqual(len(terminal_names), 1)
+        self.assertEqual(container.metadata[terminal_names[0]]["state"], "completed")
 
     async def test_repeated_failure_moves_message_to_dead_letter(self) -> None:
         container = _FakeContainer()

@@ -7,9 +7,11 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from itertools import islice
 from pathlib import Path
+from typing import TypeAlias
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile, ZipFile
 
+from .candidate_policy import requires_candidate_narrowing
 from .models import (
     EstateStatus,
     LicenseEstate,
@@ -26,6 +28,9 @@ class LicenseAnalysisError(ValueError):
 
 class UnsupportedLicenseLayoutError(LicenseAnalysisError):
     """A readable file whose tabular layout requires structured extraction."""
+
+
+SkuMatchSelection: TypeAlias = tuple[str, str] | tuple[str, str, str]
 
 
 MAX_CUSTOMER_FILE_ROWS = 1_000
@@ -152,7 +157,7 @@ class LicenseAnalyzer:
     def confirm_matches(
         self,
         estate: LicenseEstate,
-        selections: Mapping[str, tuple[str, str]],
+        selections: Mapping[str, SkuMatchSelection],
     ) -> LicenseEstate:
         pending_ids = {line.line_id for line in estate.pending_lines}
         selected_ids = set(selections)
@@ -168,20 +173,49 @@ class LicenseAnalyzer:
             if line.line_id not in selections:
                 updated.append(line)
                 continue
-            product_id, sku_id = selections[line.line_id]
-            candidate = next(
-                (
+            selection = selections[line.line_id]
+            if len(selection) == 2:
+                product_id, sku_id = selection
+                selected_title = None
+            elif len(selection) == 3:
+                product_id, sku_id, selected_title = selection
+                if not selected_title.strip():
+                    raise LicenseAnalysisError(
+                        f"Selection for {line.line_id} has an empty product title."
+                    )
+            else:
+                raise LicenseAnalysisError(
+                    f"Selection for {line.line_id} has an invalid catalogue identity."
+                )
+            pair_matches = [
+                item
+                for item in line.candidates
+                if item.product_id.casefold() == product_id.casefold()
+                and item.sku_id.casefold() == sku_id.casefold()
+            ]
+            if selected_title is not None:
+                pair_matches = [
                     item
-                    for item in line.candidates
-                    if item.product_id.casefold() == product_id.casefold()
-                    and item.sku_id.casefold() == sku_id.casefold()
-                ),
-                None,
-            )
-            if candidate is None:
+                    for item in pair_matches
+                    if item.sku_title.strip().casefold()
+                    == selected_title.strip().casefold()
+                ]
+            elif len(pair_matches) > 1:
+                identity = (
+                    "blank Product/SKU identifiers"
+                    if not product_id.strip() and not sku_id.strip()
+                    else f"ProductId/SkuId {product_id}/{sku_id}"
+                )
+                raise LicenseAnalysisError(
+                    f"Selection for {line.line_id} is ambiguous because {identity} "
+                    "belongs to more than one offered product. Choose the current "
+                    "numbered product option so its title is confirmed too."
+                )
+            if len(pair_matches) != 1:
                 raise LicenseAnalysisError(
                     f"Selection for {line.line_id} is not one of its offered candidates."
                 )
+            candidate = pair_matches[0]
             updated.append(
                 line.model_copy(
                     update={
@@ -191,6 +225,7 @@ class LicenseAnalyzer:
                         "match_confidence": candidate.confidence,
                         "match_method": "seller_confirmed",
                         "candidates": [],
+                        "candidate_narrowing_required": False,
                     }
                 )
             )
@@ -246,6 +281,9 @@ class LicenseAnalyzer:
             match_confidence=selected.confidence if selected else None,
             match_method=method,  # type: ignore[arg-type]
             candidates=[] if selected else candidates,
+            candidate_narrowing_required=(
+                False if selected else requires_candidate_narrowing(candidates)
+            ),
         )
 
 

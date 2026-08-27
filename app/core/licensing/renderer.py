@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from xml.sax.saxutils import escape
 
+from .candidate_policy import candidate_narrowing_question
 from .models import (
     CommercialComparison,
     CommercialScenario,
@@ -63,19 +64,27 @@ def format_estate(
 def format_pending_matches(estate: LicenseEstate) -> str:
     lines = ["*Let’s confirm the exact Microsoft product*"]
     for pending in estate.pending_lines:
-        lines.extend(
-            (
-                "",
-                f"*{pending.line_id} — {pending.source_product_title}*",
-                sku_clarification_question(
+        lines.extend(("", f"*{pending.line_id} — {pending.source_product_title}*"))
+        if pending.candidate_narrowing_required:
+            lines.append(
+                candidate_narrowing_question(
                     pending.source_product_title,
-                    pending.candidates,
-                ),
+                    len(pending.candidates),
+                )
+            )
+            continue
+        lines.append(
+            sku_clarification_question(
+                pending.source_product_title,
+                pending.candidates,
             )
         )
         for index, candidate in enumerate(pending.candidates, start=1):
             lines.append(f"{index}. {format_sku_candidate(candidate)}")
-    if any(line.candidates for line in estate.pending_lines):
+    if any(
+        line.candidates and not line.candidate_narrowing_required
+        for line in estate.pending_lines
+    ):
         lines.extend(
             (
                 "",
@@ -308,7 +317,11 @@ def render_estate_pdf(
             sku = (
                 f"{line.product_id}/{line.sku_id}"
                 if line.product_id and line.sku_id
-                else "Needs confirmation"
+                else (
+                    "Needs confirmation"
+                    if line.match_method == "unresolved"
+                    else "Name-only catalogue entry"
+                )
             )
             data.append([
                 line.line_id,
@@ -1166,7 +1179,7 @@ def render_comparison_pdf(
         if visible_notes:
             story.append(Paragraph("Proposal notes", styles["Heading3"]))
             for comment in visible_notes:
-                story.append(Paragraph(f"• {comment}", styles["Normal"]))
+                story.append(Paragraph(f"• {escape(comment)}", styles["Normal"]))
 
     document.build(story)
     return output.getvalue()

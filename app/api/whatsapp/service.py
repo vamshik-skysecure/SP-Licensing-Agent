@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
@@ -15,6 +16,10 @@ from app.core.licensing.capture import (
     CapturedRequirement,
     RequirementCaptureError,
     RequirementExtractor,
+)
+from app.core.licensing.candidate_policy import (
+    candidate_narrowing_question,
+    combine_product_qualifier,
 )
 from app.core.licensing.agent import (
     AgentIntent,
@@ -167,12 +172,11 @@ REQUIREMENT_CONFIRMATION_REPLIES = {
 CANCEL_REPLIES = {
     "cancel",
     "cancel that",
-    "i don't want that",
-    "i dont want that",
-    "don't want that",
-    "dont want that",
-    "remove it",
-    "remove that",
+    "cancel this",
+    "cancel the question",
+    "never mind",
+    "nevermind",
+    "stop this change",
 }
 
 SCENARIO_EDIT_ACTIONS = {
@@ -185,6 +189,21 @@ SCENARIO_EDIT_ACTIONS = {
     "set_billing",
     "set_segment",
     "add_comment",
+}
+
+FINALIZATION_CORRECTION_ACTIONS = SCENARIO_EDIT_ACTIONS | {
+    "set_requirement_detail",
+    "set_currency",
+    "set_promo",
+    "set_discount",
+    "set_adjustment",
+    "request_recommendation",
+    "build_scenario",
+}
+
+ASSERTIVE_COMMERCIAL_ACTIONS = FINALIZATION_CORRECTION_ACTIONS | {
+    "set_copilot",
+    "set_disposition",
 }
 
 SIMPLE_PRICING_RESTRICTED_TERMS = (
@@ -227,6 +246,8 @@ class ServiceConfiguration:
         "upgrade_comparison",
         "scenario_comparison",
     ] = "scenario_comparison"
+    session_ttl_minutes: int = 5
+    inbound_future_clock_skew_seconds: int = 5 * 60
 
 
 class WhatsAppWebhookService:
@@ -253,6 +274,52 @@ class WhatsAppWebhookService:
                 for message in change.value.messages:
                     await self._handle_message(message)
 
+    def _message_timestamp_status(
+        self,
+        message: IncomingWhatsAppMessage,
+        *,
+        now: datetime | None = None,
+    ) -> Literal["current", "stale", "invalid"]:
+        """Classify a signed Meta event against the conversation's usable time window.
+
+        Meta message timestamps are Unix seconds. A missing timestamp is accepted for
+        backwards compatibility with locally constructed/test payloads, while a supplied
+        but malformed timestamp is rejected. Small positive clock drift is allowed; a
+        far-future timestamp must not remain eligible indefinitely.
+        """
+
+        raw_timestamp = message.timestamp
+        if raw_timestamp is None:
+            return "current"
+        try:
+            timestamp = int(raw_timestamp)
+            if timestamp <= 0:
+                return "invalid"
+            event_time = datetime.fromtimestamp(timestamp, tz=UTC)
+        except (OverflowError, TypeError, ValueError):
+            return "invalid"
+
+        current_time = now or datetime.now(UTC)
+        ttl = timedelta(minutes=max(1, self._configuration.session_ttl_minutes))
+        future_skew = timedelta(
+            seconds=max(0, self._configuration.inbound_future_clock_skew_seconds)
+        )
+        if event_time > current_time + future_skew:
+            return "invalid"
+        if event_time + ttl <= current_time:
+            return "stale"
+        return "current"
+
+    def _is_stale_or_future_message(
+        self,
+        message: IncomingWhatsAppMessage,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Compatibility predicate for callers that only need an accept/reject result."""
+
+        return self._message_timestamp_status(message, now=now) != "current"
+
     async def _handle_message(self, message: IncomingWhatsAppMessage) -> None:
         sender = message.sender.lstrip("+")
         message_ref = opaque_identifier(message.id)
@@ -260,10 +327,58 @@ class WhatsAppWebhookService:
             not self._configuration.allow_all_sellers
             and sender not in self._configuration.seller_allowlist
         ):
-            logger.warning("Unauthorized WhatsApp sender rejected")
-            await self._send_text(sender, "This WhatsApp number is not authorized.")
+            # Meta still receives a successful webhook acknowledgement from the HTTP
+            # handler, but an unknown sender must not trigger an outbound message (and
+            # therefore must not create either a workflow record or WhatsApp cost).
+            logger.warning("Unauthorized WhatsApp sender ignored")
             return
+        timestamp_status = self._message_timestamp_status(message)
+        if timestamp_status == "stale":
+            # Do not apply a delayed instruction to either an expired session or a newer
+            # proposal.  An authorized seller still receives one safe recovery step instead
+            # of experiencing unexplained silence.  This branch intentionally runs before
+            # any workflow read/write, so the saved draft and its TTL remain untouched.
+            logger.warning(
+                "Out-of-window WhatsApp message not applied message_ref=%s",
+                message_ref,
+            )
+            await self._send_text(
+                sender,
+                "That message arrived outside the five-minute processing window, so I did "
+                "not apply it to the saved requirement or proposal. Please send the current "
+                "instruction again; I will process it against the latest session.",
+            )
+            return
+        if timestamp_status == "invalid":
+            # The durable dispatcher records a terminal receipt after this handler
+            # returns.  Do not touch the seller's workflow ledger here: doing so would
+            # refresh or reset a five-minute conversation because Meta delivered an old
+            # malformed/future webhook after an outage or deployment.
+            logger.warning(
+                "Invalid-time WhatsApp message ignored message_ref=%s",
+                message_ref,
+            )
+            return
+        # Normalize an expired workflow before inspecting any delivery ledger. The reset
+        # keeps every processed/in-flight/failure digest while clearing commercial context.
+        # Mutating an expired object first would create an empty replacement session and
+        # silently drop the other replay barriers.
         expired = await self._orchestrator.reset_expired_session(sender)
+        if await self._orchestrator.has_processed(sender, message.id):
+            logger.info("Duplicate WhatsApp message ignored message_ref=%s", message_ref)
+            return
+        if await self._orchestrator.has_failure_notification(sender, message.id):
+            # A prior attempt may already have committed a commercial mutation before an
+            # outbound delivery failed. Never execute it again. This is deliberately
+            # conservative until a transactional outbox can replay only the missing output.
+            await self._send_text(
+                sender,
+                "I stopped an automatic replay because the earlier request may already "
+                "have changed the proposal. Review the latest proposal first; resend the "
+                "change only if it is absent.",
+            )
+            await self._orchestrator.mark_processed(sender, message.id)
+            return
         if expired:
             await self._send_text(
                 sender,
@@ -271,8 +386,23 @@ class WhatsAppWebhookService:
                 "I have started a new requirement and will not reuse any earlier proposal "
                 "details.",
             )
-        if await self._orchestrator.has_processed(sender, message.id):
+
+        claim = await self._orchestrator.claim_message_processing(sender, message.id)
+        if claim == "processed":
             logger.info("Duplicate WhatsApp message ignored message_ref=%s", message_ref)
+            return
+        if claim == "inflight":
+            # A previous process may have stopped after committing a proposal mutation but
+            # before recording completion. Refusing automatic replay is intentionally
+            # at-most-once: it prevents duplicate commercial changes and asks the seller to
+            # resend only after reviewing the current state.
+            await self._send_text(
+                sender,
+                "An earlier attempt may already have changed the proposal, so I will not "
+                "repeat it automatically. Review the current proposal and resend the change "
+                "only if it is absent.",
+            )
+            await self._orchestrator.mark_processed(sender, message.id)
             return
 
         try:
@@ -309,31 +439,91 @@ class WhatsAppWebhookService:
             response = (
                 self._seller_safe_workflow_error(error)
                 if isinstance(error, ValueError)
-                else str(error)
+                else self._professional_agent_text(str(error))
             )
-            await self._send_text(sender, response)
+            await self._send_text(
+                sender,
+                response
+                or (
+                    "I could not safely read that requirement. Please resend the product "
+                    "name and quantity, or upload a clearer supported file."
+                ),
+            )
             await self._orchestrator.mark_processed(sender, message.id)
         except WorkflowConflictError:
-            logger.warning("Workflow concurrency conflict message_ref=%s", message_ref)
-            await self._send_text(sender, "The proposal changed concurrently. Please retry.")
+            # A conflict can occur while committing the business mutation *or* later while
+            # recording the delivery receipt. Completion is therefore unknown. Never release
+            # the in-flight claim and invite an automatic replay: that can duplicate an add,
+            # replacement, or comment that already committed.
+            logger.warning(
+                "Workflow concurrency conflict with unknown completion message_ref=%s",
+                message_ref,
+            )
+            try:
+                await self._orchestrator.mark_failure_notified(sender, message.id)
+            except WorkflowConflictError:
+                logger.warning(
+                    "Unable to persist conflict notification marker message_ref=%s",
+                    message_ref,
+                )
+            await self._send_text(
+                sender,
+                "I could not verify whether that request completed, so I will not repeat it "
+                "automatically. Review the latest proposal and resend the change only if it "
+                "is absent.",
+            )
+            try:
+                await self._orchestrator.mark_processed(sender, message.id)
+            except WorkflowConflictError:
+                # Keeping the original in-flight claim is the safe replay barrier.
+                logger.warning(
+                    "Conflict receipt remains in flight message_ref=%s",
+                    message_ref,
+                )
         except Exception:
             logger.exception("Unexpected workflow failure message_ref=%s", message_ref)
             if not await self._orchestrator.has_failure_notification(sender, message.id):
+                # Persist the replay barrier before attempting another network send. If that
+                # send also fails, the queued retry delivers only the recovery notice and
+                # cannot repeat a possibly committed edit.
+                await self._orchestrator.mark_failure_notified(sender, message.id)
                 await self._send_text(
                     sender,
-                    "I could not complete that request yet. No confirmed proposal change was "
-                    "applied. The service will retry it automatically, so please do not resend "
-                    "the same message. If no follow-up arrives, rephrase the request once or "
-                    "contact the licensing support owner.",
+                    "I could not verify whether that request completed, so I have stopped "
+                    "automatic replay to prevent a duplicate proposal change. Review the "
+                    "latest proposal; resend the change only if it is absent.",
                 )
-                await self._orchestrator.mark_failure_notified(sender, message.id)
-            raise
+            await self._orchestrator.mark_processed(sender, message.id)
+        finally:
+            # Active-turn TTL bypass is task-local and must end even if response delivery,
+            # failure-ledger persistence, or the completion receipt raises. Persisted
+            # in-flight/processed markers continue to enforce replay safety independently.
+            self._orchestrator.end_message_processing_context(sender, message.id)
 
     async def _handle_document(
         self,
         sender: str,
         document: IncomingWhatsAppDocument,
     ) -> None:
+        caption = (document.caption or "").strip()
+        session = await self._orchestrator.get_session(sender)
+        starts_fresh = bool(
+            caption
+            and self._requests_fresh_start(
+                " ".join(caption.casefold().strip(" ?!.,").split())
+            )
+        )
+        if session is not None and session.confirmed_as_is is not None:
+            if not starts_fresh:
+                await self._send_text(
+                    sender,
+                    "The current requirement is already confirmed, so I did not replace it "
+                    "with this attachment. To begin a new requirement, resend the file with "
+                    "the caption 'Start fresh'. To revise the proposal, describe the product "
+                    "change and quantity in a message or voice note.",
+                )
+                return
+            await self._orchestrator.reset_session(sender)
         append_to_draft = await self._has_open_requirement_draft(sender)
         suffix = document.filename.lower().rsplit(".", 1)[-1]
         supported_files = {
@@ -413,14 +603,41 @@ class WhatsAppWebhookService:
             estate,
             appended=append_to_draft,
         )
-        if document.caption and document.caption.strip():
-            await self._handle_text(sender, document.caption.strip())
+        if (
+            caption
+            and not starts_fresh
+            and self._caption_contains_post_upload_action(caption)
+            and (
+                not self._caption_may_duplicate_requirement(caption)
+                or not self._caption_repeats_estate_line(caption, estate)
+            )
+        ):
+            await self._handle_text(sender, caption)
 
     async def _handle_image(
         self,
         sender: str,
         incoming: IncomingWhatsAppImage,
     ) -> None:
+        caption = (incoming.caption or "").strip()
+        session = await self._orchestrator.get_session(sender)
+        starts_fresh = bool(
+            caption
+            and self._requests_fresh_start(
+                " ".join(caption.casefold().strip(" ?!.,").split())
+            )
+        )
+        if session is not None and session.confirmed_as_is is not None:
+            if not starts_fresh:
+                await self._send_text(
+                    sender,
+                    "The current requirement is already confirmed, so I did not replace it "
+                    "with this image. To begin a new requirement, resend it with the caption "
+                    "'Start fresh'. To revise the proposal, describe the product change and "
+                    "quantity in a message or voice note.",
+                )
+                return
+            await self._orchestrator.reset_session(sender)
         append_to_draft = await self._has_open_requirement_draft(sender)
         media = await self._whatsapp_client.download_media(
             media_id=incoming.id,
@@ -456,8 +673,98 @@ class WhatsAppWebhookService:
             estate,
             appended=append_to_draft,
         )
-        if incoming.caption and incoming.caption.strip():
-            await self._handle_text(sender, incoming.caption.strip())
+        if (
+            caption
+            and not starts_fresh
+            and self._caption_contains_post_upload_action(caption)
+            and (
+                not self._caption_may_duplicate_requirement(caption)
+                or not self._caption_repeats_estate_line(caption, estate)
+            )
+        ):
+            await self._handle_text(sender, caption)
+
+    @staticmethod
+    def _caption_contains_post_upload_action(caption: str) -> bool:
+        """Process captions that clearly ask or instruct a second, distinct action.
+
+        Attachment captions are a normal seller turn.  The attachment itself owns the
+        requirement rows, while a question such as ``Show me products under INR 5,000``
+        must still reach the conversational interpreter.  Descriptive captions that merely
+        repeat an extracted row remain excluded by ``_caption_repeats_estate_line``.
+        """
+
+        normalized = " ".join(caption.casefold().strip(" ?!.,").split())
+        return bool(
+            re.match(
+                r"^(?:please\s+)?(?:add|include|remove|delete|drop|replace|change|"
+                r"update|set|compare|finali[sz]e|confirm|comment|note)\b",
+                normalized,
+            )
+            or re.match(
+                r"^(?:please\s+)?(?:show|tell|explain|list|find|recommend|suggest|"
+                r"who|what|which|where|when|why|how|can|could|would|should|do|does|"
+                r"did|is|are|will|may)\b",
+                normalized,
+            )
+            or caption.rstrip().endswith("?")
+            or re.match(
+                r"^(?:customer|company|tenant|contact)\s+(?:name|id|email|number)?"
+                r"\s*(?:is|:|=)\s*\S+",
+                normalized,
+            )
+        )
+
+    @staticmethod
+    def _caption_repeats_estate_line(caption: str, estate) -> bool:
+        """Detect when a caption merely repeats a requirement visible in the attachment."""
+
+        normalized = normalize_product_title(caption)
+        caption_tokens = set(normalized.split()) - {
+            "add",
+            "include",
+            "licence",
+            "licences",
+            "license",
+            "licenses",
+            "please",
+            "quantity",
+            "qty",
+        }
+        numbers = {int(value) for value in re.findall(r"\b\d+\b", caption)}
+        for line in estate.lines:
+            title = normalize_product_title(line.display_title)
+            title_tokens = set(title.split()) - {"microsoft", "licence", "license"}
+            product_matches = bool(
+                title
+                and (
+                    title in normalized
+                    or (
+                        title_tokens
+                        and len(title_tokens & caption_tokens)
+                        / len(title_tokens)
+                        >= 0.8
+                    )
+                )
+            )
+            if product_matches and (
+                not numbers or line.renewal_quantity in numbers
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _caption_may_duplicate_requirement(caption: str) -> bool:
+        """Limit row de-duplication to captions that can add an attachment row again."""
+
+        normalized = " ".join(caption.casefold().strip(" ?!.,").split())
+        return bool(
+            re.match(
+                r"^(?:please\s+)?(?:add|include)\b|"
+                r"^(?:(?:i|we)\s+)?(?:want|need|require|would\s+like)\b",
+                normalized,
+            )
+        )
 
     async def _handle_audio(
         self,
@@ -519,6 +826,7 @@ class WhatsAppWebhookService:
         captured: CapturedRequirement,
         *,
         append: bool = False,
+        consume_capture_messages: bool = False,
     ):
         if captured.extraction.warnings:
             await self._send_text(
@@ -569,6 +877,7 @@ class WhatsAppWebhookService:
                 for item in captured.extraction.seller_details
                 if item.label.strip() and item.value.strip()
             ][:12],
+            consume_capture_messages=consume_capture_messages,
         )
 
     async def _process_captured_estate(
@@ -609,6 +918,18 @@ class WhatsAppWebhookService:
         )
 
     async def _capture_typed_requirement(self, sender: str, message: str) -> None:
+        session_before_capture = await self._orchestrator.get_session(sender)
+        if not await self._is_assertive_requirement_capture(
+            message,
+            session_before_capture,
+        ):
+            await self._send_text(
+                sender,
+                "I treated that as a question or informational statement and did not add "
+                "it to the licensing requirement. State the Microsoft product and quantity "
+                "directly when you want it included.",
+            )
+            return
         extractor = self._require_extractor(
             "Manual natural-language capture requires OpenAI. Send the standard CSV/XLSX "
             "template when language capture is unavailable."
@@ -679,6 +1000,7 @@ class WhatsAppWebhookService:
             "whatsapp-message.txt",
             captured,
             append=append_to_draft,
+            consume_capture_messages=True,
         )
         await self._process_captured_estate(
             sender,
@@ -687,40 +1009,1152 @@ class WhatsAppWebhookService:
         )
 
     @staticmethod
-    def _requests_fresh_start(reply: str) -> bool:
-        return reply in RESET_REQUESTS or any(
-            phrase in reply
-            for phrase in (
-                "start fresh",
-                "start from fresh",
-                "reset everything",
-                "clear everything",
-                "new requirement",
+    def _is_negated_action(reply: str, action_pattern: str) -> bool:
+        """Reject a negative statement before any keyword-based action shortcut.
+
+        The intent model remains the primary language interpreter, but these helpers run
+        before it.  They therefore have to distinguish ``do not reset`` from ``reset`` and
+        ``don't cancel`` from ``cancel`` without relying on a later model correction.
+        """
+
+        normalized = " ".join(
+            reply.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        return bool(
+            re.search(
+                rf"\b(?:do not|don't|dont|never|not to|no need(?:\s+(?:to|for))?|need not)\b"
+                rf".{{0,48}}(?:{action_pattern})\b",
+                normalized,
+            )
+            or re.search(
+                rf"\b(?:{action_pattern})\b.{{0,32}}\b(?:is|are|was|were)\s+not\s+"
+                r"(?:needed|required|wanted|approved)\b",
+                normalized,
+            )
+        )
+
+    @classmethod
+    def _is_direct_action_request(cls, reply: str, action_pattern: str) -> bool:
+        """Return true only for a seller-authored directive.
+
+        This helper is used by several pre-model shortcuts, so a permissive fallback such
+        as "every non-question is an instruction" is unsafe.  Narratives, reported speech,
+        hypotheticals, and negated examples may contain an action verb without asking the
+        advisor to do anything.
+        """
+
+        normalized = " ".join(
+            reply.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if not normalized or cls._is_negated_action(reply, action_pattern):
+            return False
+        if re.match(
+            r"^(?:if|unless|whether|suppose|supposing|assuming|imagine|maybe|"
+            r"perhaps|possibly|for example|example)\b",
+            normalized,
+        ):
+            return False
+        if re.match(
+            r"^(?:(?:the\s+)?(?:customer|client|seller|user)|he|she|they)\s+"
+            r"(?:said|says|asked|asks|mentioned|mentions|wanted|wants|requested|requests)\b",
+            normalized,
+        ):
+            return False
+        direct_polite = bool(re.match(
+            rf"^(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:{action_pattern})\b",
+            normalized,
+        ))
+        if "?" in reply and not direct_polite:
+            return False
+        return direct_polite or bool(
+            re.match(rf"^(?:please\s+)?(?:{action_pattern})\b", normalized)
+            or re.match(
+                rf"^(?:i|we)\s+(?:want|need|require|would\s+like)\s+(?:to\s+)?"
+                rf"(?:{action_pattern})\b",
+                normalized,
+            )
+            or re.match(rf"^(?:let'?s|let\s+us)\s+(?:{action_pattern})\b", normalized)
+        )
+
+    @classmethod
+    def _is_assertive_action_request(cls, reply: str, action_pattern: str) -> bool:
+        """Require a seller-authored directive, not a narrative containing action words."""
+
+        normalized = " ".join(
+            reply.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        direct_polite = bool(
+            re.fullmatch(
+                rf"(?:can|could|would|will)\s+you\s+(?:please\s+)?"
+                rf"(?:{action_pattern})(?:\s+please)?",
+                normalized,
+            )
+        )
+        if not normalized or ("?" in reply and not direct_polite):
+            return False
+        if cls._is_negated_action(reply, action_pattern):
+            return False
+        if re.match(
+            r"^(?:if|unless|whether|suppose|supposing|assuming|imagine|maybe|"
+            r"perhaps|possibly|i\s+might|i\s+may|i\s+am\s+considering|"
+            r"i'm\s+considering)\b",
+            normalized,
+        ):
+            return False
+        if re.match(
+            r"^(?:(?:the\s+)?(?:customer|client|seller|user)|he|she|they)\s+"
+            r"(?:said|says|asked|asks|mentioned|mentions|wants?|requested|requests?)\b",
+            normalized,
+        ):
+            return False
+        return direct_polite or bool(
+            re.fullmatch(rf"(?:please\s+)?(?:{action_pattern})(?:\s+please)?", normalized)
+            or re.fullmatch(
+                rf"(?:i|we)\s+(?:want|need|would\s+like)\s+to\s+"
+                rf"(?:{action_pattern})",
+                normalized,
+            )
+        )
+
+    @classmethod
+    def _is_comparison_request(cls, reply: str) -> bool:
+        """Recognize a requested result while excluding process questions and negation."""
+
+        comparison_pattern = (
+            r"(?:compar(?:e|ing)|(?:show|give|prepare|generate)(?: me| us)?"
+            r"(?: a)?(?: enterprise)? comparison)"
+        )
+        if cls._is_negated_action(reply, r"compar(?:e|ing|ison)"):
+            return False
+        if cls._is_direct_action_request(reply, comparison_pattern):
+            return True
+        normalized = " ".join(reply.casefold().strip(" ?!.,").split())
+        return bool(
+            re.match(
+                r"^(?:what(?: is|'s)\s+the\s+(?:difference|cost difference)|"
+                r"how\s+do\b.+\bcompare|which\b.+\b(?:costs?|is cheaper|is lower))",
+                normalized,
+            )
+        )
+
+    @classmethod
+    def _is_assertive_finalization_request(cls, message: str) -> bool:
+        """Accept only an unambiguous seller instruction to begin finalization.
+
+        The language model can occasionally classify a question *about* finalization as the
+        ``finalize`` action.  Commercial state must not change from questions, conditional or
+        hypothetical wording, quoted/reported speech, or an explicit negation.
+        """
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        direct_polite_request = bool(
+            re.fullmatch(
+                r"(?:can|could|would|will)\s+you\s+(?:please\s+)?finali[sz]e"
+                r"(?:\s+(?:it|this|the\s+proposal|proposal))?",
+                normalized,
+            )
+        )
+        if not normalized or ("?" in message and not direct_polite_request):
+            return False
+        if re.match(
+            r"^(?:who|what|which|where|when|why|how|can|could|would|should|"
+            r"do|does|did|is|are|will|may|if|unless|whether|suppose|supposing|"
+            r"assuming|imagine)\b",
+            normalized,
+        ) and not direct_polite_request:
+            return False
+        if re.search(r"[\"\u201c\u201d\u2018\u2019]", message) or re.match(
+            r"^(?:(?:the\s+)?(?:customer|client|seller|user)|he|she|they)\s+"
+            r"(?:said|says|asked|asks|wants?|requested|requests?)\b",
+            normalized,
+        ):
+            return False
+        if cls._is_negated_action(message, r"finali[sz](?:e|ed|ing|ation)"):
+            return False
+        return direct_polite_request or bool(
+            re.fullmatch(
+                r"(?:/finalize|"
+                r"(?:(?:yes|yeah|ok|okay)[, ]+)?(?:please\s+)?finali[sz]e"
+                r"(?:\s+(?:it|this|the\s+proposal|proposal))?|"
+                r"(?:please\s+)?go\s+ahead\s+and\s+finali[sz]e"
+                r"(?:\s+(?:it|this|the\s+proposal|proposal))?|"
+                r"(?:please\s+)?proceed\s+with\s+finali[sz]ation|"
+                r"(?:i|we)\s+(?:want|would\s+like|am\s+ready|are\s+ready)\s+to\s+"
+                r"finali[sz]e(?:\s+(?:it|this|the\s+proposal|proposal))?|"
+                r"(?:i|we)\s+(?:confirm|approve)\s+(?:it|this|the\s+proposal|proposal)"
+                r"\s+for\s+finali[sz]ation)",
+                normalized,
+            )
+        )
+
+    @classmethod
+    def _is_explicit_finalization_approval(cls, message: str) -> bool:
+        """Return whether a seller explicitly approves the visible final-validation gate."""
+
+        return cls._is_assertive_finalization_request(message) or cls._is_assertive_validation_reply(
+            message,
+            allow_bare_affirmative=True,
+        )
+
+    @classmethod
+    def _is_explicit_validation_rejection(cls, message: str) -> bool:
+        """Reject validation only from a direct negative answer, never model labelling alone."""
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if not normalized or "?" in message:
+            return False
+        if re.match(
+            r"^(?:who|what|which|where|when|why|how|can|could|would|should|"
+            r"do|does|did|is|are|will|may|if|unless|whether|suppose|supposing|"
+            r"assuming|imagine)\b",
+            normalized,
+        ):
+            return False
+        if re.search(r"[\"\u201c\u201d\u2018\u2019]", message) or cls._is_negated_action(
+            message,
+            r"(?:reject|cancel)",
+        ):
+            return False
+        return bool(
+            re.fullmatch(
+                r"(?:no|nope|not\s+yet|"
+                r"(?:no[, ]+)?(?:it|(?:this|that|the)\s+(?:requirement|proposal|"
+                r"configuration|pricing|details?))\s+(?:is|are)\s+not\s+correct|"
+                r"(?:it|(?:this|that|the)\s+(?:requirement|proposal|configuration|"
+                r"pricing|details?))\s+(?:is|are)\s+(?:incorrect|wrong)|"
+                r"(?:i|we)\s+(?:do\s+not|don't|dont)\s+(?:confirm|approve|accept|"
+                r"finali[sz]e)(?:\s+(?:it|(?:this|the)\s+(?:requirement|proposal)))?|"
+                r"(?:please\s+)?(?:reject|cancel)(?:\s+(?:it|this|the\s+validation|"
+                r"finalization))?|"
+                r"(?:it|this|that)\s+needs?\s+(?:a\s+)?(?:change|changes|correction|"
+                r"corrections))",
+                normalized,
             )
         )
 
     @staticmethod
-    def _requests_enterprise_comparison(reply: str) -> bool:
+    def _seller_scenario_reference(message: str) -> ScenarioType | None:
+        """Return a proposal target only when the seller actually wrote it."""
+
+        normalized = " ".join(message.casefold().replace("-", " ").split())
+        matches: list[ScenarioType] = []
+        if re.search(r"\bme3\b", normalized):
+            matches.append(ScenarioType.ME3_COPILOT)
+        if re.search(r"\bme5\b", normalized):
+            matches.append(ScenarioType.ME5_COPILOT)
+        if re.search(r"\bme7\b", normalized):
+            matches.append(ScenarioType.ME7)
+        if "renew as is" in normalized or "renewal as is" in normalized:
+            matches.append(ScenarioType.RENEW_AS_IS)
+        return matches[0] if len(set(matches)) == 1 else None
+
+    @classmethod
+    def _seller_target_quantity(cls, message: str, action: str) -> int | None:
+        """Resolve the requested *new* quantity, not an old/source number.
+
+        Membership in the seller's numbers is insufficient for sentences such as
+        ``change L1 from 100 to 50``.  Prefer the value in the target grammatical role;
+        use the sole remaining quantity only when the message is unambiguous.
+        """
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").replace(",", "").split()
+        )
+        numeric_targets = [
+            int(value)
+            for value in re.findall(
+                r"\b(?:from\s+\d+\s+)?(?:to|at|make\s+it)\s+(\d+)\b",
+                normalized,
+            )
+        ]
+        word_pattern = cls._number_word_pattern()
+        for match in re.finditer(
+            rf"\b(?:to|at|make\s+it)\s+(?P<number>{word_pattern})\b",
+            normalized,
+        ):
+            parsed = cls._number_words_to_int(match.group("number"))
+            if parsed is not None:
+                numeric_targets.append(parsed)
+        if numeric_targets:
+            return numeric_targets[-1]
+
+        values = cls._seller_quantity_values(message)
+        if len(values) == 1:
+            return next(iter(values))
+        if action == "add_sku":
+            anchored = re.search(
+                r"\b(?:add|include|order|buy|purchase|need|want|require)\s+"
+                r"(?:about\s+|around\s+|approximately\s+)?(\d+)\b",
+                normalized,
+            )
+            if anchored is not None:
+                return int(anchored.group(1))
+        return None
+
+    @staticmethod
+    def _phrase_is_seller_grounded(supplied: str, seller_message: str) -> bool:
+        """Match a normalized phrase on token boundaries, never raw substrings."""
+
+        supplied_value = normalize_product_title(supplied)
+        seller_value = normalize_product_title(seller_message)
+        if not supplied_value:
+            return False
+        return bool(
+            re.search(
+                rf"(?<![a-z0-9]){re.escape(supplied_value)}(?![a-z0-9])",
+                seller_value,
+            )
+        )
+
+    @staticmethod
+    def _explicit_requirement_detail(message: str) -> tuple[str, str] | None:
+        """Parse an explicit proposal-metadata assignment from the seller's own words."""
+
+        match = re.match(
+            r"^\s*(?P<label>(?:customer|company|tenant|contact|opportunity|proposal)"
+            r"(?:\s+(?:name|reference|number|id|email|note))?)\s*"
+            r"(?:is|:|=)\s*(?P<value>\S(?:.*\S)?)\s*[.!]?\s*$",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        label = " ".join(match.group("label").casefold().split())
+        value = match.group("value").strip().rstrip(".! ")
+        return (label, value) if value else None
+
+    @classmethod
+    def _seller_product_role_is_supported(
+        cls,
+        message: str,
+        supplied_product: str,
+        action: str,
+    ) -> bool:
+        """Reject a source/rejected product that the model placed in the target role."""
+
+        supplied = normalize_product_title(supplied_product)
+        normalized = normalize_product_title(message)
+        if not supplied or not cls._phrase_is_seller_grounded(supplied, normalized):
+            return False
+        alternative = re.search(r"\b(?:instead\s+of|rather\s+than)\b", normalized)
+        if alternative is not None:
+            preferred = normalized[: alternative.start()].strip()
+            rejected = normalized[alternative.end() :].strip()
+            if cls._phrase_is_seller_grounded(supplied, rejected) and not cls._phrase_is_seller_grounded(
+                supplied, preferred
+            ):
+                return False
+        if action == "replace_sku":
+            replacement = re.search(
+                r"\breplace\b.+?\b(?:with|by)\b(?P<target>.+)$",
+                normalized,
+            )
+            if replacement is not None and not cls._phrase_is_seller_grounded(
+                supplied, replacement.group("target")
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _seller_preferred_product_query(message: str, action: str) -> str:
+        """Extract the seller's preferred side of an explicit alternative."""
+
+        normalized = " ".join(message.strip().split())
+        alternative = re.search(
+            r"\b(?:instead\s+of|rather\s+than)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if alternative is None:
+            return ""
+        preferred = normalized[: alternative.start()].strip(" ,.;")
+        if action == "add_sku":
+            preferred = re.sub(
+                r"^(?:please\s+)?(?:add|include|order|buy|purchase)\s+"
+                r"(?:about\s+|around\s+|approximately\s+)?\d+\s+",
+                "",
+                preferred,
+                flags=re.IGNORECASE,
+            )
+            preferred = re.sub(
+                r"\s+\d+\s+(?:(?:licence|license)s?|users?|seats?)$",
+                "",
+                preferred,
+                flags=re.IGNORECASE,
+            )
+            preferred = re.sub(
+                r"\s+(?:(?:licence|license)s?|subscriptions?)$",
+                "",
+                preferred,
+                flags=re.IGNORECASE,
+            )
+        return preferred.strip(" ,.;")
+
+    @staticmethod
+    def _seller_comment_text(message: str) -> str:
+        """Extract an explicit seller comment while preserving wording and polarity."""
+
+        match = re.match(
+            r"^\s*(?:please\s+)?(?:add|include|record|note)\s+"
+            r"(?:a\s+)?(?:comment|note|remark|assumption)"
+            r"(?:\s+(?:that|is)|\s*[:=])?\s+(?P<comment>\S(?:.*\S)?)\s*$",
+            message,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return ""
+        return match.group("comment").strip().rstrip(".")
+
+    def _intent_with_seller_supported_targets(
+        self,
+        intent: AgentIntent,
+        message: str,
+        session: WorkflowSession | None,
+        *,
+        pending_slot_completion: bool,
+    ) -> AgentIntent:
+        """Remove model-invented line/scenario targets before commercial dispatch."""
+
+        if session is None or pending_slot_completion:
+            return intent
+        updates: dict[str, object] = {}
+
+        # A model-proposed catalogue query may expand a vague seller phrase, but it must
+        # never invent an unrelated product and thereby create an exact-match mutation.
+        # Keep only queries with at least one seller-authored product-bearing token. The
+        # catalogue confirmation layer remains responsible for resolving broad terms such
+        # as "Copilot" or "E5" to an exact SKU.
+        supplied_product = str(getattr(intent, "product_query", "") or "").strip()
+        if supplied_product:
+            role_sensitive = bool(
+                re.search(
+                    r"\b(?:instead\s+of|rather\s+than)\b|"
+                    r"\breplace\b.+?\b(?:with|by)\b",
+                    normalize_product_title(message),
+                )
+            )
+            if role_sensitive and not self._seller_product_role_is_supported(
+                message,
+                supplied_product,
+                intent.action,
+            ):
+                updates["product_query"] = self._seller_preferred_product_query(
+                    message,
+                    intent.action,
+                )
+            ignored_product_tokens = {
+                "add",
+                "change",
+                "for",
+                "include",
+                "licence",
+                "licences",
+                "license",
+                "licenses",
+                "microsoft",
+                "365",
+                "product",
+                "replace",
+                "sku",
+                "the",
+                "to",
+                "with",
+            }
+            supplied_tokens = (
+                set(normalize_product_title(supplied_product).split())
+                - ignored_product_tokens
+            )
+            seller_tokens = (
+                set(normalize_product_title(message).split())
+                - ignored_product_tokens
+            )
+            seller_plan_codes = {
+                value.casefold()
+                for value in re.findall(
+                    r"\b(?:m?e\d+|p\d+|f\d+)\b",
+                    normalize_product_title(message),
+                )
+            }
+            seller_plan_codes.update(
+                f"p{value}"
+                for value in re.findall(
+                    r"\bplan\s*(\d+)\b",
+                    normalize_product_title(message),
+                )
+            )
+            seller_tokens.update(seller_plan_codes)
+            supplied_plan_codes = {
+                value.casefold()
+                for value in re.findall(
+                    r"\b(?:m?e\d+|p\d+|f\d+)\b",
+                    normalize_product_title(supplied_product),
+                )
+            }
+            unsupported_plan = bool(supplied_plan_codes - seller_plan_codes)
+            seller_suite_families: set[str] = set()
+            supplied_suite_families: set[str] = set()
+            seller_product_text = normalize_product_title(message)
+            supplied_product_text = normalize_product_title(supplied_product)
+            if re.search(r"\b(?:office\s*365|o365)\b", seller_product_text):
+                seller_suite_families.add("office_365")
+            if re.search(r"\b(?:microsoft\s*365|m365)\b", seller_product_text):
+                seller_suite_families.add("microsoft_365")
+            if re.search(r"\b(?:office\s*365|o365)\b", supplied_product_text):
+                supplied_suite_families.add("office_365")
+            if re.search(r"\b(?:microsoft\s*365|m365)\b", supplied_product_text):
+                supplied_suite_families.add("microsoft_365")
+            unsupported_suite = bool(
+                supplied_suite_families
+                and supplied_suite_families != seller_suite_families
+            )
+            if "product_query" not in updates and (unsupported_suite or (
+                supplied_tokens
+                and (
+                    unsupported_plan
+                    or not supplied_tokens.issubset(seller_tokens)
+                )
+            )):
+                updates["product_query"] = ""
+
+        seller_numbers = self._seller_quantity_values(message)
+        raw_quantity = getattr(intent, "quantity", -1)
+        supplied_quantity = int(raw_quantity if raw_quantity is not None else -1)
+        if supplied_quantity >= 0:
+            target_quantity = (
+                self._seller_target_quantity(message, intent.action)
+                if intent.action in {"add_sku", "replace_sku", "set_quantity"}
+                else None
+            )
+            if target_quantity is not None and supplied_quantity != target_quantity:
+                updates["quantity"] = target_quantity
+            elif (
+                target_quantity is None and supplied_quantity not in seller_numbers
+            ):
+                updates["quantity"] = -1
+        raw_copilot = getattr(intent, "copilot_quantity", -1)
+        supplied_copilot = int(raw_copilot if raw_copilot is not None else -1)
+        if supplied_copilot >= 0:
+            target_copilot = self._seller_target_quantity(message, "set_copilot")
+            if target_copilot is not None and supplied_copilot != target_copilot:
+                updates["copilot_quantity"] = target_copilot
+            elif (
+                target_copilot is None and supplied_copilot not in seller_numbers
+            ):
+                updates["copilot_quantity"] = -1
+
+        normalized_message = normalize_product_title(message)
+        disposition = str(getattr(intent, "disposition", "none") or "none")
+        disposition_terms = {
+            "retain": r"\b(?:retain|keep)\b",
+            "remove": r"\b(?:remove|delete|drop|exclude)\b",
+            "migrate": r"\bmigrat(?:e|ed|ing|ion)\b",
+            "included": r"\b(?:include|included|bundle|bundled)\b",
+        }
+        if disposition != "none" and not re.search(
+            disposition_terms.get(disposition, r"(?!)"),
+            normalized_message,
+        ):
+            updates["disposition"] = "none"
+
+        supplied_boolean = str(getattr(intent, "boolean_value", "none") or "none")
+        boolean_terms = {
+            "true": r"\b(?:yes|on|enable|enabled|apply|eligible|true)\b",
+            "false": r"\b(?:no|off|disable|disabled|remove|ineligible|false)\b",
+        }
+        if supplied_boolean != "none" and not re.search(
+            boolean_terms.get(supplied_boolean, r"(?!)"),
+            normalized_message,
+        ):
+            updates["boolean_value"] = "none"
+
+        supplied_percentage = Decimal(str(getattr(intent, "percentage", -1.0)))
+        seller_percentages = self._seller_percentage_values(message)
+        if supplied_percentage >= 0 and supplied_percentage not in seller_percentages:
+            updates["percentage"] = -1.0
+        supplied_amount = Decimal(str(getattr(intent, "amount", 0.0) or 0.0))
+        seller_adjustments = self._seller_adjustment_values(message)
+        if supplied_amount != 0 and supplied_amount not in seller_adjustments:
+            updates["amount"] = 0.0
+
+        text_fields = {
+            "segment": "segment",
+            "currency": "currency",
+            "comment": "comment",
+        }
+        for attribute, update_name in text_fields.items():
+            supplied_value = normalize_product_title(
+                str(getattr(intent, attribute, "") or "")
+            )
+            text_is_grounded = self._phrase_is_seller_grounded(
+                supplied_value,
+                normalized_message,
+            )
+            if update_name == "comment" and supplied_value:
+                # The model may remove harmless grammar from a seller-authored note
+                # ("customer approval is pending" -> "customer approval pending").
+                # Accept that normalization only when every retained content token came
+                # from the seller; a model-added fact still fails closed.
+                harmless = {"a", "an", "are", "is", "the", "was", "were"}
+                supplied_comment_tokens = [
+                    token for token in supplied_value.split() if token not in harmless
+                ]
+                seller_comment_tokens = [
+                    token for token in normalized_message.split() if token not in harmless
+                ]
+                cursor = 0
+                for token in seller_comment_tokens:
+                    if (
+                        cursor < len(supplied_comment_tokens)
+                        and token == supplied_comment_tokens[cursor]
+                    ):
+                        cursor += 1
+                text_is_grounded = cursor == len(supplied_comment_tokens)
+                seller_negated = bool(
+                    re.search(r"\b(?:not|no|never|without|don't|dont)\b", normalized_message)
+                )
+                supplied_negated = bool(
+                    re.search(r"\b(?:not|no|never|without|don't|dont)\b", supplied_value)
+                )
+                if seller_negated and not supplied_negated:
+                    text_is_grounded = False
+            if supplied_value and not text_is_grounded:
+                updates[update_name] = ""
+        if intent.action == "add_comment":
+            seller_comment = self._seller_comment_text(message)
+            if seller_comment:
+                updates["comment"] = seller_comment
+
+        term_value = str(getattr(intent, "term_duration", "") or "").strip()
+        if term_value:
+            supported_term = bool(
+                self._phrase_is_seller_grounded(term_value, normalized_message)
+                or (
+                    term_value.casefold() == "p1y"
+                    and re.search(r"\b(?:annual|one year|1 year|12 months?|p1y)\b", normalized_message)
+                )
+            )
+            if not supported_term:
+                updates["term_duration"] = ""
+        billing_value = str(getattr(intent, "billing_plan", "") or "").strip()
+        if billing_value and not self._phrase_is_seller_grounded(
+            billing_value,
+            normalized_message,
+        ):
+            updates["billing_plan"] = ""
+
+        if intent.action == "set_requirement_detail":
+            written_detail = self._explicit_requirement_detail(message)
+            if written_detail is None:
+                updates["detail_label"] = ""
+                updates["detail_value"] = ""
+            else:
+                grounded_label, grounded_value = written_detail
+                if str(getattr(intent, "detail_label", "") or "").strip() != grounded_label:
+                    updates["detail_label"] = grounded_label
+                if str(getattr(intent, "detail_value", "") or "").strip() != grounded_value:
+                    updates["detail_value"] = grounded_value
+        supplied_line = str(getattr(intent, "line_id", "") or "").strip().upper()
+        if supplied_line:
+            requirement = session.confirmed_as_is is None
+            if requirement and session.estate is not None:
+                lines = list(session.estate.lines)
+            elif session.active_scenario is not None:
+                active = session.scenarios.get(session.active_scenario)
+                lines = (
+                    [line for line in active.lines if line.proposed_quantity > 0]
+                    if active is not None
+                    else []
+                )
+            else:
+                lines = []
+            supported = len(lines) == 1
+            explicit_ids = {
+                value.upper()
+                for value in re.findall(r"\bL\d+\b", message, flags=re.IGNORECASE)
+            }
+            inferred = self._line_reference_from_message(
+                lines,
+                message,
+                requirement=requirement,
+            )
+            supported = supported or supplied_line in explicit_ids or inferred == supplied_line
+            if not supported:
+                updates["line_id"] = ""
+
+        stated_scenario = str(getattr(intent, "scenario", "none") or "none")
+        if stated_scenario != "none":
+            seller_scenario = self._seller_scenario_reference(message)
+            if seller_scenario is None:
+                updates["scenario"] = "none"
+            elif seller_scenario is not None and seller_scenario.value != stated_scenario:
+                updates["scenario"] = seller_scenario.value
+        return self._agent_intent_with(intent, **updates) if updates else intent
+
+    @classmethod
+    def _commercial_action_has_domain_evidence(
+        cls,
+        message: str,
+        intent: AgentIntent,
+        session: WorkflowSession | None,
+    ) -> bool:
+        """Require the object that makes an imperative a licensing operation."""
+
+        normalized = normalize_product_title(message)
+        action = intent.action
+        line_ids = set(re.findall(r"\bl\d+\b", normalized))
+        product_query = str(getattr(intent, "product_query", "") or "").strip()
+        session_product = False
+        if session is not None:
+            candidate_titles: list[str] = []
+            if session.confirmed_as_is is None and session.estate is not None:
+                candidate_titles.extend(line.display_title for line in session.estate.lines)
+            elif session.active_scenario is not None:
+                scenario = session.scenarios.get(session.active_scenario)
+                if scenario is not None:
+                    candidate_titles.extend(line.sku_title for line in scenario.lines)
+            session_product = any(
+                len(title_value.split()) >= 2
+                and title_value in normalized
+                for title_value in map(normalize_product_title, candidate_titles)
+                if title_value
+            )
+
+        if action == "add_sku":
+            # A direct instruction can be valid while still missing the exact product,
+            # for example ``Add 10 licences``. The product must never come from the
+            # model alone, but seller-authored licensing-object wording is sufficient to
+            # enter the persisted missing-product dialogue. The separate directness,
+            # negation, hypothetical and reported-speech guards still have to pass.
+            return bool(
+                product_query
+                or re.search(
+                    r"\b(?:licen[cs]es?|skus?|products?|plans?|subscriptions?|"
+                    r"seats?|users?)\b",
+                    normalized,
+                )
+            )
+        if action == "replace_sku":
+            # Likewise, ``Replace L2`` is an incomplete but meaningful instruction. It
+            # may ask for the missing target product; it must not invent that product.
+            return bool(
+                product_query
+                or line_ids
+                or session_product
+                or re.search(
+                    r"\b(?:licen[cs]e|sku|product|plan|line|it|this|current)\b",
+                    normalized,
+                )
+            )
+        if action == "set_quantity":
+            return bool(
+                line_ids
+                or session_product
+                or re.search(
+                    r"\b(?:qty|quantity|licen[cs]es?|users?|seats?|subscriptions?)\b",
+                    normalized,
+                )
+            )
+        if action == "set_copilot":
+            return bool(re.search(r"\bcopilot\b", normalized))
+        if action == "set_disposition":
+            return bool(
+                line_ids
+                or session_product
+                or re.search(r"\b(?:licen[cs]e|sku|product|line|it|this)\b", normalized)
+            )
+        if action == "build_scenario":
+            return cls._seller_scenario_reference(message) is not None
+        if action == "set_term":
+            return bool(
+                re.search(r"\b(?:term|contract|annual|yearly|p\d+[ymd]|months?|years?)\b", normalized)
+            )
+        if action == "set_billing":
+            return bool(re.search(r"\b(?:billing|bill|annual|yearly|monthly)\b", normalized))
+        if action == "set_segment":
+            return bool(
+                re.search(
+                    r"\b(?:segment|commercial|education|academic|government|"
+                    r"nonprofit|non profit|charity)\b",
+                    normalized,
+                )
+            )
+        if action == "set_currency":
+            return bool(
+                re.search(r"\b(?:currency|inr|usd|eur|gbp|rupees?|dollars?|euros?)\b", normalized)
+            )
+        if action == "add_comment":
+            return bool(re.search(r"\b(?:comment|note|remark|assumption)\b", normalized))
+        if action == "set_requirement_detail":
+            return cls._explicit_requirement_detail(message) is not None
+        if action == "set_promo":
+            return bool(re.search(r"\b(?:promo|promotion|eligibility|eligible)\b", normalized))
+        if action == "set_discount":
+            return bool(re.search(r"\b(?:discount|percent|percentage|%)\b", message.casefold()))
+        if action == "set_adjustment":
+            return bool(
+                re.search(
+                    r"\b(?:adjustment|adjust|subtract|deduct|increase|decrease)\b",
+                    normalized,
+                )
+            )
+        if action == "request_recommendation":
+            return session is not None or bool(
+                re.search(r"\b(?:licen[cs]e|sku|microsoft|plan|product)\b", normalized)
+            )
+        return True
+
+    @classmethod
+    def _is_assertive_commercial_instruction(
+        cls,
+        message: str,
+        intent: AgentIntent,
+        session: WorkflowSession | None,
+        *,
+        pending_slot_completion: bool,
+    ) -> bool:
+        """Require seller-authored action evidence before arming or applying a mutation."""
+
+        if pending_slot_completion:
+            return True
+        action = intent.action
+        if action not in ASSERTIVE_COMMERCIAL_ACTIONS:
+            return True
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if not normalized:
+            return False
+        # These phrases explicitly preserve the current state. They are not mutations even
+        # when a model emits a commercial action because the sentence also contains a SKU,
+        # scenario, quantity, or another action noun.
+        if re.search(
+            r"\b(?:no\s+need(?:\s+(?:to|for))?|need\s+not|not\s+(?:needed|required)|"
+            r"do\s+not\s+(?:need|want|require)|don't\s+(?:need|want|require)|"
+            r"dont\s+(?:need|want|require))\b",
+            normalized,
+        ) or re.search(
+            r"\b(?:leave|keep)\b.{0,60}\b(?:unchanged|as[ -]?is|the\s+same)\b",
+            normalized,
+        ):
+            return False
+        if re.match(
+            r"^(?:if|unless|whether|suppose|supposing|assuming|imagine|"
+            r"for example|example)\b",
+            normalized,
+        ) or re.search(
+            r"\b(?:for example|as an example|hypothetically)\b",
+            normalized,
+        ):
+            return False
+        if re.search(
+            r"\b(?:customer|client|seller|user|manager|analyst)\b.{0,48}"
+            r"\b(?:said|says|asked|asks|mentioned|mentions|requested|requests?)\b|"
+            r"\b(?:said|asked|mentioned|requested)\b.{0,24}"
+            r"\b(?:customer|client|seller|user|manager|analyst)\b",
+            normalized,
+        ):
+            return False
+        if re.search(r"\bbut\s+not\b|\bnot\s+(?:to\s+)?-?\d+(?:\.\d+)?\b", normalized):
+            return False
+        if re.match(
+            r"^(?:(?:the\s+)?(?:customer|client|seller|user)|he|she|they)\s+"
+            r"(?:said|says|asked|asks|mentioned|mentions|wants?|requested|requests?)\b",
+            normalized,
+        ):
+            return False
+        if re.search(
+            r"\b(?:want|need|would\s+like)\s+to\s+know\b|"
+            r"\b(?:want|need|would\s+like)\s+(?:a\s+)?(?:pricing|price|quote|cost)\b|"
+            r"^(?:please\s+)?(?:tell|explain)\b|"
+            r"\bshow\s+me\s+(?:what|how|whether)\b|"
+            r"\b(?:what\s+would|would\s+it)\b.{0,80}\b(?:cost|price|happen)\b|"
+            r"\b(?:price|cost)\b.{0,40}\bif\b",
+            normalized,
+        ):
+            return False
+        if re.search(r"[\"\u201c\u201d].*\b(?:add|replace|change|set|remove|build|finali[sz]e)\b", message, re.I):
+            return False
+
+        # Only action verbs count as imperative evidence. Product/scenario/attribute nouns
+        # (ME5, Copilot, annual, USD, quantity) are deliberately absent: a sentence such as
+        # "ME5 is expensive" or "USD is volatile" must remain read-only even if the model
+        # assigns a mutation label.
+        action_terms = {
+            "add_sku": r"(?:add|include|order|purchase|buy)",
+            "replace_sku": r"(?:replace|switch|swap|change|upgrade|downgrade)",
+            "set_quantity": r"(?:change|set|update|make)",
+            "set_copilot": r"(?:change|set|update|make)",
+            "set_disposition": r"(?:retain|remove|delete|drop|migrate|include|exclude)",
+            "build_scenario": r"(?:build|prepare|create|show|use|select|choose|evaluate)",
+            "set_term": r"(?:set|change|update|make|use)",
+            "set_billing": r"(?:set|change|update|make|use)",
+            "set_segment": r"(?:set|change|update|make|use)",
+            "set_currency": r"(?:set|change|update|make|use|convert)",
+            "add_comment": r"(?:add|include|record|note)",
+            "set_requirement_detail": r"(?:set|change|update|record|use)",
+            "request_recommendation": r"(?:recommend|suggest|advice|advise|guidance)",
+            "set_promo": r"(?:apply|enable|disable|remove|use)",
+            "set_discount": r"(?:apply|set|change|remove|use)",
+            "set_adjustment": (
+                r"(?:apply|set|change|remove|adjust|use|add|increase|subtract|"
+                r"deduct|decrease)"
+            ),
+        }
+        evidence = action_terms.get(action, r"(?:add|change|set|update)")
+        direct_polite = bool(
+            re.match(
+                rf"^(?:can|could|would|will)\s+you\s+(?:please\s+)?{evidence}\b",
+                normalized,
+            )
+        )
+        recommendation_question = (
+            action == "request_recommendation"
+            and cls._is_direct_recommendation_request(normalized)
+        )
+        if ("?" in message or re.match(
+            r"^(?:who|what|which|where|when|why|how|can|could|would|should|"
+            r"do|does|did|is|are|will|may)\b",
+            normalized,
+        )) and not (direct_polite or recommendation_question):
+            return False
+        if cls._is_negated_action(message, evidence):
+            return False
+        has_action_verb = bool(re.search(rf"\b{evidence}\b", normalized))
+        direct_action = direct_polite or bool(
+            re.match(rf"^(?:please\s+)?{evidence}\b", normalized)
+            or re.match(
+                rf"^(?:i|we)\s+(?:want|need|would\s+like)\s+(?:to\s+)?{evidence}\b",
+                normalized,
+            )
+        )
+        if has_action_verb and direct_action:
+            return cls._commercial_action_has_domain_evidence(
+                message,
+                intent,
+                session,
+            )
+
+        # Explicit first-person procurement is a direct addition even without the word
+        # "add" (for example, "I need 10 Power BI Pro licences"). Informational pricing
+        # requests were rejected above.
+        if action == "add_sku" and re.match(
+            r"^(?:(?:i|we)\s+)?(?:want|need|require|would\s+like)\b",
+            normalized,
+        ):
+            return cls._commercial_action_has_domain_evidence(message, intent, session)
+
+        # Safe shorthand forms are intentionally full-message grammars. A bare number is
+        # accepted only by a persisted visible quantity slot, never here; narratives such as
+        # "L1 cost 50 last year" cannot change a proposal.
+        if action == "set_quantity" and re.fullmatch(
+            r"(?:l\d+\s+(?:to\s+)?\d+(?:\s+(?:licen[cs]es?|users?|seats?|qty|quantity))?|"
+            r"\d+(?:\s+(?:licen[cs]es?|users?|seats?|qty|quantity))?\s+(?:for\s+)?l\d+)",
+            normalized,
+        ):
+            return True
+        if action == "set_copilot" and re.fullmatch(
+            r"(?:(?:microsoft\s+365\s+)?copilot(?:\s+(?:qty|quantity|count))?\s+"
+            r"(?:to\s+)?\d+(?:\s+(?:licen[cs]es?|users?|seats?))?|"
+            r"\d+(?:\s+(?:licen[cs]es?|users?|seats?))?\s+(?:for\s+)?"
+            r"(?:microsoft\s+365\s+)?copilot)",
+            normalized,
+        ):
+            return True
+        if action == "build_scenario" and re.fullmatch(
+            r"(?:me3|me5|me7|renew(?:al)?\s+as[ -]?is)", normalized
+        ):
+            return True
+        if action == "build_scenario" and re.match(
+            r"^(?:(?:i|we)\s+)?(?:want|need|would\s+like)\s+(?:the\s+)?"
+            r"(?:me3|me5|me7|renew(?:al)?\s+as[ -]?is)(?:\s+(?:option|proposal))?$",
+            normalized,
+        ):
+            return True
+        if action == "set_requirement_detail" and re.match(
+            r"^(?:customer|company|tenant|contact)\s+(?:name|id|email|number)?\s*"
+            r"(?:is|:|=)\s*\S+",
+            normalized,
+        ):
+            return True
+        if action == "add_comment" and re.match(
+            r"^(?:comment|note|remark)\s*(?::|is|=)\s*\S+",
+            normalized,
+        ):
+            return True
+        if action == "set_discount" and re.fullmatch(
+            r"\d+(?:\.\d+)?\s*%\s+discount", normalized
+        ):
+            return True
+        if action == "set_adjustment" and re.fullmatch(
+            r"(?:commercial\s+)?adjustment\s+(?:of\s+)?-?\d+(?:\.\d+)?",
+            normalized,
+        ):
+            return True
+        return recommendation_question
+
+    @staticmethod
+    def _is_direct_recommendation_request(normalized: str) -> bool:
+        """Recognize direct seller requests for advice without treating hypotheticals as edits."""
+
+        patterns = (
+            r"^(?:what|which)\b.*\b(?:recommend|suggest|advise|advice|guidance)\b",
+            r"^(?:please\s+)?(?:recommend|suggest|advise)\b",
+            r"^(?:can|could|would|will)\s+you\s+(?:please\s+)?(?:"
+            r"(?:give|share|provide)(?:\s+me)?\s+(?:(?:a|some)\s+)?"
+            r"(?:recommendations?|suggestions?|advice|guidance)|"
+            r"recommend|suggest|advise)\b",
+            r"^(?:can|could|should|would)\s+(?:i|we)\s+"
+            r"(?:upgrade|downgrade|switch|replace|use|choose|pick)\b",
+            r"^(?:i|we)\s+(?:want|need|would\s+like)\s+"
+            r"(?:(?:a|some)\s+)?(?:recommendations?|suggestions?|advice|guidance)\b",
+        )
+        return any(re.search(pattern, normalized) for pattern in patterns)
+
+    @classmethod
+    def _requests_fresh_start(cls, reply: str) -> bool:
+        normalized = " ".join(
+            reply.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if cls._is_negated_action(
+            reply,
+            r"(?:start|reset|clear|begin)(?:\s+(?:fresh|again|everything|the\s+requirement|a\s+new\s+requirement))?",
+        ):
+            return False
+        direct_polite = re.fullmatch(
+            r"(?:can|could|would|will)\s+you\s+(?:please\s+)?(?P<request>.+)",
+            normalized,
+        )
+        if direct_polite is not None:
+            normalized = direct_polite.group("request")
+        elif "?" in reply:
+            return False
+        normalized = re.sub(r"^(?:please\s+|just\s+)+", "", normalized)
+        normalized = re.sub(
+            r"^(?:(?:i|we)\s+(?:want|need|would\s+like)\s+to\s+|"
+            r"let(?:'s|\s+us)\s+)",
+            "",
+            normalized,
+        )
+        return normalized in RESET_REQUESTS or bool(
+            re.fullmatch(
+                r"(?:start|begin)(?:\s+(?:again|fresh|over|from\s+scratch)|"
+                r"\s+(?:a\s+)?new\s+(?:licensing\s+)?requirement)|"
+                r"(?:reset|clear)(?:\s+(?:everything|the\s+(?:draft|requirement)|"
+                r"this\s+(?:draft|requirement)))?|"
+                r"(?:discard|clear)\s+(?:the\s+)?(?:old|previous|saved)?\s*"
+                r"draft\s+(?:and|then)\s+(?:start|begin)\s+"
+                r"(?:a\s+)?new\s+(?:licensing\s+)?requirement",
+                normalized,
+            )
+        )
+
+    @classmethod
+    def _requests_resume_saved_draft(cls, reply: str) -> bool:
+        """Recognize a direct request to resume without relying on exact canned text."""
+
+        normalized = " ".join(
+            reply.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if not normalized or cls._is_negated_action(
+            reply,
+            r"(?:resume|continue|show|open)(?:\s+(?:it|the\s+(?:draft|proposal)|"
+            r"my\s+(?:draft|proposal)|where\s+we\s+(?:stopped|left\s+off)))?",
+        ):
+            return False
+        direct_polite = re.fullmatch(
+            r"(?:can|could|would|will)\s+(?:you|we)\s+(?:please\s+)?(?P<request>.+)",
+            normalized,
+        )
+        if direct_polite is not None:
+            normalized = direct_polite.group("request")
+        elif "?" in reply:
+            return False
+        normalized = re.sub(r"^(?:please\s+|just\s+)+", "", normalized)
+        normalized = re.sub(
+            r"^(?:(?:i|we)\s+(?:want|need|would\s+like)\s+to\s+|"
+            r"let(?:'s|\s+us)\s+)",
+            "",
+            normalized,
+        )
+        return normalized in RESUME_REQUESTS or bool(
+            re.fullmatch(
+                r"(?:resume|continue|open|show)(?:\s+with)?"
+                r"(?:\s+(?:it|my|the))?\s*"
+                r"(?:saved\s+)?(?:draft|proposal|requirement|session)|"
+                r"(?:resume|continue)\s+(?:where\s+)?we\s+"
+                r"(?:stopped|left\s+off)",
+                normalized,
+            )
+        )
+
+    @classmethod
+    def _requests_enterprise_comparison(cls, reply: str) -> bool:
         if "compare" not in reply:
+            return False
+        if not cls._is_comparison_request(reply):
             return False
         compact = " ".join(reply.split())
         if re.search(r"\b(?:all|other|the)?\s*(?:4|four)\b", compact):
             return True
         return all(value in compact for value in ("me3", "me5", "me7"))
 
-    @staticmethod
-    def _requests_pending_change_cancel(reply: str) -> bool:
-        return reply in CANCEL_REPLIES or any(
-            phrase in reply
-            for phrase in (
-                "cancel the change",
-                "cancel that change",
-                "do not replace",
-                "don't replace",
-                "dont replace",
-                "not replace",
-                "leave it unchanged",
-                "keep it unchanged",
+    @classmethod
+    def _requests_pending_change_cancel(cls, reply: str) -> bool:
+        normalized = " ".join(
+            reply.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if not normalized or "?" in reply:
+            return False
+        if re.match(
+            r"^(?:(?:the\s+)?(?:customer|client|seller|user)|he|she|they)\s+"
+            r"(?:said|says|asked|asks|mentioned|mentions|requested|requests?)\b",
+            normalized,
+        ):
+            return False
+        if re.fullmatch(
+            r"(?:please\s+)?(?:do\s+not|don't|dont|never)\s+cancel"
+            r"(?:\s+(?:(?:it|this|that)(?:\s+(?:change|question))?|"
+            r"the\s+(?:change|question)))?",
+            normalized,
+        ):
+            return False
+        if re.fullmatch(
+            r"(?:(?:please\s+)?(?:i\s+)?(?:do\s+not|don't|dont)\s+want\s+to\s+"
+            r"(?:make|apply|continue|proceed\s+with)\s+(?:this|that|the)\s+"
+            r"(?:change|replacement|selection)|"
+            r"(?:please\s+)?(?:forget|drop|skip|stop)\s+(?:this|that|the)\s+"
+            r"(?:change|replacement|selection)|"
+            r"(?:that|this)\s+is\s+not\s+(?:the\s+)?(?:product|sku|option)\s+"
+            r"i\s+(?:meant|wanted|need))",
+            normalized,
+        ):
+            return True
+        if re.fullmatch(
+            r"(?:(?:wait|actually|on\s+second\s+thought)[,;]?\s+)?"
+            r"let(?:'s|\s+us)\s+not\s+replace(?:\s+it)?"
+            r"(?:\s*(?:;|,|and|then)\s*(?:please\s+)?compare"
+            r"(?:\s+(?:it\s+)?with\s+another\s+proposal|\s+the\s+proposals?)?)?",
+            normalized,
+        ):
+            return True
+        return bool(
+            re.fullmatch(
+                r"(?:please\s+)?(?:"
+                r"cancel(?:\s+(?:(?:it|this|that)(?:\s+(?:change|question))?|"
+                r"the\s+(?:change|question)))?|"
+                r"abandon(?:\s+(?:the\s+)?)?(?:(?:catalogue|product|sku)\s+)?"
+                r"(?:selection|choice|change)|"
+                r"discard(?:\s+(?:the\s+)?)?(?:(?:catalogue|product|sku)\s+)?"
+                r"(?:selection|choice|change)|"
+                r"never\s+mind|nevermind|stop\s+this\s+change|"
+                r"(?:do\s+not|don't|dont|not)\s+replace(?:\s+it)?|"
+                r"(?:leave|keep)\s+it\s+(?:unchanged|as[ -]?is))"
+                r"(?:\s+please)?",
+                normalized,
             )
         )
 
@@ -771,6 +2205,11 @@ class WhatsAppWebhookService:
         """Translate internal workflow state errors into actionable seller language."""
 
         message = str(error).strip()
+        if "product-selection menu belongs to an earlier requirement" in message.casefold():
+            return (
+                "That product-selection menu belongs to an earlier requirement and is no "
+                "longer active. Nothing was changed. Use the latest product options shown."
+            )
         if re.search(
             r"\b(?:(?:scenario|requirement|existing)\s+)?line(?:\(s\))?\b"
             r".*\bnot found\b",
@@ -801,7 +2240,40 @@ class WhatsAppWebhookService:
                 "The active proposal changed or is no longer available. Review the current "
                 "proposal, then retry the change."
             )
-        return message
+        if any(
+            phrase in message.casefold()
+            for phrase in (
+                "not awaiting product confirmation",
+                "there is no pending sku change",
+                "sku confirmation is invalid",
+                "product selection is no longer valid",
+                "unknown commercial workflow action",
+                "interpreted action is not supported",
+            )
+        ):
+            return (
+                "That earlier selection is no longer active, so nothing was changed. "
+                "Review the latest requirement or proposal and use its current options."
+            )
+        # Do not expose implementation-oriented exception text. Known, seller-safe
+        # validation messages are preserved; everything else receives a neutral recovery
+        # instruction instead of leaking state names, identifiers, or backend details.
+        if re.search(
+            r"\b(?:pending|scenario|workflow|traceback|exception|etag|blob|internal|"
+            r"confirmation[_ -]?id|source[_ -]?line[_ -]?id)\b",
+            message,
+            re.I,
+        ):
+            return (
+                "I could not apply that request to the current proposal, so nothing was "
+                "changed. Review the latest proposal and restate the intended licensing "
+                "change with the product name and quantity."
+            )
+        return (
+            "I could not apply that request safely. Nothing was changed. Review the latest "
+            "requirement or proposal, then restate the licensing action with the product name "
+            "and quantity where relevant."
+        )
 
     @staticmethod
     def _trailing_question(value: str) -> str:
@@ -918,8 +2390,13 @@ class WhatsAppWebhookService:
                 )
             return
         except Exception:
+            if "images" in locals():
+                # Rendering succeeded and an outbound page failed. Propagate the
+                # delivery error so the webhook replay barrier handles it; sending a
+                # complete text fallback here would duplicate pages already delivered.
+                raise
             logger.exception(
-                "Unable to render or send product guidance table; using mobile text fallback"
+                "Unable to render product guidance table; using mobile text fallback"
             )
         blocks: list[str] = []
         for row in safe_rows:
@@ -1049,6 +2526,7 @@ class WhatsAppWebhookService:
                         kind="agent_clarification",
                         question=clarification[:500],
                         context_message=question[:2000],
+                        detail_value="official_product_clarification",
                     ),
                 )
             await self._send_text(sender, clarification[:500])
@@ -1070,6 +2548,39 @@ class WhatsAppWebhookService:
             matches.append(ScenarioType.RENEW_AS_IS)
         return matches[0] if len(set(matches)) == 1 else None
 
+    @staticmethod
+    def _scenario_from_bare_reply(message: str) -> ScenarioType | None:
+        """Resolve only a short answer to a scenario question, never a new instruction.
+
+        ``ME5`` can safely fill the slot that is visible to the seller.  A complete turn such
+        as ``add Visio to ME5`` or ``build ME5 instead`` is a newer commercial action and must
+        be routed on its own rather than inheriting an older pending operation.
+        """
+
+        if "?" in message or WhatsAppWebhookService._is_negated_action(
+            message,
+            r"(?:me3|me5|me7|renew(?:al)?(?:\s+as\s+is)?)",
+        ):
+            return None
+        normalized = " ".join(
+            message.casefold().replace("-", " ").strip(" ?!.,").split()
+        )
+        match = re.fullmatch(
+            r"(?:the\s+)?(me3|me5|me7|renew(?:al)?(?:\s+as\s+is)?)"
+            r"(?:\s+(?:option|scenario|proposal))?(?:\s+please)?",
+            normalized,
+        )
+        if match is None:
+            return None
+        token = match.group(1)
+        if token == "me3":
+            return ScenarioType.ME3_COPILOT
+        if token == "me5":
+            return ScenarioType.ME5_COPILOT
+        if token == "me7":
+            return ScenarioType.ME7
+        return ScenarioType.RENEW_AS_IS
+
     async def _select_or_request_scenario_target(
         self,
         sender: str,
@@ -1084,11 +2595,27 @@ class WhatsAppWebhookService:
         ):
             return False
         session = await self._orchestrator.get_session(sender)
-        if session is None or len(session.scenarios) <= 1:
+        if session is None:
             return False
         target = self._scenario_from_request(intent, original_message)
+        if target is None and intent.action == "set_copilot":
+            # A seller may say only "Set Copilot to 30" after preparing one Copilot
+            # proposal.  The model-provided scenario is deliberately discarded unless the
+            # seller wrote it, so recover the target only when persisted commercial state
+            # makes it unambiguous.  A four-way comparison can contain multiple Copilot
+            # proposals and therefore still requires an explicit seller choice.
+            copilot_targets = [
+                scenario_type
+                for scenario_type, scenario in session.scenarios.items()
+                if any(line.line_id == "COPILOT" for line in scenario.lines)
+            ]
+            if len(copilot_targets) == 1:
+                target = copilot_targets[0]
         if target is not None:
+            await self._ensure_operation_allowed(sender, agent_action=intent.action)
             await self._orchestrator.build_scenario(sender, target)
+            return False
+        if len(session.scenarios) <= 1:
             return False
         available = ", ".join(item.label for item in ScenarioType if item in session.scenarios)
         question = f"Which proposal should I update: {available}?"
@@ -1098,6 +2625,7 @@ class WhatsAppWebhookService:
             question=question,
             original_message=original_message,
             scope="scenario",
+            awaiting_slot="scenario",
         )
         await self._orchestrator.set_pending_dialogue(sender, pending)
         await self._send_text(sender, question)
@@ -1126,7 +2654,23 @@ class WhatsAppWebhookService:
                 if scenario is not None:
                     lines = [line for line in scenario.lines if line.proposed_quantity > 0]
         available_ids = {line.line_id for line in lines}
+        # A scenario keeps zero-quantity source rows to preserve the audit trail for
+        # migrations and replacements. A saved multi-turn edit can legitimately refer to
+        # one of those rows after the seller selects a different target proposal. Accept an
+        # exact persisted line ID, while continuing to show only visible (>0) lines when a
+        # new target must be inferred from natural language.
+        all_scenario_ids: set[str] = set()
+        if (
+            not requirement
+            and session is not None
+            and session.active_scenario is not None
+        ):
+            full_scenario = session.scenarios.get(session.active_scenario)
+            if full_scenario is not None:
+                all_scenario_ids = {line.line_id for line in full_scenario.lines}
         if supplied and supplied.casefold() != "none" and supplied in available_ids:
+            return supplied
+        if supplied and supplied.casefold() != "none" and supplied in all_scenario_ids:
             return supplied
         if len(lines) == 1:
             return lines[0].line_id
@@ -1233,6 +2777,15 @@ class WhatsAppWebhookService:
                 scored.append((500 + 20 * len(code_overlap) + len(overlap), line.line_id))
             elif len(overlap) >= 2:
                 scored.append((100 + 10 * len(overlap), line.line_id))
+            elif len(overlap) == 1:
+                # A seller will often answer a product-target question with the one
+                # distinguishing word from the displayed title (for example
+                # ``Residency``). Accept that shorthand only when the token is
+                # meaningful and it resolves to exactly one line below. Equal scores
+                # deliberately remain ambiguous rather than selecting the wrong SKU.
+                token = next(iter(overlap))
+                if len(token) >= 4:
+                    scored.append((20 + len(token), line.line_id))
         if not scored:
             return None
         scored.sort(reverse=True)
@@ -1249,6 +2802,7 @@ class WhatsAppWebhookService:
         original_message: str | None,
         operation: str | None = None,
         scope: Literal["none", "requirement", "scenario"] | None = None,
+        awaiting_slot: str | None = None,
     ) -> PendingDialogue:
         """Capture every known operation slot before asking a follow-up question."""
 
@@ -1261,8 +2815,11 @@ class WhatsAppWebhookService:
                 inferred_scope = "scenario"
 
         def integer(name: str) -> int:
+            raw_value = getattr(intent, name, -1)
+            if raw_value is None or raw_value == "":
+                return -1
             try:
-                return int(getattr(intent, name, -1) or -1)
+                return int(raw_value)
             except (TypeError, ValueError):
                 return -1
 
@@ -1303,15 +2860,58 @@ class WhatsAppWebhookService:
         source_line_id = str(getattr(intent, "line_id", "") or "").strip().upper()
         if source_line_id.casefold() == "none":
             source_line_id = ""
+        product_query = str(getattr(intent, "product_query", "") or "").strip()
+        dialogue_scope = scope or inferred_scope
+        if (
+            source_line_id
+            and session is not None
+            and action in {"choose_change", "replace_sku", "set_quantity", "set_disposition"}
+        ):
+            editable_lines, _ = self._pending_lines(session, dialogue_scope)
+            if source_line_id not in {line.line_id for line in editable_lines}:
+                source_line_id = ""
+        resolved_slot = awaiting_slot or "none"
+        if resolved_slot == "none":
+            if action == "choose_change":
+                resolved_slot = "change_dimension"
+            elif action in {"replace_sku", "set_quantity", "set_disposition"} and not source_line_id:
+                resolved_slot = "line"
+            elif action in {"add_sku", "replace_sku"} and not product_query:
+                resolved_slot = "product"
+            elif action == "add_sku" and integer("quantity") <= 0:
+                resolved_slot = "quantity"
+            elif action == "set_quantity" and integer("quantity") < 0:
+                resolved_slot = "quantity"
+            elif action == "set_copilot" and integer("copilot_quantity") < 0:
+                resolved_slot = "quantity"
+            elif action == "set_disposition" and disposition == "none":
+                resolved_slot = "disposition"
+            elif action == "build_scenario" and self._scenario_from_request(
+                intent, original_message
+            ) is None:
+                resolved_slot = "scenario"
+            elif action == "set_term" and not detail_value:
+                resolved_slot = "term"
+            elif action == "set_billing" and not detail_value:
+                resolved_slot = "billing"
+            elif action == "set_segment" and not detail_value:
+                resolved_slot = "segment"
+            elif action == "set_currency" and not detail_value:
+                resolved_slot = "currency"
+            elif action == "add_comment" and not detail_value:
+                resolved_slot = "comment"
+            elif action == "request_recommendation":
+                resolved_slot = "recommendation_context"
         return PendingDialogue(
             kind="agent_clarification",
             question=question[:500],
             context_message=(original_message or "")[:2000],
             operation=action,  # type: ignore[arg-type]
-            scope=scope or inferred_scope,
+            awaiting_slot=resolved_slot,  # type: ignore[arg-type]
+            scope=dialogue_scope,
             scenario_type=self._scenario_from_request(intent, original_message),
             source_line_id=source_line_id,
-            product_query=str(getattr(intent, "product_query", "") or "").strip(),
+            product_query=product_query,
             quantity=integer("quantity"),
             copilot_quantity=integer("copilot_quantity"),
             disposition=disposition,  # type: ignore[arg-type]
@@ -1332,12 +2932,19 @@ class WhatsAppWebhookService:
             product = str(getattr(intent, "product_query", "") or "").strip()
             quantity = int(getattr(intent, "quantity", -1) or -1)
             if not product:
-                question = "Which exact Microsoft product should I add?"
+                question = (
+                    f"Which exact Microsoft product should I add for {quantity} licences?"
+                    if quantity > 0
+                    else "Which exact Microsoft product should I add?"
+                )
             elif quantity <= 0:
                 question = f"How many {product} licences should I add?"
         elif action == "replace_sku":
             product = str(getattr(intent, "product_query", "") or "").strip()
-            if not product:
+            source_line = str(getattr(intent, "line_id", "") or "").strip()
+            if not source_line:
+                question = "Which licence in the current proposal should I replace?"
+            elif not product:
                 question = "Which Microsoft product should replace the selected licence?"
         elif action == "set_quantity" and int(getattr(intent, "quantity", -1)) < 0:
             question = "What should the new licence quantity be?"
@@ -1389,6 +2996,8 @@ class WhatsAppWebhookService:
         """Conservative fallback when the intent model asks instead of starting capture."""
 
         value = " ".join(message.casefold().strip(" ?!.,").split())
+        if WhatsAppWebhookService._is_negated_requirement_statement(value):
+            return False
         if any(
             phrase in value
             for phrase in (
@@ -1431,6 +3040,8 @@ class WhatsAppWebhookService:
             "want",
             "need",
             "require",
+            "start with",
+            "begin with",
             "add",
             "include",
             "also",
@@ -1450,6 +3061,400 @@ class WhatsAppWebhookService:
             or bool(re.fullmatch(r"(?:m?e[1357]|o365|m365)", value))
         )
 
+    @classmethod
+    def _is_high_confidence_requirement_statement(cls, message: str) -> bool:
+        """Recognize an explicit SKU request without overriding genuine questions.
+
+        The language model remains the primary router. This narrow structural fallback is
+        used only when it returns ``clarify`` (or is temporarily unavailable), so an obvious
+        statement such as "I also need Copilot" cannot be stranded in a generic question.
+        """
+
+        if cls._is_negated_requirement_statement(message):
+            return False
+        if not (
+            cls._looks_like_requirement_fragment(message)
+            and not cls._is_licensing_question_message(message)
+            and not cls._is_clear_non_requirement_turn(message)
+            and not cls._looks_like_existing_requirement_operation(message)
+        ):
+            return False
+        value = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        explicit_request = bool(
+            re.search(
+                r"(?:^|[;,.]\s*)(?:please\s+)?(?:also\s+)?(?:(?:i|we)\s+)?"
+                r"(?:want|need|require|add|include|order|purchase|buy|renew|use|"
+                r"give\s+me|go\s+with|consider)\b",
+                value,
+            )
+            or re.match(
+                r"^(?:let'?s|let\s+us)\s+(?:start|begin)"
+                r"(?:\s+(?:with|using))?\b",
+                value,
+            )
+            or re.match(
+                r"^(?:let'?s|let\s+us)\s+(?:add|include|use|order)\b",
+                value,
+            )
+            or re.match(
+                r"^(?:can|could|would|will)\s+you\s+(?:please\s+)?"
+                r"(?:add|include|order|use|capture|record)\b",
+                value,
+            )
+        )
+        explicit_quantity = bool(
+            re.search(
+                r"\b\d+\s*(?:licen[cs]es?|users?|seats?|subscriptions?|qty|quantity)\b",
+                value,
+            )
+        )
+        compact_product_quantity = bool(
+            re.fullmatch(
+                r"[a-z0-9+()./& -]{1,120}\s+\d+"
+                r"(?:\s+(?:licen[cs]es?|users?|seats?|subscriptions?|qty|quantity))?",
+                value,
+            )
+            and not re.search(
+                r"\b(?:has|have|had|costs?|priced?|includes?|contains?|features?|"
+                r"was|were|last\s+year|expensive|cheap)\b",
+                value,
+            )
+        )
+        return explicit_request or explicit_quantity or compact_product_quantity or bool(
+            re.fullmatch(r"(?:m?e[1357]|o365|m365)", value)
+        )
+
+    async def _is_assertive_requirement_capture(
+        self,
+        message: str,
+        session: WorkflowSession | None,
+    ) -> bool:
+        """Ground every text-capture mutation in the seller's actual wording."""
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        direct_polite = bool(
+            re.match(
+                r"^(?:can|could|would|will)\s+you\s+(?:please\s+)?"
+                r"(?:add|include|capture|record|use|order)\b",
+                normalized,
+            )
+        )
+        direct_possession_request = bool(
+            re.match(
+                r"^(?:can|could|may)\s+(?:i|we)\s+"
+                r"(?:have|get|use|order|take)\b",
+                normalized,
+            )
+        )
+        if not normalized or (
+            "?" in message and not (direct_polite or direct_possession_request)
+        ):
+            return False
+        if self._is_licensing_question_message(message) and not (
+            direct_polite or direct_possession_request
+        ):
+            return False
+        if self._is_negated_requirement_statement(message):
+            return False
+        if self._is_quantity_only_reply(message):
+            # Approximate quantity answers ("maybe around ten") are valid only when a
+            # persisted capture turn is visibly waiting for that quantity. They must not
+            # start a new requirement by themselves.
+            return bool(session is not None and session.capture_messages)
+        if re.search(
+            r"\b(?:if|unless|whether|suppose|supposing|assuming|imagine|maybe|"
+            r"perhaps|hypothetically|for\s+example|as\s+an\s+example)\b",
+            normalized,
+        ):
+            return False
+        if re.search(
+            r"\b(?:(?:customer|client|seller|user|manager|analyst|report|invoice)\b"
+            r".{0,36}\b(?:said|says|asked|asks|mentioned|mentions|lists?|stated|"
+            r"requested|requests?|wants?|selected|selects|chose|chooses|picked|picks))\b",
+            normalized,
+        ) or re.search(
+                r"\b(?:said|asked|mentioned|stated|requested|selected|chose|picked)\s+"
+                r"(?:the\s+)?"
+            r"(?:customer|client|seller|user|manager|analyst)\b",
+            normalized,
+        ):
+            return False
+        if re.search(
+            r"\b(?:want|need|would\s+like)\s+to\s+know\b|"
+            r"\b(?:want|need|would\s+like)\s+(?:a\s+)?"
+            r"(?:pricing|price|quote|cost)\b|"
+            r"\b(?:has|have|had|costs?|priced?|includes|contains?|features?|"
+            r"is\s+expensive|is\s+cheap)\b",
+            normalized,
+        ):
+            return False
+        direct_requirement = bool(
+            re.search(
+                r"(?:^|[;,.]\s*)(?:please\s+)?(?:also\s+)?(?:(?:i|we)\s+)?"
+                r"(?:want|need|require|add|include|order|purchase|buy|renew|use|"
+                r"give\s+me|go\s+with|consider)\b",
+                normalized,
+            )
+            or re.match(
+                r"^(?:let'?s|let\s+us)\s+(?:start|begin)"
+                r"(?:\s+(?:with|using))?\b",
+                normalized,
+            )
+            or re.match(
+                r"^(?:let'?s|let\s+us)\s+(?:add|include|use|order)\b",
+                normalized,
+            )
+        )
+        if direct_polite or direct_possession_request or direct_requirement:
+            return True
+        # A bare catalogue title/code is a valid first turn ("Power BI Pro", "ME7").
+        # Requiring real catalogue evidence prevents arbitrary one-word conversation from
+        # entering the commercial draft.
+        query = self._catalog_query_from_requirement(message)
+        return bool(query and await self._orchestrator.catalog_candidates(query))
+
+    @staticmethod
+    def _catalog_query_from_requirement(message: str) -> str:
+        """Reduce a seller sentence to product-bearing terms without naming products.
+
+        This is used only as a safety check for the deterministic fallback path. The
+        language model remains the primary interpreter; when it is unavailable or returns
+        an unsuitable top-level action, the fallback must still prove that the remaining
+        terms match the maintained catalogue before it starts requirement capture.
+        """
+
+        value = normalize_product_title(message)
+        value = re.sub(
+            r"\b(?:for\s+)?(?:one|1|twelve|12)\s*[- ]?"
+            r"(?:years?|months?)\b|\b(?:p1y|annual(?:ly)?|yearly)\b",
+            " ",
+            value,
+        )
+        value = re.sub(
+            r"\b\d+\s*(?:licen[cs]es?|users?|seats?|quantity|qty)\b",
+            " ",
+            value,
+        )
+        value = re.sub(
+            r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+            r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+            r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+            r"eighty|ninety|hundred|thousand|and)(?:[ -]+(?:zero|one|two|"
+            r"three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|"
+            r"fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+            r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|"
+            r"and))*\s*(?:licen[cs]es?|users?|seats?|quantity|qty)\b",
+            " ",
+            value,
+        )
+        value = re.sub(r"\b\d+\b", " ", value)
+        ignored = {
+            "a",
+            "add",
+            "also",
+            "an",
+            "around",
+            "consider",
+            "for",
+            "give",
+            "i",
+            "include",
+            "licence",
+            "licences",
+            "license",
+            "licenses",
+            "let",
+            "lets",
+            "me",
+            "need",
+            "now",
+            "order",
+            "please",
+            "quantity",
+            "qty",
+            "require",
+            "subscription",
+            "start",
+            "starting",
+            "begin",
+            "confusing",
+            "take",
+            "that",
+            "the",
+            "this",
+            "to",
+            "s",
+            "us",
+            "use",
+            "want",
+            "we",
+            "with",
+            "within",
+        }
+        return " ".join(token for token in value.split() if token not in ignored)
+
+    async def _is_catalog_backed_requirement_statement(self, message: str) -> bool:
+        """Require real catalogue evidence before overriding a model routing result."""
+
+        if not await self._is_assertive_requirement_capture(message, None):
+            return False
+        query = self._catalog_query_from_requirement(message)
+        if not query:
+            return False
+        return bool(await self._orchestrator.catalog_candidates(query))
+
+    @staticmethod
+    def _is_negated_requirement_statement(message: str) -> bool:
+        """Keep removals and negative statements out of heuristic requirement capture."""
+
+        value = " ".join(message.casefold().strip(" ?!.,").split())
+        return bool(
+            re.search(
+                r"\bno\s+need(?:\s+(?:to|for))?\b|"
+                r"\b(?:do\s+not|don't|dont)\s+(?:need|want|require)\b|"
+                r"\b(?:not\s+(?:needed|required|wanted)|no\s+longer\s+(?:needed|required))\b",
+                value,
+            )
+            or re.search(
+                r"\b(?:copilot|defender|power\s+bi|microsoft|office|me[357]|"
+                r"licen[cs]e|sku)\b.{0,60}\b(?:is|are|was|were)\s+not\s+"
+                r"(?:needed|required|wanted)\b",
+                value,
+            )
+            or
+            re.search(
+                r"\b(?:do not|don't|dont|no longer|not required|not needed|without)\b"
+                r".{0,80}\b(?:need|want|require|add|include|renew|use|licen[cs]e|sku)\b",
+                value,
+            )
+            or re.search(
+                r"\b(?:remove|delete|drop|exclude)\b.{0,80}"
+                r"\b(?:licen[cs]e|sku|copilot|defender|power bi|microsoft|office|me[357])\b",
+                value,
+            )
+        )
+
+    @staticmethod
+    def _contains_multiple_mutation_clauses(message: str) -> bool:
+        """Detect independent edits that the one-action contract cannot apply atomically."""
+
+        clauses = [
+            clause.strip()
+            for clause in re.split(r"\s+(?:and then|then|and)\s+|[;\n]+", message.casefold())
+            if clause.strip()
+        ]
+        mutation = re.compile(
+            r"\b(?:add|remove|delete|drop|replace|change|update|set|retain|migrate|include)\b"
+        )
+        mutation_clauses = [clause for clause in clauses if mutation.search(clause)]
+
+        def is_quantity_modifier(clause: str) -> bool:
+            tokens = re.findall(r"[a-z0-9]+", clause)
+            allowed = {
+                "change",
+                "it",
+                "licence",
+                "licences",
+                "license",
+                "licenses",
+                "make",
+                "quantity",
+                "qty",
+                "seat",
+                "seats",
+                "set",
+                "the",
+                "to",
+                "update",
+                "user",
+                "users",
+            }
+            return (
+                any(token.isdigit() for token in tokens)
+                and all(token.isdigit() or token in allowed for token in tokens)
+            )
+
+        if len(mutation_clauses) >= 2:
+            # "Replace X with Y and set the quantity to N" is one representable
+            # replacement. Other multiple-verb requests cannot be committed atomically by
+            # the one-action intent contract.
+            if (
+                len(mutation_clauses) == 2
+                and re.search(
+                    r"\b(?:add|replace|change|update)\b",
+                    mutation_clauses[0],
+                )
+                and is_quantity_modifier(mutation_clauses[1])
+                and not re.search(
+                    r"\b(?:add|remove|delete|drop|replace)\b",
+                    mutation_clauses[1],
+                )
+            ):
+                return False
+            return True
+
+        if len(clauses) < 2 or not mutation.search(clauses[0]):
+            return False
+
+        # A shared verb can govern several independent objects: "Add E3 and Copilot",
+        # "Remove L1 and L2", or "Change L1 and L2 to 50". The structured intent schema
+        # can represent only one target, so detect the omitted repeated verb rather than
+        # partially applying the first object.
+        if len(set(re.findall(r"\bl\d+\b", message.casefold()))) >= 2:
+            return True
+
+        modifier_tokens = {
+            "a",
+            "all",
+            "an",
+            "annual",
+            "annually",
+            "billing",
+            "comment",
+            "contract",
+            "currency",
+            "discount",
+            "for",
+            "keep",
+            "licence",
+            "licences",
+            "license",
+            "licenses",
+            "it",
+            "make",
+            "monthly",
+            "of",
+            "plan",
+            "quantity",
+            "qty",
+            "same",
+            "seat",
+            "seats",
+            "set",
+            "term",
+            "the",
+            "to",
+            "user",
+            "users",
+            "with",
+            "year",
+            "yearly",
+        }
+        for clause in clauses[1:]:
+            tokens = re.findall(r"[a-z0-9]+", clause)
+            meaningful = [
+                token
+                for token in tokens
+                if token not in modifier_tokens and not token.isdigit()
+            ]
+            if meaningful:
+                return True
+        return False
+
     @staticmethod
     def _is_licensing_question_message(message: str) -> bool:
         """Keep product-rich questions out of requirement capture."""
@@ -1464,6 +3469,13 @@ class WhatsAppWebhookService:
         )
         if operation:
             return False
+        if re.search(
+            r"\b(?:(?:want|need|would like) to (?:know|understand|learn)|"
+            r"information about|features?|benefits?|capabilities?|"
+            r"help (?:me )?(?:choose|pick|select)|suggest|recommend)\b",
+            tail,
+        ):
+            return True
         return bool(
             "?" in lines[-1]
             or re.match(
@@ -1478,14 +3490,14 @@ class WhatsAppWebhookService:
             )
         )
 
-    @staticmethod
-    def _is_quantity_only_reply(message: str) -> bool:
+    @classmethod
+    def _is_quantity_only_reply(cls, message: str) -> bool:
         """Identify a quantity that completes the product currently being captured."""
 
         value = " ".join(
             message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
         )
-        return bool(
+        numeric_form = bool(
             re.fullmatch(
                 r"(?:(?:let'?s|let us|i|we|please)\s+)?"
                 r"(?:(?:want|need|consider|use|take|make it|set it to|go with)\s+)?"
@@ -1494,6 +3506,238 @@ class WhatsAppWebhookService:
                 value,
             )
         )
+        if numeric_form:
+            return True
+        values = cls._seller_quantity_values(value)
+        return bool(
+            len(values) == 1
+            and re.fullmatch(
+                r"(?:(?:let'?s|let us|i|we|please)\s+)?"
+                r"(?:(?:want|need|consider|use|take|make it|set it to|go with)\s+)?"
+                r"(?:(?:about|around|approximately|approx|maybe(?:\s+around)?)\s+)?"
+                r"(?:[a-z]+(?:[ -]+(?:and\s+)?[a-z]+)*)"
+                r"\s*(?:(?:licence|license)s?|users?|seats?|quantity|qty)?",
+                value,
+            )
+        )
+
+    @staticmethod
+    def _number_words_to_int(value: str) -> int | None:
+        """Parse a bounded English whole-number phrase used for licence quantities."""
+
+        small = {
+            "zero": 0,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+            "eleven": 11,
+            "twelve": 12,
+            "thirteen": 13,
+            "fourteen": 14,
+            "fifteen": 15,
+            "sixteen": 16,
+            "seventeen": 17,
+            "eighteen": 18,
+            "nineteen": 19,
+            "twenty": 20,
+            "thirty": 30,
+            "forty": 40,
+            "fifty": 50,
+            "sixty": 60,
+            "seventy": 70,
+            "eighty": 80,
+            "ninety": 90,
+        }
+        tokens = value.casefold().replace("-", " ").split()
+        if not tokens or any(
+            token not in small and token not in {"and", "hundred", "thousand"}
+            for token in tokens
+        ):
+            return None
+        total = 0
+        current = 0
+        saw_number = False
+        for token in tokens:
+            if token == "and":
+                continue
+            saw_number = True
+            if token in small:
+                current += small[token]
+            elif token == "hundred":
+                current = max(current, 1) * 100
+            elif token == "thousand":
+                total += max(current, 1) * 1000
+                current = 0
+        result = total + current
+        return result if saw_number and 0 <= result <= 1_000_000 else None
+
+    @staticmethod
+    def _number_word_pattern() -> str:
+        word = (
+            r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|"
+            r"twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+            r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+            r"hundred|thousand|and)"
+        )
+        return rf"{word}(?:[ -]+{word})*"
+
+    @classmethod
+    def _number_word_matches(cls, message: str, patterns: tuple[str, ...]) -> set[int]:
+        """Parse seller-authored number words only at field-specific language anchors."""
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        number_words = cls._number_word_pattern()
+        values: set[int] = set()
+        for template in patterns:
+            pattern = template.format(number=number_words)
+            for match in re.finditer(pattern, normalized):
+                phrase = match.group("number")
+                parsed = cls._number_words_to_int(phrase)
+                if parsed is not None:
+                    values.add(parsed)
+        return values
+
+    @classmethod
+    def _seller_percentage_values(cls, message: str) -> set[Decimal]:
+        """Return percentages explicitly stated by the seller, including number words."""
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").replace(",", "").split()
+        )
+        values = {
+            Decimal(value)
+            for value in re.findall(
+                r"(?<![a-z0-9])(-?\d+(?:\.\d+)?)\s*(?:%|percent(?:age)?\b)",
+                normalized,
+            )
+        }
+        values.update(
+            Decimal(value)
+            for value in cls._number_word_matches(
+                normalized,
+                (r"\b(?P<number>{number})\s+percent(?:age)?\b",),
+            )
+        )
+        return values
+
+    @classmethod
+    def _seller_adjustment_values(cls, message: str) -> set[Decimal]:
+        """Return explicitly stated adjustment amounts with seller-authored direction."""
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").replace(",", "").split()
+        )
+        unsigned_numeric = r"(?P<number>\d+(?:\.\d+)?)"
+        signed_numeric = r"(?P<number>-?\d+(?:\.\d+)?)"
+        positive_patterns = (
+            rf"\b(?:add|increase)(?:\s+(?:an?|the|commercial))?\s+"
+            rf"(?:adjustment\s+(?:of|by)\s+)?{unsigned_numeric}\b",
+            rf"\b(?:adjustment|amount)(?:\s+(?:of|to|by))?\s+{signed_numeric}\b",
+        )
+        negative_patterns = (
+            rf"\b(?:subtract|deduct|decrease)(?:\s+(?:an?|the|commercial))?\s+"
+            rf"(?:adjustment\s+(?:of|by)\s+)?{unsigned_numeric}\b",
+        )
+        values: set[Decimal] = set()
+        for pattern in positive_patterns:
+            values.update(Decimal(match.group("number")) for match in re.finditer(pattern, normalized))
+        for pattern in negative_patterns:
+            values.update(-abs(Decimal(match.group("number"))) for match in re.finditer(pattern, normalized))
+
+        word_patterns = (
+            (
+                r"\b(?:add|increase)(?:\s+(?:an?|the|commercial))?\s+"
+                r"(?:adjustment\s+(?:of|by)\s+)?(?P<number>{number})\b",
+                1,
+            ),
+            (
+                r"\b(?:subtract|deduct|decrease)(?:\s+(?:an?|the|commercial))?\s+"
+                r"(?:adjustment\s+(?:of|by)\s+)?(?P<number>{number})\b",
+                -1,
+            ),
+            (
+                r"\b(?:adjustment|amount)(?:\s+(?:of|to|by))?\s+"
+                r"(?P<number>{number})\b",
+                1,
+            ),
+        )
+        for pattern, sign in word_patterns:
+            for value in cls._number_word_matches(normalized, (pattern,)):
+                values.add(Decimal(sign * value))
+        return values
+
+    @classmethod
+    def _seller_quantity_values(cls, message: str) -> set[int]:
+        """Return seller-authored quantities without treating SKU digits as quantities."""
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        scrubbed = re.sub(
+            r"\b(?:product|sku)\s+id\s*[:=#-]?\s*[a-z0-9-]+\b",
+            " ",
+            normalized,
+        )
+        scrubbed = re.sub(r"\b(?:microsoft|office)\s*365\b", " ", scrubbed)
+        # ``Plan 1`` and ``Plan 2`` identify a product edition. They are never licence
+        # quantities unless a separate quantity is explicitly supplied.
+        scrubbed = re.sub(r"\bplan\s+\d+\b", " ", scrubbed)
+        scrubbed = re.sub(r"\b(?:l\d+|m?e\d+|p\d+|f\d+)\b", " ", scrubbed)
+        scrubbed = re.sub(r"\bp\d+[ymd]\b", " ", scrubbed)
+        scrubbed = re.sub(
+            r"\b\d+\s*(?:years?|months?|days?)\b",
+            " ",
+            scrubbed,
+        )
+        scrubbed = re.sub(
+            r"\b(?=[a-z0-9-]*[a-z])(?=[a-z0-9-]*\d)[a-z0-9-]+\b",
+            " ",
+            scrubbed,
+        )
+        values = {int(value) for value in re.findall(r"\b\d+\b", scrubbed)}
+
+        number_word = cls._number_word_pattern()
+        phrases: list[str] = []
+        phrases.extend(
+            match.group("number")
+            for match in re.finditer(
+                rf"\b(?P<number>{number_word}(?:[ -]+{number_word})*)\s+"
+                r"(?:(?:licence|license)s?|users?|seats?|subscriptions?|qty|quantity)\b",
+                normalized,
+            )
+        )
+        trailing = re.search(
+            rf"\b(?:to|quantity(?:\s+of)?|qty(?:\s+of)?)\s+"
+            rf"(?P<number>{number_word}(?:[ -]+{number_word})*)$",
+            normalized,
+        )
+        if trailing is not None:
+            phrases.append(trailing.group("number"))
+        if re.fullmatch(rf"{number_word}(?:[ -]+{number_word})*", normalized):
+            phrases.append(normalized)
+        phrases.extend(
+            match.group("number")
+            for match in re.finditer(
+                rf"\b(?:add|include|need|want|require|order|buy|purchase|take|"
+                rf"consider|with|to)\s+(?P<number>{number_word})\b"
+                rf"(?![- ]+(?:year|month|day)s?\b)",
+                normalized,
+            )
+        )
+        for phrase in phrases:
+            parsed = cls._number_words_to_int(phrase)
+            if parsed is not None:
+                values.add(parsed)
+        return values
 
     @staticmethod
     def _looks_like_existing_requirement_operation(message: str) -> bool:
@@ -1576,23 +3820,332 @@ class WhatsAppWebhookService:
             )
         await self._send_text(
             sender,
-            "I have not added that message to the licensing requirement. I can help with "
-            "Microsoft licence capture, SKU clarification, annual pricing, proposal changes, "
+            "That request is outside this licensing advisor's scope, so I have "
+            "not added it to the licensing requirement. I can help with "
+            "Microsoft licensing requirements, SKU clarification, annual pricing, proposal changes, "
             f"and comparisons. {next_step}",
         )
+
+    async def _message_has_licensing_context(self, message: str) -> bool:
+        """Conservatively recognize a licensing/product question from seller evidence."""
+
+        normalized = normalize_product_title(message)
+        if re.search(
+            r"\b(?:microsoft|office|licen[cs]e|licensing|sku|subscription|tenant|"
+            r"renewal|renew|pricing|price|quote|proposal|copilot|defender|intune|"
+            r"entra|power\s+bi|visio|teams|exchange|dynamics|windows|m?e[1357]|"
+            r"o365|m365|requirements?|commercial\s+value|budget|inr|usd|eur|gbp)\b",
+            normalized,
+        ):
+            return True
+        if re.search(
+            r"\b(?:upload|attach|send|share|provide)\b.{0,40}"
+            r"\b(?:pdf|word|docx?|excel|csv|xlsx?|image|screenshot|voice\s+note|"
+            r"audio|document|file)\b|"
+            r"\b(?:pdf|word|docx?|excel|csv|xlsx?|image|screenshot|voice\s+note|"
+            r"audio|document|file)\b.{0,40}\b(?:upload|attach|send|share|provide)\b",
+            normalized,
+        ):
+            return True
+        matches = await self._orchestrator.catalog_candidates(message.strip())
+        return bool(matches and matches[0].confidence >= 90)
+
+    def _deterministic_session_fact_answer(
+        self,
+        session: WorkflowSession | None,
+        message: str,
+    ) -> str | None:
+        """Answer current-proposal fact questions only from committed session data.
+
+        The language model decides conversational intent, but it is not an authority for
+        seller quantities, selected SKUs, terms, or commercial totals.  Questions about the
+        saved requirement therefore cross this deterministic boundary before any model text
+        can be sent to WhatsApp.
+        """
+
+        if session is None:
+            return None
+        normalized = normalize_product_title(message)
+        explicit_scenario = self._seller_scenario_reference(message)
+        captured_reference = bool(
+            re.search(
+                r"\b(?:captured|uploaded|submitted|original|draft)\s+"
+                r"(?:requirement|licen[cs]es?|file|estate)\b|"
+                r"\b(?:requirement|estate)\s+(?:i\s+)?(?:uploaded|submitted)\b",
+                normalized,
+            )
+        )
+        baseline_reference = bool(
+            explicit_scenario == ScenarioType.RENEW_AS_IS
+            or re.search(r"\b(?:confirmed\s+baseline|baseline)\b", normalized)
+        )
+        active_reference = bool(
+            re.search(
+                r"\b(?:current|active|revised|selected|latest)\s+"
+                r"(?:proposal|configuration|option|scenario)\b",
+                normalized,
+            )
+        )
+        state_reference = bool(
+            captured_reference
+            or baseline_reference
+            or active_reference
+            or explicit_scenario is not None
+            or re.search(
+                r"\b(?:my|this|confirmed|saved|proposal|requirement|draft|"
+                r"renewal|renew\s+as\s+is|as\s+is|l\d+)\b",
+                normalized,
+            )
+        )
+        unit_price_question = bool(
+            re.search(
+                r"\b(?:unit\s+price|price\s+per\s+(?:licen[cs]e|user|seat)|"
+                r"per[ -](?:licen[cs]e|user|seat)\s+price)\b",
+                normalized,
+            )
+        )
+        line_total_question = bool(
+            re.search(
+                r"\b(?:line\s+total|subtotal\s+for|total\s+for\s+(?:l\d+|the\s+))\b",
+                normalized,
+            )
+        )
+        total_question = bool(
+            not unit_price_question
+            and (
+                re.search(r"\b(?:overall\s+)?(?:total|value)\b", normalized)
+                or (
+                    state_reference
+                    and re.search(r"\b(?:cost|price|how\s+much)\b", normalized)
+                )
+            )
+        )
+        quantity_question = bool(
+            state_reference
+            and re.search(r"\b(?:how\s+many|qty|quantity|quantities)\b", normalized)
+        )
+        configuration_question = bool(
+            state_reference
+            and re.search(
+                r"\b(?:which|what|show|list)\b.{0,40}"
+                r"\b(?:skus?|products?|licen[cs]es?|lines?|configuration)\b|"
+                r"\b(?:skus?|products?|licen[cs]es?|lines?|configuration)\b.{0,40}"
+                r"\b(?:included|selected|have|current)\b",
+                normalized,
+            )
+        )
+        term_question = bool(
+            state_reference
+            and re.search(r"\b(?:term|billing|annual|monthly)\b", normalized)
+        )
+        if not (
+            total_question
+            or unit_price_question
+            or line_total_question
+            or quantity_question
+            or configuration_question
+            or term_question
+        ):
+            return None
+
+        scenario = None
+        scenario_label = ""
+        if not captured_reference:
+            if explicit_scenario == ScenarioType.RENEW_AS_IS or baseline_reference:
+                scenario = session.confirmed_as_is or session.scenarios.get(
+                    ScenarioType.RENEW_AS_IS
+                )
+                scenario_label = ScenarioType.RENEW_AS_IS.label
+            elif explicit_scenario is not None:
+                scenario = session.scenarios.get(explicit_scenario)
+                scenario_label = explicit_scenario.label
+            elif active_reference and session.active_scenario is not None:
+                scenario = session.scenarios.get(session.active_scenario)
+                scenario_label = "current " + session.active_scenario.label
+            else:
+                scenario = (
+                    session.scenarios.get(session.active_scenario)
+                    if session.active_scenario is not None
+                    else None
+                ) or session.confirmed_as_is
+        if explicit_scenario is not None and scenario is None and not captured_reference:
+            return (
+                f"The {scenario_label or explicit_scenario.label} proposal has not been "
+                "prepared in this session. Ask me to prepare it before requesting its "
+                "configuration or commercial value."
+            )
+        if scenario is not None:
+            visible_lines = [
+                line for line in scenario.lines if line.proposed_quantity > 0
+            ]
+            label = scenario_label or scenario.scenario_type.label
+            target = self._line_reference_from_message(
+                visible_lines,
+                message,
+                requirement=False,
+            )
+            selected = (
+                [line for line in visible_lines if line.line_id == target]
+                if target is not None
+                else visible_lines
+            )
+            if target is None and re.search(r"\bl\d+\b", normalized):
+                requested = re.search(r"\bl\d+\b", normalized)
+                assert requested is not None
+                return (
+                    f"I could not find {requested.group(0).upper()} in the committed "
+                    f"{label} proposal. No value was inferred."
+                )
+            if unit_price_question or line_total_question:
+                if target is None:
+                    return (
+                        "Which licence line do you mean? Send its displayed line ID or exact "
+                        "product name; I will use only the committed proposal value."
+                    )
+                line = selected[0]
+                unavailable = (
+                    " Price is unavailable for this line."
+                    if line.price_unavailable
+                    else ""
+                )
+                if unit_price_question:
+                    return (
+                        f"The committed {label} unit price for {line.line_id} - "
+                        f"{line.sku_title} is "
+                        f"{format_money(line.unit_price, self._configuration.currency)}."
+                        f"{unavailable}"
+                    )
+                return (
+                    f"The committed {label} line total for {line.line_id} - "
+                    f"{line.sku_title} is "
+                    f"{format_money(line.extended_price, self._configuration.currency)}."
+                    f"{unavailable}"
+                )
+            sections: list[str] = []
+            if quantity_question or configuration_question:
+                rows = [
+                    f"{line.line_id} - {line.sku_title}: "
+                    f"{line.proposed_quantity:,} licence(s)"
+                    for line in selected
+                ]
+                sections.append(
+                    f"Committed {label} configuration:\n" + "\n".join(rows)
+                )
+            if term_question:
+                sections.append(
+                    f"The committed {label} proposal uses term "
+                    f"{scenario.term_duration} with {scenario.billing_plan} billing."
+                )
+            if total_question:
+                unavailable = sum(line.price_unavailable for line in visible_lines)
+                warning = (
+                    f" {unavailable} line(s) still have unavailable pricing and are not "
+                    "silently treated as free."
+                    if unavailable
+                    else ""
+                )
+                sections.append(
+                    f"The committed {label} annual total is "
+                    f"{format_money(scenario.total_value, self._configuration.currency)}."
+                    f"{warning}"
+                )
+            return "\n\n".join(sections) if sections else None
+
+        if session.estate is None:
+            return None
+        estate_lines = list(session.estate.lines)
+        target = self._line_reference_from_message(
+            estate_lines,
+            message,
+            requirement=True,
+        )
+        selected_estate = (
+            [line for line in estate_lines if line.line_id == target]
+            if target is not None
+            else estate_lines
+        )
+        rows = [
+            f"{line.line_id} - {line.display_title}: "
+            f"{line.renewal_quantity:,} licence(s)"
+            for line in selected_estate
+        ]
+        if total_question or unit_price_question or line_total_question:
+            return (
+                "Pricing remains paused until the complete captured requirement and every "
+                "exact SKU are confirmed. I have not inferred or estimated a price.\n"
+                + "Captured requirement:\n"
+                + "\n".join(rows)
+            )
+        suffix = ""
+        return "Captured requirement:\n" + "\n".join(rows) + suffix
 
     @classmethod
     def _is_explicit_title_choice(cls, message: str) -> bool:
         """Require selection language before accepting a title embedded in a sentence."""
 
-        if cls._is_clear_non_requirement_turn(message):
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if (
+            cls._is_clear_non_requirement_turn(message)
+            or "?" in message
+            or re.match(
+                r"^(?:who|what|which|where|when|why|how|can\s+i|could\s+i|"
+                r"would\s+i|explain|tell\s+me)\b",
+                normalized,
+            )
+            or cls._is_negated_action(
+                message,
+                r"(?:choose|select|use|confirm|go\s+with|pick)",
+            )
+            or re.search(
+                r"\b(?:customer|client|seller|user|manager|analyst)\b.{0,48}"
+                r"\b(?:said|says|asked|asks|selected|chose|picked|requested|requests?)\b|"
+                r"\b(?:was|is|has\s+been)\s+(?:selected|chosen|picked)\s+by\s+"
+                r"(?:the\s+)?(?:customer|client|seller|user|manager|analyst)\b",
+                normalized,
+            )
+        ):
             return False
-        value = " ".join(message.casefold().strip(" ?!.,").split())
         return bool(
             re.search(
                 r"\b(?:choose|chosen|select|selected|use|confirm|confirmed|"
                 r"go with|pick|picked|that is|this is)\b",
-                value,
+                normalized,
+            )
+        )
+
+    @classmethod
+    def _is_direct_candidate_title_reply(cls, message: str) -> bool:
+        """Accept a bare/explicit title answer, never a question about that title."""
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if not normalized or "?" in message:
+            return False
+        if re.match(
+            r"^(?:who|what|which|where|when|why|how|can\s+i|could\s+i|"
+            r"would\s+i|if|unless|whether|explain|tell\s+me)\b",
+            normalized,
+        ):
+            return False
+        if cls._is_negated_action(
+            message,
+            r"(?:choose|select|use|confirm|go\s+with|pick)",
+        ) or re.search(
+            r"\b(?:customer|client|seller|user|manager|analyst)\b.{0,48}"
+            r"\b(?:said|says|asked|asks|selected|chose|picked|requested|requests?)\b|"
+            r"\b(?:was|is|has\s+been)\s+(?:selected|chosen|picked)\s+by\s+"
+            r"(?:the\s+)?(?:customer|client|seller|user|manager|analyst)\b",
+            normalized,
+        ):
+            return False
+        return not bool(
+            re.match(
+                r"^(?:(?:the\s+)?(?:customer|client|seller|user)|he|she|they)\s+"
+                r"(?:said|says|asked|asks|mentioned|mentions|wants?|requested|requests?)\b",
+                normalized,
             )
         )
 
@@ -1649,15 +4202,9 @@ class WhatsAppWebhookService:
         if self._is_clear_non_requirement_turn(message):
             await self._send_non_requirement_boundary(sender)
             return True
-        if self._looks_like_requirement_fragment(message):
-            return False
         if intent.action == "capture_requirement":
             return False
         if intent.action == "clarify":
-            if self._looks_like_requirement_fragment(message) or self._is_quantity_only_reply(
-                message
-            ):
-                return False
             clarification = self._professional_agent_text(intent.clarification)
             await self._send_text(
                 sender,
@@ -1720,15 +4267,33 @@ class WhatsAppWebhookService:
 
         if session.estate is None or not session.estate.pending_lines:
             return False
+        intent = self._intent_with_seller_supported_targets(
+            intent,
+            message,
+            session,
+            pending_slot_completion=False,
+        )
+        if not await self._is_assertive_requirement_capture(message, session):
+            return False
         extracted = await self._extract_single_turn_requirement(message)
         product = str(getattr(intent, "product_query", "") or "").strip()
         quantity = int(getattr(intent, "quantity", -1) or -1)
         clarification = ""
         if extracted is not None:
             extracted_product, extracted_quantity, clarification = extracted
-            product = product or extracted_product
+            grounded_extraction = self._intent_with_seller_supported_targets(
+                self._agent_intent_with(
+                    intent,
+                    product_query=extracted_product,
+                    quantity=extracted_quantity,
+                ),
+                message,
+                session,
+                pending_slot_completion=False,
+            )
+            product = product or str(grounded_extraction.product_query or "").strip()
             if quantity <= 0:
-                quantity = extracted_quantity
+                quantity = grounded_extraction.quantity
         if not product:
             return False
 
@@ -1745,9 +4310,6 @@ class WhatsAppWebhookService:
             )
             return True
 
-        target = session.estate.pending_lines[0]
-        if quantity <= 0:
-            quantity = target.renewal_quantity
         if add_another:
             result = await self._orchestrator.add_requirement_sku(
                 sender,
@@ -1755,6 +4317,59 @@ class WhatsAppWebhookService:
                 quantity,
             )
         else:
+            pending_lines = list(session.estate.pending_lines)
+            supplied_line = str(getattr(intent, "line_id", "") or "").strip().upper()
+            target = next(
+                (line for line in pending_lines if line.line_id == supplied_line),
+                None,
+            )
+            if target is None:
+                inferred = self._line_reference_from_message(
+                    pending_lines,
+                    message,
+                    requirement=True,
+                )
+                target = next(
+                    (line for line in pending_lines if line.line_id == inferred),
+                    None,
+                )
+            if target is None and len(pending_lines) == 1:
+                target = pending_lines[0]
+            if target is None:
+                choices = "; ".join(
+                    f"{line.line_id} ({line.source_product_title})"
+                    for line in pending_lines[:10]
+                )
+                question = (
+                    "Which unresolved licence should I correct? Reply with its product "
+                    f"name: {choices}"
+                )
+                replacement_intent = self._agent_intent_with(
+                    intent,
+                    action="replace_sku",
+                    product_query=product,
+                    quantity=quantity,
+                )
+                pending = await self._pending_dialogue_for_intent(
+                    sender,
+                    replacement_intent,
+                    question=question,
+                    original_message=message,
+                    operation="replace_sku",
+                    scope="requirement",
+                    awaiting_slot="line",
+                )
+                await self._orchestrator.set_pending_dialogue(sender, pending)
+                await self._orchestrator.set_pending_match_prompt_suspended(sender, True)
+                await self._send_text(sender, question)
+                return True
+            if quantity <= 0:
+                quantity = target.renewal_quantity
+            product = await self._qualified_pending_product_query(
+                target.source_product_title,
+                product,
+                narrowing_required=target.candidate_narrowing_required,
+            )
             result = await self._orchestrator.replace_requirement_sku(
                 sender,
                 target.line_id,
@@ -1773,18 +4388,120 @@ class WhatsAppWebhookService:
     ) -> bool:
         """Replace an unconfirmed add/replace request with the seller's newer wording."""
 
+        session = await self._orchestrator.get_session(sender)
+        intent = self._intent_with_seller_supported_targets(
+            intent,
+            message,
+            session,
+            pending_slot_completion=False,
+        )
+        if intent.action == "capture_requirement":
+            if not await self._is_assertive_requirement_capture(message, session):
+                return False
+            product = str(intent.product_query or "").strip()
+            if not product:
+                extracted = await self._extract_single_turn_requirement(message)
+                if extracted is not None:
+                    grounded_extraction = self._intent_with_seller_supported_targets(
+                        self._agent_intent_with(
+                            intent,
+                            product_query=extracted[0],
+                            quantity=extracted[1],
+                        ),
+                        message,
+                        session,
+                        pending_slot_completion=False,
+                    )
+                    product = str(
+                        grounded_extraction.product_query or ""
+                    ).strip()
+            if not product:
+                return False
+            product = await self._qualified_pending_product_query(
+                pending.product_query,
+                product,
+                narrowing_required=pending.candidate_narrowing_required,
+            )
+            quantity = intent.quantity if intent.quantity > 0 else pending.quantity
+            await self._orchestrator.cancel_sku_change(sender)
+            if pending.scope == "requirement":
+                if pending.action == "add":
+                    result = await self._orchestrator.add_requirement_sku(
+                        sender, product, quantity
+                    )
+                else:
+                    result = await self._orchestrator.replace_requirement_sku(
+                        sender,
+                        pending.source_line_id or "",
+                        product,
+                        quantity,
+                    )
+            elif pending.action == "add":
+                result = await self._orchestrator.add_sku(sender, product, quantity)
+            else:
+                result = await self._orchestrator.replace_sku(
+                    sender,
+                    pending.source_line_id or "",
+                    product,
+                    quantity,
+                )
+            await self._send_sku_change_result(sender, result)
+            return True
+
+        if intent.action in {"add_sku", "replace_sku"}:
+            # A complete newer instruction supersedes the whole unconfirmed operation,
+            # but a complete product answer to an outstanding add/replace confirmation
+            # retains that operation's target. A model can correctly classify a concise
+            # answer such as ``Microsoft 365 E7 for one licence`` as requirement capture;
+            # treating it as an unrelated add would silently lose replacement semantics.
+            grounded = self._intent_with_seller_supported_targets(
+                intent,
+                message,
+                session,
+                pending_slot_completion=False,
+            )
+            if not self._is_assertive_commercial_instruction(
+                message,
+                grounded,
+                session,
+                pending_slot_completion=False,
+            ):
+                return False
+            await self._orchestrator.cancel_sku_change(sender)
+            await self._execute_agent_intent(
+                sender,
+                grounded,
+                original_message=message,
+            )
+            return True
+
         extracted = await self._extract_single_turn_requirement(message)
         product = str(getattr(intent, "product_query", "") or "").strip()
         quantity = int(getattr(intent, "quantity", -1) or -1)
         if extracted is not None:
             extracted_product, extracted_quantity, _clarification = extracted
-            product = product or extracted_product
+            grounded_extraction = self._intent_with_seller_supported_targets(
+                self._agent_intent_with(
+                    intent,
+                    product_query=extracted_product,
+                    quantity=extracted_quantity,
+                ),
+                message,
+                session,
+                pending_slot_completion=False,
+            )
+            product = product or str(grounded_extraction.product_query or "").strip()
             if quantity <= 0:
-                quantity = extracted_quantity
+                quantity = grounded_extraction.quantity
         if not product:
             return False
         if quantity <= 0:
             quantity = pending.quantity
+        product = await self._qualified_pending_product_query(
+            pending.product_query,
+            product,
+            narrowing_required=pending.candidate_narrowing_required,
+        )
 
         if pending.scope == "requirement":
             if pending.action == "add":
@@ -1810,6 +4527,30 @@ class WhatsAppWebhookService:
         await self._send_sku_change_result(sender, result)
         return True
 
+    async def _qualified_pending_product_query(
+        self,
+        original_query: str,
+        supplied_product: str,
+        *,
+        narrowing_required: bool,
+    ) -> str:
+        """Keep a complete replacement title independent of an older broad query.
+
+        A qualifier such as ``Plan 2`` needs the earlier family name to become safe,
+        while a complete catalogue title such as ``Microsoft 365 E7`` must replace the
+        earlier query instead of becoming an impossible string such as
+        ``Copilot Microsoft 365 E7``. Exact catalogue confidence is deterministic and
+        therefore safer than guessing completeness from word count.
+        """
+
+        product = " ".join(supplied_product.split()).strip()
+        if not narrowing_required or not product:
+            return product
+        candidates = await self._orchestrator.catalog_candidates(product)
+        if any(candidate.confidence == 100 for candidate in candidates):
+            return product
+        return combine_product_qualifier(original_query, product)
+
     async def _show_saved_session_choice(
         self,
         sender: str,
@@ -1826,11 +4567,13 @@ class WhatsAppWebhookService:
                 question=question,
             ),
         )
+        line_count = len(session.estate.lines)
+        line_summary = "one SKU line" if line_count == 1 else f"{line_count} SKU lines"
         await self._send_text(
             sender,
             "*SkySecure Microsoft Licensing Advisor*\n\n"
             "Welcome back. I found an active saved draft containing "
-            f"{len(session.estate.lines)} SKU line(s) and "
+            f"{line_summary} and "
             f"{session.estate.total_renewal_quantity:,} licences. I have not added, removed, "
             "or repriced anything.\n\n"
             f"{question} Reply *Resume* or *Start fresh*.",
@@ -1864,11 +4607,16 @@ class WhatsAppWebhookService:
     def _quantity_from_reply(cls, message: str) -> int:
         if not cls._is_quantity_only_reply(message):
             return -1
-        match = re.search(r"\b(\d+)\b", message)
-        return int(match.group(1)) if match else -1
+        values = cls._seller_quantity_values(message)
+        return next(iter(values)) if len(values) == 1 else -1
 
     @staticmethod
-    def _product_from_reply(message: str, intent: AgentIntent) -> str:
+    def _product_from_reply(
+        message: str,
+        intent: AgentIntent,
+        *,
+        allow_single_token: bool = False,
+    ) -> str:
         """Return a product-like answer, excluding operation words such as bare 'SKU'."""
 
         interpreted = str(getattr(intent, "product_query", "") or "").strip()
@@ -1924,7 +4672,9 @@ class WhatsAppWebhookService:
             has_marker = any(marker in normalized for marker in markers)
             has_code = bool(re.search(r"\b(?:m?e\d+|p\d+|f\d+|o365|m365)\b", normalized))
             if has_marker or has_code or (
-                index == 0 and bool(interpreted) and len(meaningful) >= 2
+                index == 0 and bool(interpreted) and len(meaningful) >= 1
+            ) or (
+                allow_single_token and len(meaningful) == 1
             ):
                 cleaned = re.sub(
                     r"^(?:please\s+)?(?:i\s+)?(?:want|need)\s+(?:to\s+)?"
@@ -1935,6 +4685,108 @@ class WhatsAppWebhookService:
                 ).strip(" .")
                 return cleaned or candidate.strip()
         return ""
+
+    async def _direct_product_slot_query(
+        self,
+        message: str,
+        intent: AgentIntent,
+    ) -> str:
+        """Return a catalogue-backed direct answer to a visible product question.
+
+        The seller's text is authoritative here.  A hostile or mistaken model label must
+        not reject an exact title, while a narrative such as "I watched a video about
+        Power BI Pro yesterday" must not silently fill the product slot.
+        """
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if (
+            not normalized
+            or normalized in AFFIRMATIVE_REPLIES
+            or normalized in UNCERTAIN_REPLIES
+            or normalized in CANCEL_REPLIES
+            or "?" in message
+            or self._is_licensing_question_message(message)
+        ):
+            return ""
+        explicit_selection = re.fullmatch(
+            r"(?:(?:please\s+)?(?:choose|select|use|pick|add|include)\s+(?:the\s+)?|"
+            r"(?:the\s+)?(?:product|sku|plan|licen[cs]e)\s+"
+            r"(?:is|should\s+be)\s+|(?:it|this)\s+should\s+be\s+)(?P<product>.+)",
+            normalized,
+        )
+        explicit_product = (
+            explicit_selection.group("product").strip()
+            if explicit_selection is not None
+            else ""
+        )
+        narrative_predicate = re.search(
+            r"\b(?:is|are|was|were|has|have|had|seems?|looks?|costs?|priced?|"
+            r"includes?|supports?|contains?|requires?|expensive|cheap|costly|"
+            r"available|unavailable|better|worse)\b",
+            explicit_product or normalized,
+        )
+        if narrative_predicate:
+            return ""
+        if re.search(
+            r"\b(?:watched|read|heard|saw|discussed|mentioned|talked|spoke|"
+            r"video|article|yesterday|last\s+(?:week|month|year))\b",
+            normalized,
+        ) or re.match(
+            r"^(?:(?:the\s+)?(?:customer|client|seller|user)|he|she|they)\s+"
+            r"(?:said|says|asked|asks|mentioned|mentions|selected|chose|picked)\b",
+            normalized,
+        ):
+            return ""
+
+        seller_query = re.sub(
+            r"^(?:please\s+)?(?:(?:i|we)\s+(?:want|need|would\s+like)\s+(?:to\s+)?)?"
+            r"(?:(?:choose|select|use|pick|add|include)\s+)?(?:the\s+)?",
+            "",
+            message.strip(),
+            flags=re.IGNORECASE,
+        ).strip(" .")
+        interpreted = str(getattr(intent, "product_query", "") or "").strip()
+        candidates: list[str] = []
+        if explicit_product:
+            candidates.append(explicit_product)
+        if interpreted and self._seller_product_role_is_supported(
+            message,
+            interpreted,
+            str(getattr(intent, "action", "") or ""),
+        ):
+            candidates.append(interpreted)
+        candidates.extend([seller_query, message.strip()])
+        seen: set[str] = set()
+        for query in candidates:
+            key = normalize_product_title(query)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            matches = await self._orchestrator.catalog_candidates(query)
+            if matches:
+                return query
+        return ""
+
+    @staticmethod
+    def _is_non_value_slot_reply(message: str) -> bool:
+        """Reject acknowledgements/refusals that cannot be a free-text field value."""
+
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        return bool(
+            normalized in AFFIRMATIVE_REPLIES
+            or normalized in UNCERTAIN_REPLIES
+            or normalized in CANCEL_REPLIES
+            or re.fullmatch(
+                r"(?:yes|yeah|yep|no|nope|ok|okay|sure|thanks?|thank\s+you|"
+                r"cancel(?:\s+(?:it|this|that|please))?|please\s+cancel|"
+                r"never\s*mind)",
+                normalized,
+            )
+        )
 
     @staticmethod
     def _change_dimension(message: str) -> Literal["sku", "quantity", "disposition", "none"]:
@@ -2012,12 +4864,14 @@ class WhatsAppWebhookService:
     def _pending_lines(
         session: WorkflowSession,
         scope: Literal["none", "requirement", "scenario"],
+        scenario_type: ScenarioType | None = None,
     ) -> tuple[list, bool]:
         requirement = scope == "requirement"
         if requirement and session.estate is not None:
             return list(session.estate.lines), True
-        if session.active_scenario is not None:
-            scenario = session.scenarios.get(session.active_scenario)
+        selected_scenario = scenario_type or session.active_scenario
+        if selected_scenario is not None:
+            scenario = session.scenarios.get(selected_scenario)
             if scenario is not None:
                 return [line for line in scenario.lines if line.proposed_quantity > 0], False
         return [], requirement
@@ -2029,12 +4883,36 @@ class WhatsAppWebhookService:
         message: str,
         intent: AgentIntent,
     ) -> str:
-        lines, requirement = self._pending_lines(session, pending.scope)
+        lines, requirement = self._pending_lines(
+            session,
+            pending.scope,
+            pending.scenario_type,
+        )
         available = {line.line_id for line in lines}
-        for supplied in (
-            pending.source_line_id,
-            str(getattr(intent, "line_id", "") or "").strip().upper(),
-        ):
+        if pending.scope != "requirement" and pending.source_line_id:
+            selected_scenario = pending.scenario_type or session.active_scenario
+            scenario = (
+                session.scenarios.get(selected_scenario)
+                if selected_scenario is not None
+                else None
+            )
+            if scenario is not None and any(
+                line.line_id == pending.source_line_id for line in scenario.lines
+            ):
+                # Preserve an already-grounded source row even when that proposal renders it
+                # at quantity zero. It remains a real auditable row and is a valid source for
+                # a seller-requested replacement.
+                return pending.source_line_id
+        current_line = str(getattr(intent, "line_id", "") or "").strip().upper()
+        explicit_message_lines = [
+            match.upper()
+            for match in re.findall(r"\bL\d+\b", message, flags=re.IGNORECASE)
+            if match.upper() in available
+        ]
+        # A complete newer instruction such as ``Replace L2 with ...`` owns its explicit
+        # target. The saved target is only a fallback for a true slot answer such as a bare
+        # replacement product or quantity.
+        for supplied in (current_line, *explicit_message_lines, pending.source_line_id):
             if supplied in available:
                 return supplied
         inferred = self._line_reference_from_message(
@@ -2053,13 +4931,110 @@ class WhatsAppWebhookService:
             return inferred
         return lines[0].line_id if len(lines) == 1 else ""
 
+    def _pending_target_conflicts_with_current_turn(
+        self,
+        pending: PendingDialogue,
+        session: WorkflowSession,
+        message: str,
+        intent: AgentIntent,
+    ) -> bool:
+        """Detect a complete same-action instruction that supersedes saved slot context.
+
+        Short answers inherit the visible question. A newer complete action must not inherit
+        an older line, proposal, product, quantity, or disposition merely because the model
+        assigned both turns the same action label.
+        """
+
+        if pending.operation == "none" or intent.action != pending.operation:
+            return False
+
+        lines, _ = self._pending_lines(
+            session,
+            pending.scope,
+            pending.scenario_type,
+        )
+        available_lines = {line.line_id for line in lines}
+        current_line = str(getattr(intent, "line_id", "") or "").strip().upper()
+        explicit_message_lines = {
+            value.upper()
+            for value in re.findall(r"\bL\d+\b", message, flags=re.IGNORECASE)
+            if value.upper() in available_lines
+        }
+        current_lines = ({current_line} if current_line in available_lines else set()) | (
+            explicit_message_lines
+        )
+        if (
+            pending.source_line_id in available_lines
+            and current_lines
+            and pending.source_line_id not in current_lines
+        ):
+            return True
+
+        current_scenario = self._seller_scenario_reference(message)
+        if (
+            pending.scenario_type is not None
+            and current_scenario is not None
+            and current_scenario != pending.scenario_type
+        ):
+            return True
+
+        normalized = " ".join(message.casefold().strip(" ?!.,").split())
+        explicit_action = bool(
+            re.match(
+                r"^(?:please\s+)?(?:(?:i|we)\s+(?:want|need|would\s+like)\s+"
+                r"(?:to\s+)?)?(?:add|include|replace|change|update|set|remove|"
+                r"delete|retain|migrate|build|prepare)\b",
+                normalized,
+            )
+        )
+        if not explicit_action:
+            return False
+
+        current_product = str(getattr(intent, "product_query", "") or "").strip()
+        if (
+            pending.product_query
+            and current_product
+            and normalize_product_title(current_product)
+            != normalize_product_title(pending.product_query)
+        ):
+            return True
+
+        current_quantity = int(getattr(intent, "quantity", -1) or -1)
+        if (
+            pending.quantity >= 0
+            and current_quantity >= 0
+            and current_quantity != pending.quantity
+        ):
+            return True
+        current_copilot = int(getattr(intent, "copilot_quantity", -1) or -1)
+        if (
+            pending.copilot_quantity >= 0
+            and current_copilot >= 0
+            and current_copilot != pending.copilot_quantity
+        ):
+            return True
+        current_disposition = str(
+            getattr(intent, "disposition", "none") or "none"
+        )
+        if (
+            pending.disposition != "none"
+            and current_disposition != "none"
+            and current_disposition != pending.disposition
+        ):
+            return True
+        return False
+
     def _pending_line_title(
         self,
         pending: PendingDialogue,
         session: WorkflowSession,
         line_id: str,
     ) -> str:
-        lines, requirement = self._pending_lines(session, pending.scope)
+        lines, requirement = self._pending_lines(
+            session,
+            pending.scope,
+            pending.scenario_type,
+        )
         for line in lines:
             if line.line_id == line_id:
                 return line.display_title if requirement else line.sku_title
@@ -2096,6 +5071,111 @@ class WhatsAppWebhookService:
         if current is not None and current.pending_dialogue == pending:
             await self._orchestrator.clear_pending_dialogue(sender)
 
+    @staticmethod
+    def _commercial_state_snapshot(session: WorkflowSession) -> dict:
+        """Return state whose change proves a pending operation may have committed."""
+
+        return session.model_dump(
+            mode="json",
+            exclude={
+                "pending_dialogue",
+                "updated_at",
+                "processed_message_ids",
+                "inflight_message_ids",
+                "failure_notified_message_ids",
+            },
+        )
+
+    @staticmethod
+    def _committed_commercial_state_snapshot(session: WorkflowSession) -> dict:
+        """Return committed state while ignoring the two transient question stacks."""
+
+        return session.model_dump(
+            mode="json",
+            exclude={
+                "pending_dialogue",
+                "pending_sku_change",
+                "updated_at",
+                "processed_message_ids",
+                "inflight_message_ids",
+                "failure_notified_message_ids",
+            },
+        )
+
+    async def _resolve_pending_dialogue_preserving_sku(
+        self,
+        sender: str,
+        message: str,
+        session: WorkflowSession,
+    ) -> bool:
+        """Resolve a newer read-only question without losing an older SKU choice.
+
+        A seller may ask a Microsoft product question while an add/replace candidate list is
+        still waiting for confirmation. If the official answer requires clarification, both
+        pieces of context are valid: the clarification must receive the next reply, while the
+        uncommitted SKU choice must remain available afterwards. A real commercial mutation
+        or a newer SKU choice always supersedes the older choice.
+        """
+
+        pending_sku = session.pending_sku_change
+        pending_dialogue = session.pending_dialogue
+        if (
+            pending_sku is None
+            or pending_dialogue is None
+            or pending_dialogue.detail_value != "official_product_clarification"
+        ):
+            return False
+        candidate_reference = self._single_candidate_number(message) is not None or any(
+            normalize_product_title(candidate.sku_title)
+            in normalize_product_title(message)
+            for candidate in pending_sku.candidates
+            if normalize_product_title(candidate.sku_title)
+        )
+        if candidate_reference:
+            await self._repeat_or_release_pending(
+                sender,
+                pending_dialogue,
+                "The newer clarification is still active, so I did not apply that option to "
+                "the earlier hidden SKU choice. " + pending_dialogue.question,
+            )
+            latest = await self._orchestrator.get_session(sender)
+            if latest is not None and latest.pending_dialogue is None:
+                await self._send_sku_change_result(
+                    sender,
+                    SkuChangeResult(
+                        state="confirmation_required",
+                        confirmation=pending_sku,
+                    ),
+                )
+            return True
+        before = self._committed_commercial_state_snapshot(session)
+        handled = await self._resolve_pending_dialogue(sender, message, session)
+        if not handled:
+            return False
+        latest = await self._orchestrator.get_session(sender)
+        if (
+            latest is not None
+            and self._committed_commercial_state_snapshot(latest) == before
+            and (
+                latest.pending_sku_change is None
+                or latest.pending_sku_change.id == pending_sku.id
+            )
+        ):
+            await self._orchestrator.restore_pending_sku_change(
+                sender,
+                pending_sku,
+                preserve_pending_dialogue=latest.pending_dialogue is not None,
+            )
+            if latest.pending_dialogue is None:
+                await self._send_sku_change_result(
+                    sender,
+                    SkuChangeResult(
+                        state="confirmation_required",
+                        confirmation=pending_sku,
+                    ),
+                )
+        return True
+
     async def _execute_completed_pending(
         self,
         sender: str,
@@ -2103,8 +5183,315 @@ class WhatsAppWebhookService:
         intent: AgentIntent,
         message: str,
     ) -> None:
+        # The saved question is now complete. Remove it before dispatch so guarded
+        # scenario operations do not mistake the operation being completed for a
+        # separate unfinished edit. Per-seller dispatch is serialized; if execution
+        # fails before changing domain state, restore this exact question. An output/network
+        # failure after a successful mutation must never re-arm an already-applied action.
+        current = await self._orchestrator.get_session(sender)
+        cleared = current is not None and current.pending_dialogue == pending
+        before_state = (
+            self._commercial_state_snapshot(current) if current is not None else None
+        )
+        if cleared:
+            await self._orchestrator.clear_pending_dialogue(sender)
+        try:
+            await self._execute_agent_intent(
+                sender,
+                intent,
+                original_message=message,
+                pending_slot_completion=True,
+            )
+        except Exception:
+            latest = await self._orchestrator.get_session(sender)
+            unchanged = bool(
+                latest is not None
+                and before_state is not None
+                and self._commercial_state_snapshot(latest) == before_state
+            )
+            if (
+                cleared
+                and unchanged
+                and latest is not None
+                and latest.pending_dialogue is None
+                and latest.pending_sku_change is None
+            ):
+                # A newly-created fuzzy selection is newer state and must never be cleared
+                # by restoring the older question.
+                await self._orchestrator.set_pending_dialogue(sender, pending)
+            raise
+
+    async def _execute_conversational_preserving_pending(
+        self,
+        sender: str,
+        pending: PendingDialogue,
+        intent: AgentIntent,
+        message: str,
+    ) -> None:
+        """Answer an interruption without silently discarding an unfinished operation."""
+
         await self._execute_agent_intent(sender, intent, original_message=message)
-        await self._clear_pending_if_unchanged(sender, pending)
+        current = await self._orchestrator.get_session(sender)
+        official_product_question = (
+            intent.action == "answer_question"
+            and str(getattr(intent, "detail_label", "")).strip().casefold()
+            == "official_product_question"
+        )
+        if current is not None and not (
+            official_product_question and current.pending_dialogue is not None
+        ):
+            # Ordinary read-only interruptions preserve the commercial question already in
+            # progress. Official product research is the exception when it creates a newer,
+            # required clarification: that question describes the seller's latest turn and
+            # must not be overwritten by stale commercial context.
+            if current.pending_dialogue != pending:
+                await self._orchestrator.set_pending_dialogue(sender, pending)
+            attempts = await self._orchestrator.record_pending_dialogue_failure(sender)
+            if attempts >= 2:
+                await self._orchestrator.clear_pending_dialogue(sender)
+                await self._send_text(
+                    sender,
+                    "I closed the earlier unfinished question after two interruptions so it "
+                    "will not keep repeating or intercept a later reply. No licensing or "
+                    "commercial value was changed; restate the change when you want to "
+                    "continue it.",
+                )
+                return
+            await self._send_text(
+                sender,
+                "The earlier proposal change is still waiting for this detail: "
+                + pending.question,
+            )
+
+    async def _pending_reply_is_compatible(
+        self,
+        pending: PendingDialogue,
+        session: WorkflowSession,
+        message: str,
+        intent: AgentIntent,
+    ) -> bool:
+        """Return whether this turn can safely fill the pending operation's next slot.
+
+        This deterministic compatibility check is deliberately independent of the model's
+        top-level action. A short answer such as ``51`` must still fill a requested quantity
+        even if the language model labels it as an acknowledgement. Conversely, a complete
+        new commercial action must not inherit an older add/replace operation.
+        """
+
+        operation = pending.operation
+        if operation == "none":
+            return False
+        pending_action_terms = {
+            "add_sku": r"(?:add|include|use)",
+            "replace_sku": r"(?:replace|switch|swap|change|use)",
+            "set_quantity": r"(?:change|set|update|use)",
+            "set_copilot": r"(?:change|set|update|use)",
+            "set_disposition": r"(?:retain|remove|delete|migrate|include)",
+            "build_scenario": r"(?:build|prepare|use|select|choose)",
+            "set_term": r"(?:set|change|use|apply)",
+            "set_billing": r"(?:set|change|use|apply)",
+            "set_segment": r"(?:set|change|use|apply)",
+            "set_currency": r"(?:set|change|use|convert)",
+            "add_comment": r"(?:add|include|use)",
+        }
+        pending_evidence = pending_action_terms.get(operation, r"(?:set|change|use)")
+        direct_pending_request = bool(
+            re.search(rf"\b{pending_evidence}\b", message, flags=re.IGNORECASE)
+            and self._is_direct_action_request(message, pending_evidence)
+            and not self._is_negated_action(message, pending_evidence)
+        )
+        normalized_for_semantics = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        informational_or_hypothetical = bool(
+            ("?" in message)
+            or re.match(
+                r"^(?:who|what|which|where|when|why|how|can|could|would|should|"
+                r"do|does|did|is|are|will|may|if|unless|whether|suppose|"
+                r"supposing|assuming|imagine|for example|example)\b",
+                normalized_for_semantics,
+            )
+            or re.search(
+                r"\b(?:want|need|would\s+like)\s+to\s+know\b|"
+                r"\b(?:want|need|would\s+like)\s+(?:a\s+)?"
+                r"(?:pricing|price|quote|cost)\b|"
+                r"\b(?:for example|as an example|hypothetically)\b",
+                normalized_for_semantics,
+            )
+            or re.match(
+                r"^(?:(?:the\s+)?(?:customer|client|seller|user)|he|she|they)\s+"
+                r"(?:said|says|asked|asks|mentioned|mentions|requested|requests?)\b",
+                normalized_for_semantics,
+            )
+            or re.search(
+                r"\b(?:no\s+need(?:\s+(?:to|for))?|need\s+not|"
+                r"not\s+(?:needed|required)|do\s+not\s+(?:need|want|require)|"
+                r"don't\s+(?:need|want|require)|dont\s+(?:need|want|require))\b",
+                normalized_for_semantics,
+            )
+            or re.search(
+                r"\b(?:leave|keep)\b.{0,60}\b(?:unchanged|as[ -]?is|the\s+same)\b",
+                normalized_for_semantics,
+            )
+            or re.search(
+                r"\b(?:but\s+)?not\s+(?:to\s+)?-?\d+(?:\.\d+)?\b",
+                normalized_for_semantics,
+            )
+        )
+        if informational_or_hypothetical and not direct_pending_request:
+            return False
+        if self._pending_target_conflicts_with_current_turn(
+            pending,
+            session,
+            message,
+            intent,
+        ):
+            return False
+        normalized = " ".join(message.casefold().strip(" ?!.,").split())
+        quantity = self._quantity_from_reply(message)
+        same_action = intent.action == operation
+        commercial_actions = FINALIZATION_CORRECTION_ACTIONS | {
+            "capture_requirement",
+            "compare",
+            "compare_enterprise_options",
+            "confirm_matches",
+            "confirm_sku",
+            "confirm_validation",
+            "finalize",
+            "reject_validation",
+            "reset_requirement",
+        }
+        distinct_commercial_action = (
+            intent.action in commercial_actions and not same_action
+        )
+        if pending.awaiting_slot == "scenario":
+            # A deterministic proposal token such as ``ME5`` is authoritative for the
+            # exact slot that was just requested, even if the stateless model labels the
+            # short reply as a new requirement. A complete action that merely mentions
+            # ME5 is newer intent and must supersede the stale operation.
+            return self._scenario_from_bare_reply(message) is not None
+        if pending.awaiting_slot == "line":
+            if distinct_commercial_action:
+                return False
+            lines, requirement = self._pending_lines(
+                session,
+                pending.scope,
+                pending.scenario_type,
+            )
+            return self._line_reference_from_message(
+                lines,
+                message,
+                requirement=requirement,
+            ) is not None
+        if pending.awaiting_slot == "quantity":
+            # A bare numeric answer belongs to the quantity question in front of the
+            # seller. This deterministic fact outranks a model label such as set_copilot;
+            # complete new instructions are not quantity-only and therefore do not enter
+            # this branch.
+            if quantity >= 0:
+                return True
+            if distinct_commercial_action and not (
+                intent.action == "capture_requirement"
+                and not str(getattr(intent, "product_query", "") or "").strip()
+            ):
+                return False
+            # The model's numeric field is not evidence that the seller supplied that
+            # value. Only the strict, full-message quantity grammar above may fill the
+            # visible slot; narrative text such as "15 was the old amount" must not.
+            return False
+        if pending.awaiting_slot == "product":
+            return bool(await self._direct_product_slot_query(message, intent))
+        if pending.awaiting_slot == "disposition":
+            if distinct_commercial_action:
+                return False
+            return bool(
+                re.search(
+                    r"\b(?:retain|remove|migrate|include|included|replace)\b",
+                    normalized,
+                )
+            ) or same_action
+        if operation == "choose_change":
+            if distinct_commercial_action:
+                return False
+            return self._change_dimension(message) != "none"
+        if operation == "add_sku":
+            if pending.product_query and pending.quantity <= 0:
+                return quantity >= 0
+            if not pending.product_query:
+                return intent.action in {"add_sku", "capture_requirement", "clarify"} and bool(
+                    self._product_from_reply(message, intent)
+                )
+            return same_action
+        if operation == "replace_sku":
+            if not pending.source_line_id:
+                lines, requirement = self._pending_lines(
+                    session,
+                    pending.scope,
+                    pending.scenario_type,
+                )
+                if self._line_reference_from_message(
+                    lines,
+                    message,
+                    requirement=requirement,
+                ) is not None:
+                    return True
+            if not pending.product_query:
+                return intent.action in {"replace_sku", "capture_requirement", "clarify"} and bool(
+                    self._product_from_reply(message, intent)
+                )
+            return same_action
+        if operation in {"set_quantity", "set_copilot"}:
+            return quantity >= 0 or same_action
+        if operation == "set_disposition":
+            return bool(
+                re.search(
+                    r"\b(?:retain|remove|migrate|include|included|replace)\b",
+                    normalized,
+                )
+            ) or same_action
+        if operation == "build_scenario":
+            if pending.awaiting_slot == "scenario":
+                return self._scenario_from_bare_reply(message) is not None
+            return self._scenario_from_request(intent, message) is not None
+        if operation in {
+            "set_term",
+            "set_billing",
+            "set_segment",
+            "set_currency",
+            "add_comment",
+        }:
+            # Never convert an information question, greeting, acknowledgement, or
+            # unrelated turn into a seller comment or commercial attribute. Only a
+            # same-action extraction, or an unambiguous non-question clarification,
+            # may fill these free-text slots.
+            if self._is_non_value_slot_reply(message):
+                return False
+            if self._is_licensing_question_message(message):
+                return False
+            if operation == "set_segment":
+                return bool(
+                    re.fullmatch(
+                        r"(?:commercial|education|academic|government|non[ -]?profit|charity)",
+                        normalized,
+                    )
+                )
+            if operation == "set_term":
+                return bool(
+                    re.fullmatch(
+                        r"(?:p\d+[ymd]|annual|yearly|one\s+year|\d+\s+(?:months?|years?))",
+                        normalized,
+                    )
+                )
+            if operation == "set_billing":
+                return bool(re.fullmatch(r"(?:annual|yearly|monthly)", normalized))
+            if operation == "set_currency":
+                return bool(re.fullmatch(r"(?:inr|usd|eur|gbp)", normalized))
+            if operation == "add_comment":
+                return bool(message.strip()) and len(normalized.split()) >= 2
+            return same_action
+        if operation in {"request_recommendation", "compare_enterprise_options"}:
+            return same_action
+        return False
 
     async def _resolve_structured_pending_dialogue(
         self,
@@ -2124,6 +5511,35 @@ class WhatsAppWebhookService:
             dimension = self._change_dimension(message)
             line_id = self._pending_line_id(pending, session, message, interpreted)
             title = self._pending_line_title(pending, session, line_id)
+            if dimension in {"sku", "quantity", "disposition"} and not line_id:
+                next_operation = {
+                    "sku": "replace_sku",
+                    "quantity": "set_quantity",
+                    "disposition": "set_disposition",
+                }[dimension]
+                verb = {
+                    "sku": "replace",
+                    "quantity": "change",
+                    "disposition": "update",
+                }[dimension]
+                question = (
+                    f"Which licence in the current proposal would you like to {verb}? "
+                    "Reply with its product name."
+                )
+                await self._orchestrator.set_pending_dialogue(
+                    sender,
+                    pending.model_copy(
+                        update={
+                            "operation": next_operation,
+                            "awaiting_slot": "line",
+                            "source_line_id": "",
+                            "question": question,
+                            "failed_attempts": 0,
+                        }
+                    ),
+                )
+                await self._send_text(sender, question)
+                return True
             if dimension == "sku":
                 replacement = self._product_from_reply(message, interpreted)
                 if replacement:
@@ -2144,6 +5560,7 @@ class WhatsAppWebhookService:
                     pending.model_copy(
                         update={
                             "operation": "replace_sku",
+                            "awaiting_slot": "product",
                             "source_line_id": line_id,
                             "question": question,
                             "failed_attempts": 0,
@@ -2176,6 +5593,7 @@ class WhatsAppWebhookService:
                     pending.model_copy(
                         update={
                             "operation": "set_quantity",
+                            "awaiting_slot": "quantity",
                             "source_line_id": line_id,
                             "question": question,
                             "failed_attempts": 0,
@@ -2193,11 +5611,33 @@ class WhatsAppWebhookService:
                     disposition = next(
                         (
                             value
-                            for value in ("retain", "remove", "migrate", "included")
+                            for value in (
+                                "retain",
+                                "remove",
+                                "migrate",
+                                "included",
+                                "replace",
+                            )
                             if re.search(rf"\b{value}\b", normalized)
                         ),
                         "none",
                     )
+                if disposition == "replace":
+                    question = f"Which Microsoft product should replace {title}?"
+                    await self._orchestrator.set_pending_dialogue(
+                        sender,
+                        pending.model_copy(
+                            update={
+                                "operation": "replace_sku",
+                                "awaiting_slot": "product",
+                                "source_line_id": line_id,
+                                "question": question,
+                                "failed_attempts": 0,
+                            }
+                        ),
+                    )
+                    await self._send_text(sender, question)
+                    return True
                 if disposition != "none":
                     completed = self._agent_intent_with(
                         interpreted,
@@ -2215,6 +5655,7 @@ class WhatsAppWebhookService:
                     pending.model_copy(
                         update={
                             "operation": "set_disposition",
+                            "awaiting_slot": "disposition",
                             "source_line_id": line_id,
                             "question": question,
                             "failed_attempts": 0,
@@ -2227,15 +5668,33 @@ class WhatsAppWebhookService:
             return True
 
         scenario_type = pending.scenario_type
-        selecting_scenario = (
-            scenario_type is None
-            and pending.question.casefold().startswith("which proposal should i update")
-        )
+        selecting_scenario = pending.awaiting_slot == "scenario"
         if selecting_scenario:
-            scenario_type = self._scenario_from_request(interpreted, message)
+            scenario_type = self._scenario_from_bare_reply(message)
             if scenario_type is None:
                 await self._repeat_or_release_pending(sender, pending, pending.question)
                 return True
+        elif scenario_type is None and operation in {
+            "replace_sku",
+            "set_quantity",
+            "set_copilot",
+            "set_disposition",
+            "build_scenario",
+        }:
+            # A seller may answer a different missing slot first (for example, "ME5"
+            # while the target line is still unknown). Preserve that valid information
+            # and continue asking only for the detail that remains missing.
+            scenario_type = self._scenario_from_request(interpreted, message)
+
+        scenario_progressed = scenario_type != pending.scenario_type
+        if scenario_progressed:
+            # Persist the seller's unambiguous scenario answer before resolving the next
+            # slot.  This makes the selected proposal authoritative for line-name lookup and
+            # lets completed operations clear the exact pending object they consumed.
+            pending = pending.model_copy(
+                update={"scenario_type": scenario_type, "failed_attempts": 0}
+            )
+            await self._orchestrator.set_pending_dialogue(sender, pending)
 
         line_id = pending.source_line_id
         selecting_line = (
@@ -2243,9 +5702,59 @@ class WhatsAppWebhookService:
             and not line_id
         )
         if operation in {"replace_sku", "set_quantity", "set_disposition"}:
-            line_id = self._pending_line_id(pending, session, message, interpreted)
+            # A bare scenario answer (for example ``ME5``) names the proposal, not its
+            # synthetic BASE line. Never consume that token as a previously *missing* line,
+            # but retain a source line that the seller already grounded in the saved
+            # operation before the proposal question was asked.
+            line_id = (
+                ""
+                if selecting_scenario and not pending.source_line_id
+                else self._pending_line_id(pending, session, message, interpreted)
+            )
             if not line_id:
-                await self._repeat_or_release_pending(sender, pending, pending.question)
+                target_lines, requirement_scope = self._pending_lines(
+                    session,
+                    pending.scope,
+                    scenario_type,
+                )
+                verb = {
+                    "replace_sku": "replace",
+                    "set_quantity": "change",
+                    "set_disposition": "update",
+                }[operation]
+                target_name = (
+                    "the current requirement"
+                    if requirement_scope
+                    else (
+                        scenario_type.label
+                        if scenario_type is not None
+                        else "the current proposal"
+                    )
+                )
+                choices = "; ".join(
+                    f"{line.line_id} ({line.display_title if requirement_scope else line.sku_title})"
+                    for line in target_lines[:8]
+                )
+                question = (
+                    f"Which licence in {target_name} would you like to {verb}? "
+                    "Reply with its product name"
+                    + (f": {choices}." if choices else ".")
+                )
+                updated = pending.model_copy(
+                    update={
+                        "scenario_type": scenario_type,
+                        "awaiting_slot": "line",
+                        "question": question[:500],
+                        "failed_attempts": 0 if scenario_progressed else pending.failed_attempts,
+                    }
+                )
+                if scenario_progressed:
+                    await self._orchestrator.set_pending_dialogue(sender, updated)
+                    await self._send_text(sender, question[:500])
+                else:
+                    await self._repeat_or_release_pending(
+                        sender, updated, question[:500]
+                    )
                 return True
 
         quantity = pending.quantity
@@ -2256,9 +5765,21 @@ class WhatsAppWebhookService:
             quantity = int(interpreted.quantity)
 
         product = pending.product_query
-        reply_product = self._product_from_reply(message, interpreted)
-        if reply_product and not selecting_scenario and not (
-            selecting_line and bool(product)
+        reply_product = (
+            await self._direct_product_slot_query(message, interpreted)
+            if pending.awaiting_slot == "product"
+            else self._product_from_reply(message, interpreted)
+        )
+        source_only_replacement_reply = bool(
+            operation == "replace_sku"
+            and selecting_line
+            and not re.search(r"\b(?:with|by)\b", message, flags=re.IGNORECASE)
+        )
+        if (
+            reply_product
+            and not selecting_scenario
+            and not source_only_replacement_reply
+            and not (selecting_line and bool(product))
         ):
             product = reply_product
 
@@ -2286,6 +5807,9 @@ class WhatsAppWebhookService:
                     "quantity": quantity,
                     "scenario_type": scenario_type,
                     "question": question,
+                    "awaiting_slot": (
+                        "product" if not product else "quantity"
+                    ),
                     "failed_attempts": 0 if progressed else pending.failed_attempts,
                 }
             )
@@ -2298,9 +5822,35 @@ class WhatsAppWebhookService:
 
         if operation == "replace_sku":
             if not product:
-                title = self._pending_line_title(pending, session, line_id)
+                title = self._pending_line_title(
+                    pending.model_copy(
+                        update={
+                            "source_line_id": line_id,
+                            "scenario_type": scenario_type,
+                        }
+                    ),
+                    session,
+                    line_id,
+                )
                 question = f"Which Microsoft product should replace {title}?"
-                await self._repeat_or_release_pending(sender, pending, question)
+                progressed = bool(
+                    line_id != pending.source_line_id
+                    or scenario_type != pending.scenario_type
+                )
+                updated = pending.model_copy(
+                    update={
+                        "source_line_id": line_id,
+                        "scenario_type": scenario_type,
+                        "awaiting_slot": "product",
+                        "question": question,
+                        "failed_attempts": 0 if progressed else pending.failed_attempts,
+                    }
+                )
+                if progressed:
+                    await self._orchestrator.set_pending_dialogue(sender, updated)
+                    await self._send_text(sender, question)
+                else:
+                    await self._repeat_or_release_pending(sender, updated, question)
                 return True
             completed = self._agent_intent_with(
                 interpreted,
@@ -2335,8 +5885,11 @@ class WhatsAppWebhookService:
             if reply_quantity >= 0:
                 copilot_quantity = reply_quantity
             elif copilot_quantity < 0:
-                copilot_quantity = int(
-                    getattr(interpreted, "copilot_quantity", -1) or -1
+                interpreted_copilot = getattr(interpreted, "copilot_quantity", -1)
+                copilot_quantity = (
+                    -1
+                    if interpreted_copilot is None or interpreted_copilot == ""
+                    else int(interpreted_copilot)
                 )
             if copilot_quantity < 0:
                 await self._repeat_or_release_pending(
@@ -2361,6 +5914,40 @@ class WhatsAppWebhookService:
             )
             if interpreted_disposition != "none":
                 disposition = interpreted_disposition  # type: ignore[assignment]
+            if disposition == "none":
+                normalized_disposition = " ".join(message.casefold().split())
+                disposition = next(
+                    (
+                        value
+                        for value in ("retain", "remove", "migrate", "included")
+                        if re.search(rf"\b{value}\b", normalized_disposition)
+                    ),
+                    "none",
+                )  # type: ignore[assignment]
+                if disposition == "none" and re.search(
+                    r"\binclude\b", normalized_disposition
+                ):
+                    disposition = "included"
+            if disposition == "none" and re.search(
+                r"\breplace\b",
+                " ".join(message.casefold().split()),
+            ):
+                title = self._pending_line_title(pending, session, line_id)
+                question = f"Which Microsoft product should replace {title}?"
+                await self._orchestrator.set_pending_dialogue(
+                    sender,
+                    pending.model_copy(
+                        update={
+                            "operation": "replace_sku",
+                            "awaiting_slot": "product",
+                            "source_line_id": line_id,
+                            "question": question,
+                            "failed_attempts": 0,
+                        }
+                    ),
+                )
+                await self._send_text(sender, question)
+                return True
             if disposition == "none":
                 await self._repeat_or_release_pending(
                     sender,
@@ -2402,6 +5989,9 @@ class WhatsAppWebhookService:
         }
         if operation in detail_fields:
             field = detail_fields[operation]
+            if self._is_non_value_slot_reply(message):
+                await self._repeat_or_release_pending(sender, pending, pending.question)
+                return True
             supplied = str(getattr(interpreted, field, "") or "").strip()
             detail = pending.detail_value or supplied or message.strip()
             if not detail:
@@ -2429,15 +6019,35 @@ class WhatsAppWebhookService:
             return False
         reply = " ".join(message.casefold().strip(" ?!.,").split())
         if pending.kind == "resume_session":
-            if reply in RESUME_REQUESTS:
+            if "?" not in message and (reply in CANCEL_REPLIES or re.fullmatch(
+                r"(?:cancel(?:\s+please)?|please\s+cancel|never\s*mind)",
+                reply,
+            )):
+                await self._orchestrator.clear_pending_dialogue(sender)
+                await self._send_text(
+                    sender,
+                    "Okay — I closed the resume choice. The saved draft remains unchanged. "
+                    "Send *Resume* or *Start fresh* whenever you want to continue.",
+                )
+                return True
+            if self._requests_fresh_start(message):
+                await self._orchestrator.reset_session(sender)
+                await self._send_text(
+                    sender,
+                    "Done — I cleared the previous draft. Send the first licence and quantity "
+                    "when you are ready; you can provide them together or one detail at a time.",
+                )
+                return True
+            if self._requests_resume_saved_draft(message):
                 await self._resume_saved_session(sender, session)
                 return True
             intent = await self._interpret_pending_message(message, session)
             if intent is not None and intent.action in CONVERSATIONAL_ACTIONS:
-                await self._execute_agent_intent(
+                await self._execute_conversational_preserving_pending(
                     sender,
+                    pending,
                     intent,
-                    original_message=message,
+                    message,
                 )
                 return True
             if intent is None and self._is_clear_non_requirement_turn(message):
@@ -2446,8 +6056,13 @@ class WhatsAppWebhookService:
             if intent is not None and intent.action == "capture_requirement":
                 attempts = await self._orchestrator.record_pending_dialogue_failure(sender)
                 if attempts >= 2:
-                    await self._orchestrator.reset_session(sender)
-                    await self._capture_typed_requirement(sender, message)
+                    await self._orchestrator.clear_pending_dialogue(sender)
+                    await self._send_text(
+                        sender,
+                        "I closed the saved-draft choice after two unsupported replies. The "
+                        "saved draft remains unchanged, and no hidden question is active. "
+                        "Send *Resume* or *Start fresh* in a new message when ready.",
+                    )
                     return True
                 await self._send_text(
                     sender,
@@ -2465,23 +6080,50 @@ class WhatsAppWebhookService:
                 await self._resume_saved_session(sender, session)
                 return True
             elif intent is not None and intent.action not in CONVERSATIONAL_ACTIONS:
-                # A concrete edit, comparison, clarification, or proposal operation clearly
-                # refers to the saved draft and therefore acts as an implicit resume. Route it
-                # once instead of repeating the resume/start-fresh gate.
-                await self._orchestrator.clear_pending_dialogue(sender)
-                await self._execute_agent_intent(
-                    sender,
+                grounded = self._intent_with_seller_supported_targets(
                     intent,
-                    original_message=message,
+                    message,
+                    session,
+                    pending_slot_completion=False,
                 )
-                return True
+                direct_edit = bool(
+                    grounded.action in ASSERTIVE_COMMERCIAL_ACTIONS
+                    and self._scenario_from_bare_reply(message) is None
+                    and self._is_assertive_commercial_instruction(
+                        message,
+                        grounded,
+                        session,
+                        pending_slot_completion=False,
+                    )
+                )
+                direct_compare = bool(
+                    grounded.action in {"compare", "compare_enterprise_options"}
+                    and self._is_comparison_request(message)
+                )
+                direct_finalize = bool(
+                    grounded.action == "finalize"
+                    and self._is_assertive_finalization_request(message)
+                )
+                if direct_edit or direct_compare or direct_finalize:
+                    # A complete seller-grounded instruction can safely operate on the
+                    # saved draft. A model-only clarification, hidden option selection, bare
+                    # scenario token, or question cannot implicitly resume it.
+                    await self._orchestrator.clear_pending_dialogue(sender)
+                    await self._execute_agent_intent(
+                        sender,
+                        grounded,
+                        original_message=message,
+                    )
+                    return True
             attempts = await self._orchestrator.record_pending_dialogue_failure(sender)
             if attempts >= 2:
+                await self._orchestrator.clear_pending_dialogue(sender)
                 await self._send_text(
                     sender,
                     "The saved draft remains protected and unchanged. I could not determine "
-                    "whether that message meant resume or start fresh, so I have stopped "
-                    "repeating the full prompt. Send *Resume* or *Start fresh* when ready.",
+                    "whether that message meant resume or start fresh, so I closed that "
+                    "choice instead of intercepting future messages. Send *Resume* or "
+                    "*Start fresh* in a new message when ready.",
                 )
                 return True
             await self._send_text(
@@ -2491,34 +6133,30 @@ class WhatsAppWebhookService:
                 "clear it and begin again.",
             )
             return True
-        if reply in CANCEL_REPLIES:
-            await self._orchestrator.clear_pending_dialogue(sender)
-            await self._send_text(
-                sender,
-                "Okay — I cancelled that question. The saved requirement and proposal are "
-                "unchanged. What would you like to do next?",
-            )
-            return True
-        if self._intent_interpreter is None:
-            if self._is_clear_non_requirement_turn(message):
-                # Preserve the unanswered workflow question but do not trap an unrelated
-                # conversational turn inside it when the model is unavailable.
-                await self._send_non_requirement_boundary(sender)
-                return True
-            await self._release_pending_dialogue(sender, session)
-            return True
-
-        try:
-            intent = await self._intent_interpreter.interpret(
+        intent: AgentIntent | None = None
+        if self._intent_interpreter is not None:
+            try:
+                intent = await self._intent_interpreter.interpret(
+                    message,
+                    session,
+                )
+            except IntentInterpretationError:
+                logger.warning("Pending-turn intent interpretation failed")
+        if intent is not None:
+            # Pending context may supply the operation and target, but every value parsed
+            # from this reply must still be present in the seller's words. The structured
+            # resolver adds trusted pending fields only after this grounding pass.
+            intent = self._intent_with_seller_supported_targets(
+                intent,
                 message,
                 session,
+                pending_slot_completion=False,
             )
-        except IntentInterpretationError:
-            if self._is_clear_non_requirement_turn(message):
-                await self._send_non_requirement_boundary(sender)
-                return True
-            await self._release_pending_dialogue(sender, session)
-            return True
+
+        fallback_intent = self._agent_intent_with(
+            intent or AgentIntent.model_construct(),
+            action=(intent.action if intent is not None else "clarify"),
+        )
 
         if pending.operation == "none":
             normalized_question = " ".join(pending.question.casefold().split())
@@ -2539,23 +6177,94 @@ class WhatsAppWebhookService:
                     upgraded,
                     session,
                     pending.context_message or pending.question,
-                    intent,
+                    fallback_intent,
                 )
                 pending = upgraded.model_copy(
                     update={"source_line_id": inferred_line}
                 )
                 await self._orchestrator.set_pending_dialogue(sender, pending)
 
+        if self._requests_pending_change_cancel(message):
+            await self._orchestrator.clear_pending_dialogue(sender)
+            await self._send_text(
+                sender,
+                "Okay — I cancelled that question. The saved requirement and proposal are "
+                "unchanged. What would you like to do next?",
+            )
+            return True
+
         if (
-            intent.action not in CONVERSATIONAL_ACTIONS
-            and await self._resolve_structured_pending_dialogue(
+            pending.detail_value == "official_product_clarification"
+            and intent is not None
+            and intent.action
+            in {"answer_question", "clarify", "capture_requirement", "request_recommendation"}
+            and not self._looks_like_existing_requirement_operation(message)
+        ):
+            # This turn answers the official advisor's required follow-up. Combine it with
+            # the original question so the advisor sees the complete context, then consume
+            # the old question exactly once. The surrounding dual-state helper restores any
+            # unrelated pending add/replace choice after this read-only turn.
+            await self._orchestrator.clear_pending_dialogue(sender)
+            combined_question = (
+                f"{pending.context_message or pending.question}\n"
+                f"Seller clarification: {message}\n"
+                "Answer the Microsoft product question using this clarification. Do not "
+                "change or price the requirement."
+            )
+            research_intent = AgentIntent.model_construct(
+                detail_value=combined_question,
+                product_query=str(getattr(intent, "product_query", "") or ""),
+            )
+            await self._send_official_product_answer(
+                sender,
+                research_intent,
+                original_message=combined_question,
+            )
+            return True
+
+        if await self._pending_reply_is_compatible(
+            pending,
+            session,
+            message,
+            fallback_intent,
+        ) and await self._resolve_structured_pending_dialogue(
                 sender,
                 message,
                 session,
                 pending,
-                intent,
+                fallback_intent,
+            ):
+            return True
+
+        if pending.operation == "none" and reply in AFFIRMATIVE_REPLIES:
+            # Let the model resolve a safe, read-only follow-up such as "Would you like
+            # guidance?" -> "Yes". Never let a bare approval mutate pricing, validate an
+            # estate, or finalize a proposal when the preceding question had no structured
+            # operation attached to it.
+            if intent is not None and intent.action in (
+                CONVERSATIONAL_ACTIONS | {"clarify", "request_recommendation"}
+            ):
+                await self._orchestrator.clear_pending_dialogue(sender)
+                await self._execute_agent_intent(
+                    sender,
+                    intent,
+                    original_message=message,
+                )
+                return True
+            # An unstructured missing-detail question cannot safely interpret bare approval.
+            # Close it once rather than looping or treating it as estate approval.
+            await self._release_pending_dialogue(
+                sender,
+                session,
+                confirmation_blocked=True,
             )
-        ):
+            return True
+
+        if intent is None:
+            if self._is_clear_non_requirement_turn(message):
+                await self._send_non_requirement_boundary(sender)
+                return True
+            await self._repeat_or_release_pending(sender, pending, pending.question)
             return True
 
         if (
@@ -2563,9 +6272,13 @@ class WhatsAppWebhookService:
             and self._pending_is_recommendation_guidance(pending)
             and intent.action
             in {"request_recommendation", "answer_question", "clarify", "capture_requirement"}
-            and not self._looks_like_requirement_fragment(message)
             and not self._looks_like_existing_requirement_operation(message)
         ):
+            # This is an answer to a read-only recommendation question, not a new
+            # requirement merely because it contains a user count (for example
+            # "endpoint protection for 100 users"). An explicit add/change/remove
+            # instruction still supersedes the guidance question through the operation
+            # check above.
             await self._orchestrator.clear_pending_dialogue(sender)
             combined_question = (
                 f"{pending.context_message or pending.question}\n"
@@ -2590,6 +6303,7 @@ class WhatsAppWebhookService:
                 and session.estate is not None
                 and not session.estate.pending_lines
                 and not session.capture_messages
+                and self._is_requirement_confirmation_reply(message)
                 and (
                     self._pending_confirms_complete_requirement(pending)
                     or self._is_explicit_requirement_confirmation(message)
@@ -2604,14 +6318,37 @@ class WhatsAppWebhookService:
                 confirmation_blocked=True,
             )
             return True
-        if intent.action in CONVERSATIONAL_ACTIONS:
-            # The seller has changed or closed the subject. Do not let the old question
-            # capture later acknowledgements, questions, or unrelated messages.
+        if (
+            session.confirmed_as_is is None
+            and intent.action == "clarify"
+            and not self._looks_like_existing_requirement_operation(message)
+            and await self._is_catalog_backed_requirement_statement(message)
+        ):
+            # An unstructured review question must not swallow an obvious new catalogue
+            # line merely because the model returned a generic clarification. Catalogue
+            # evidence plus requirement wording is the deterministic capture boundary.
             await self._orchestrator.clear_pending_dialogue(sender)
-            await self._execute_agent_intent(
+            await self._capture_typed_requirement(sender, message)
+            return True
+        if intent.action in CONVERSATIONAL_ACTIONS:
+            if intent.action == "out_of_scope":
+                # An unrelated new subject must not leave a latent edit armed. Answer it and
+                # clear the pending operation so a later number or product cannot be consumed
+                # by stale context.
+                await self._orchestrator.clear_pending_dialogue(sender)
+                await self._execute_agent_intent(
+                    sender,
+                    intent,
+                    original_message=message,
+                )
+                return True
+            # Relevant informational interruptions can be answered while retaining the
+            # unfinished commercial action; no old prompt is replayed in the same turn.
+            await self._execute_conversational_preserving_pending(
                 sender,
+                pending,
                 intent,
-                original_message=message,
+                message,
             )
             return True
         if intent.action == "clarify":
@@ -2631,13 +6368,27 @@ class WhatsAppWebhookService:
                     next_question,
                 )
                 return True
+        if intent.action in ASSERTIVE_COMMERCIAL_ACTIONS and not self._is_assertive_commercial_instruction(
+            message,
+            intent,
+            session,
+            pending_slot_completion=False,
+        ):
+            # A model can label a question, historical statement, or negated sentence as
+            # an edit. Preserve the visible unfinished question and answer safely instead
+            # of clearing its context before the central mutation guard rejects it.
+            await self._execute_conversational_preserving_pending(
+                sender,
+                pending,
+                intent,
+                message,
+            )
+            return True
         await self._orchestrator.clear_pending_dialogue(sender)
         if intent.action == "capture_requirement":
-            if pending.context_message.strip():
-                await self._orchestrator.remember_capture_message(
-                    sender,
-                    pending.context_message,
-                )
+            # The pending context can be an earlier information question or abandoned
+            # clarification. Requirement fragments are already persisted separately by
+            # the capture workflow, so merging this text risks inventing an SKU.
             await self._capture_typed_requirement(sender, message)
             return True
         await self._execute_agent_intent(
@@ -2684,38 +6435,74 @@ class WhatsAppWebhookService:
             "naturally whenever you are ready.",
         )
 
-    @staticmethod
-    def _is_requirement_confirmation_reply(message: str) -> bool:
-        reply = " ".join(message.casefold().strip(" ?!.,").split())
-        if reply in AFFIRMATIVE_REPLIES or reply in REQUIREMENT_CONFIRMATION_REPLIES:
-            return True
-        negative_markers = {
-            "cancel",
-            "change",
-            "don't",
-            "dont",
-            "incorrect",
-            "no",
-            "not",
-            "remove",
-            "wrong",
-        }
-        words = set(reply.split())
-        if words & negative_markers:
+    @classmethod
+    def _is_assertive_validation_reply(
+        cls,
+        message: str,
+        *,
+        allow_bare_affirmative: bool,
+    ) -> bool:
+        """Accept approval assertions while rejecting questions, negation, and hypotheticals."""
+
+        reply = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if not reply:
             return False
-        return any(
-            marker in words
-            for marker in {"approve", "approved", "confirm", "confirmed", "correct"}
+        if "?" in message or re.match(
+            r"^(?:who|what|which|where|when|why|how|can|could|would|should|"
+            r"do|does|did|is|are|will|may)\b",
+            reply,
+        ):
+            return False
+        if re.match(r"^(?:if|unless|when|whether|suppose|assuming)\b", reply):
+            return False
+        if cls._is_negated_action(
+            reply,
+            r"(?:confirm|approve|proceed|price|finali[sz]e)",
+        ) or re.search(
+            r"\b(?:not|never|no)\s+(?:yet\s+)?(?:confirmed|approved|correct|finalized|finalised)\b",
+            reply,
+        ):
+            return False
+        if allow_bare_affirmative and reply in AFFIRMATIVE_REPLIES:
+            return True
+        if reply in REQUIREMENT_CONFIRMATION_REPLIES:
+            return True
+        return bool(
+            re.fullmatch(
+                r"(?:(?:yes|yeah|ok|okay)[, ]+)?"
+                r"(?:(?:i|we)\s+(?:hereby\s+)?(?:confirm|approve)(?:\s+(?:it|this|"
+                r"the\s+(?:complete\s+)?(?:requirement|details|configuration|"
+                r"proposal|pricing)(?:\s+for\s+pricing)?|"
+                r"the\s+analysis(?:\s+and\s+pricing)?|all\s+details))?(?:\s+now)?|"
+                r"(?:please\s+)?(?:confirm|approve)\s+(?:the\s+)?(?:complete\s+)?"
+                r"(?:requirement|details|configuration|list)(?:\s+and\s+"
+                r"(?:calculate|show|prepare)\s+(?:the\s+)?renew(?:al)?\s+as[ -]?is"
+                r"(?:\s+(?:annual\s+)?(?:price|cost|proposal))?)?|"
+                r"(?:please\s+)?(?:confirm|approve)(?:\s+(?:it|this|the\s+requirement|"
+                r"the\s+details|for\s+pricing))?|"
+                r"(?:please\s+)?proceed(?:\s+with)?\s+pricing|"
+                r"(?:the\s+)?(?:requirement|details|configuration|list)\s+(?:is|are)\s+correct|"
+                r"(?:(?:yes|yeah|ok|okay)\s+)?finali[sz]e(?:\s+(?:it|this|the\s+proposal))?)",
+                reply,
+            )
         )
 
-    @staticmethod
-    def _is_explicit_requirement_confirmation(message: str) -> bool:
+    @classmethod
+    def _is_requirement_confirmation_reply(cls, message: str) -> bool:
+        return cls._is_assertive_validation_reply(
+            message,
+            allow_bare_affirmative=True,
+        )
+
+    @classmethod
+    def _is_explicit_requirement_confirmation(cls, message: str) -> bool:
         """Distinguish an explicit approval from a bare answer such as 'yes'."""
 
-        reply = " ".join(message.casefold().strip(" ?!.,").split())
-        return bool(
-            reply in REQUIREMENT_CONFIRMATION_REPLIES
-            or re.search(r"\b(?:confirm|confirmed|approve|approved)\b", reply)
+        return cls._is_assertive_validation_reply(
+            message,
+            allow_bare_affirmative=False,
         )
 
     @staticmethod
@@ -2783,26 +6570,40 @@ class WhatsAppWebhookService:
         if reply in UNCERTAIN_REPLIES:
             await self._pause_pending_requirement_match(sender, pending_lines)
             return True
-        if reply in CANCEL_REPLIES:
-            if len(pending_lines) == 1:
-                await self._remove_requirement_line(sender, pending_lines[0].line_id)
-            else:
-                choices = "; ".join(
-                    line.source_product_title for line in pending_lines[:10]
-                )
-                await self._send_text(
-                    sender,
-                    "Which unresolved product should I remove? Reply with the product name: "
-                    + choices,
-                )
+        if "?" in message and re.fullmatch(
+            r"(?:cancel|cancel\s+(?:this|that|the\s+question)|never\s*mind)",
+            reply,
+        ):
+            await self._send_text(
+                sender,
+                "That question did not cancel or pause the unresolved SKU selection. If you "
+                "want to close it, say *Cancel the product selection* without a question "
+                "mark; otherwise choose a displayed option or send the complete product name.",
+            )
+            return True
+        if self._requests_pending_change_cancel(message):
+            await self._orchestrator.set_pending_match_prompt_suspended(sender, True)
+            await self._orchestrator.clear_pending_dialogue(sender)
+            await self._send_text(
+                sender,
+                "Okay — I cancelled the product-selection prompt. No licence was removed or "
+                "priced. The unresolved product remains in the draft until you choose an "
+                "exact SKU, provide its complete product name, or explicitly remove that "
+                "licence.",
+            )
             return True
 
+        selectable_lines = [
+            line
+            for line in pending_lines
+            if not line.candidate_narrowing_required
+        ]
         line_id, candidate_number = self._candidate_selection_from_reply(
             message,
-            pending_lines,
+            selectable_lines,
         )
         selected_line = next(
-            (line for line in pending_lines if line.line_id == line_id),
+            (line for line in selectable_lines if line.line_id == line_id),
             None,
         )
         if (
@@ -2812,6 +6613,7 @@ class WhatsAppWebhookService:
         ):
             estate = await self._confirm_requirement_candidate(
                 sender,
+                capture_token=session.estate.capture_token[:16],
                 line_id=line_id,
                 candidate_number=candidate_number,
             )
@@ -2824,7 +6626,10 @@ class WhatsAppWebhookService:
             for line in pending_lines
             for index, candidate in enumerate(line.candidates, start=1)
             if (
-                normalized_message == normalize_product_title(candidate.sku_title)
+                (
+                    normalized_message == normalize_product_title(candidate.sku_title)
+                    and self._is_direct_candidate_title_reply(message)
+                )
                 or (
                     normalize_product_title(candidate.sku_title) in normalized_message
                     and self._is_explicit_title_choice(message)
@@ -2835,8 +6640,10 @@ class WhatsAppWebhookService:
             line, index = title_matches[0]
             estate = await self._confirm_requirement_candidate(
                 sender,
+                capture_token=session.estate.capture_token[:16],
                 line_id=line.line_id,
                 candidate_number=index,
+                allow_hidden_exact_title=True,
             )
             await self._after_requirement_match_confirmation(sender, estate)
             return True
@@ -2848,12 +6655,25 @@ class WhatsAppWebhookService:
         ):
             estate = await self._confirm_requirement_candidate(
                 sender,
+                capture_token=session.estate.capture_token[:16],
                 line_id=pending_lines[0].line_id,
                 candidate_number=1,
             )
             await self._after_requirement_match_confirmation(sender, estate)
             return True
 
+        if session.pending_match_prompt_suspended and (
+            re.search(
+                r"\b(?:show|display|list|repeat|reopen|restore|view)\b",
+                reply,
+            )
+            and re.search(
+                r"\b(?:options?|choices?|matches?|products?|skus?|l\d+)\b",
+                reply,
+            )
+        ):
+            await self._send_pending_match_requests(sender, session.estate)
+            return True
         if session.pending_match_prompt_suspended:
             # Explicit option and exact-title replies above can still resolve the line.
             # Everything else returns to normal intent routing instead of replaying the
@@ -2861,6 +6681,13 @@ class WhatsAppWebhookService:
             return False
 
         intent = await self._interpret_pending_message(message, session)
+        if intent is not None:
+            intent = self._intent_with_seller_supported_targets(
+                intent,
+                message,
+                session,
+                pending_slot_completion=False,
+            )
         if intent is not None:
             if intent.action in CONVERSATIONAL_ACTIONS | {"reset_requirement"}:
                 await self._execute_agent_intent(
@@ -2873,7 +6700,7 @@ class WhatsAppWebhookService:
                 "capture_requirement",
                 "add_sku",
                 "replace_sku",
-            } or self._looks_like_requirement_fragment(message):
+            } or await self._is_catalog_backed_requirement_statement(message):
                 if self._is_clear_non_requirement_turn(message):
                     await self._send_non_requirement_boundary(sender)
                     return True
@@ -2885,6 +6712,17 @@ class WhatsAppWebhookService:
                 ):
                     return True
             elif intent.action != "clarify":
+                if intent.action == "confirm_matches":
+                    # Any direct numbered/title selection was handled above. A model label
+                    # alone must not confirm a catalogue option from a question, negation,
+                    # reported statement, or other narrative text.
+                    await self._send_text(
+                        sender,
+                        "I did not treat that message as a direct product selection, so the "
+                        "unresolved line is unchanged. Reply with a displayed option number "
+                        "or send the complete product name when you want to confirm it.",
+                    )
+                    return True
                 await self._execute_agent_intent(
                     sender,
                     intent,
@@ -2916,6 +6754,22 @@ class WhatsAppWebhookService:
         """Keep unresolved data safe while preventing a catalogue-choice loop."""
 
         await self._orchestrator.set_pending_match_prompt_suspended(sender, True)
+        broad = [line for line in pending_lines if line.candidate_narrowing_required]
+        if broad:
+            questions = [
+                candidate_narrowing_question(
+                    line.source_product_title,
+                    len(line.candidates),
+                )
+                for line in broad[:3]
+            ]
+            await self._send_text_chunks(
+                sender,
+                "\n\n".join(questions)
+                + "\n\nAll captured quantities and source lines remain unchanged, and "
+                "pricing is paused until the exact SKU is confirmed.",
+            )
+            return
         products = "; ".join(line.source_product_title for line in pending_lines[:6])
         await self._send_text(
             sender,
@@ -2924,6 +6778,25 @@ class WhatsAppWebhookService:
             "exact match is confirmed. You can still choose a displayed option, send the "
             "full product name, remove the line, or continue with another licensing question.",
         )
+
+    async def _repeat_or_close_pending_sku_change(
+        self,
+        sender: str,
+        message: str,
+    ) -> None:
+        """Repeat a SKU choice once, then release it without applying anything."""
+
+        attempts = await self._orchestrator.record_pending_sku_change_failure(sender)
+        if attempts >= 2:
+            await self._orchestrator.cancel_sku_change(sender)
+            await self._send_text(
+                sender,
+                "I closed the earlier product choice after two unsupported replies so it "
+                "will not keep intercepting the conversation. No SKU or commercial value "
+                "was changed. Restate the product change when you are ready.",
+            )
+            return
+        await self._send_text(sender, message)
 
     async def _try_handle_pending_sku_change_reply(
         self,
@@ -2935,11 +6808,12 @@ class WhatsAppWebhookService:
         if pending is None:
             return False
         reply = " ".join(message.casefold().strip(" ?!.,").split())
-        if self._requests_pending_change_cancel(reply):
+        if self._requests_pending_change_cancel(message):
             await self._orchestrator.cancel_sku_change(sender)
             await self._send_text(
                 sender,
-                "Okay — I cancelled that product change. The proposal remains unchanged.",
+                "Okay - I cancelled that product change. The proposal is unchanged, and "
+                "the repeated choice has been closed.",
             )
             if self._requests_enterprise_comparison(reply):
                 await self._send_enterprise_comparison(sender)
@@ -2968,13 +6842,22 @@ class WhatsAppWebhookService:
             )
             return True
 
-        number = self._single_candidate_number(message)
+        number = None if "?" in message else self._single_candidate_number(message)
+        if number is None and re.fullmatch(
+            r"(?:(?:choose|select|use|pick)\s+)?(?:the\s+)?last"
+            r"(?:\s+(?:one|option))?",
+            reply,
+        ):
+            number = len(pending.candidates)
         normalized_message = normalize_product_title(message)
         title_numbers = [
             index
             for index, candidate in enumerate(pending.candidates, start=1)
             if (
-                normalized_message == normalize_product_title(candidate.sku_title)
+                (
+                    normalized_message == normalize_product_title(candidate.sku_title)
+                    and self._is_direct_candidate_title_reply(message)
+                )
                 or (
                     normalize_product_title(candidate.sku_title) in normalized_message
                     and self._is_explicit_title_choice(message)
@@ -2985,25 +6868,66 @@ class WhatsAppWebhookService:
             number = title_numbers[0]
         elif reply in AFFIRMATIVE_REPLIES and len(pending.candidates) == 1:
             number = 1
+        elif pending.candidate_narrowing_required:
+            # Numbered options were intentionally not displayed for this broad query.
+            # Never let a guessed or stale option number select from the hidden set.
+            number = None
         if number is None or number < 1 or number > len(pending.candidates):
             intent = await self._interpret_pending_message(message, session)
             if intent is not None:
+                intent = self._intent_with_seller_supported_targets(
+                    intent,
+                    message,
+                    session,
+                    pending_slot_completion=False,
+                )
+            if intent is not None:
                 if intent.action in CONVERSATIONAL_ACTIONS | {"reset_requirement"}:
-                    if intent.action in {"help", "answer_question", "out_of_scope"}:
-                        # A new subject supersedes an unconfirmed scenario edit. Nothing has
-                        # been applied, and a later bare "yes" must not revive the stale choice.
+                    if intent.action in {"acknowledge", "out_of_scope"}:
+                        # A conversational close or a clearly unrelated new subject ends the
+                        # unconfirmed choice. This prevents the next short reply from being
+                        # applied to stale catalogue options the seller is no longer discussing.
                         await self._orchestrator.cancel_sku_change(sender)
-                    await self._execute_agent_intent(
-                        sender,
-                        intent,
-                        original_message=message,
-                    )
+                    if intent.action in {"help", "answer_question"}:
+                        try:
+                            await self._execute_agent_intent(
+                                sender,
+                                intent,
+                                original_message=message,
+                            )
+                        finally:
+                            latest = await self._orchestrator.get_session(sender)
+                            preserve_dialogue = bool(
+                                intent.action == "answer_question"
+                                and str(
+                                    getattr(intent, "detail_label", "")
+                                ).strip().casefold()
+                                == "official_product_question"
+                                and latest is not None
+                                and latest.pending_dialogue is not None
+                                and latest.pending_dialogue.detail_value
+                                == "official_product_clarification"
+                            )
+                            await self._orchestrator.restore_pending_sku_change(
+                                sender,
+                                pending,
+                                preserve_pending_dialogue=preserve_dialogue,
+                            )
+                    else:
+                        await self._execute_agent_intent(
+                            sender,
+                            intent,
+                            original_message=message,
+                        )
                     return True
                 if intent.action in {
                     "capture_requirement",
                     "add_sku",
                     "replace_sku",
-                } or self._looks_like_requirement_fragment(message):
+                } or (
+                    intent.action == "clarify"
+                    and await self._is_catalog_backed_requirement_statement(message)
+                ):
                     if self._is_clear_non_requirement_turn(message):
                         await self._send_non_requirement_boundary(sender)
                         return True
@@ -3014,6 +6938,51 @@ class WhatsAppWebhookService:
                         intent,
                     ):
                         return True
+                elif intent.action == "confirm_sku":
+                    if pending.candidate_narrowing_required:
+                        await self._repeat_or_close_pending_sku_change(
+                            sender,
+                            candidate_narrowing_question(
+                                pending.product_query,
+                                len(pending.candidates),
+                            )
+                            + " No product was selected and nothing was changed. Restate the "
+                            "change with a more specific product name.",
+                        )
+                        return True
+                    explicit_candidate = self._single_candidate_number(message)
+                    if (
+                        explicit_candidate is None
+                        or explicit_candidate != intent.candidate_number
+                        or not 1 <= intent.candidate_number <= len(pending.candidates)
+                    ):
+                        await self._repeat_or_close_pending_sku_change(
+                            sender,
+                            "Please choose one of the displayed product options, or send the "
+                            "complete Microsoft product name. Nothing has been changed.",
+                        )
+                        return True
+                    result = await self._orchestrator.confirm_sku_change(
+                        sender,
+                        intent.candidate_number,
+                    )
+                    await self._send_sku_change_result(sender, result)
+                    return True
+                elif intent.action == "cancel_sku":
+                    if not self._requests_pending_change_cancel(message):
+                        await self._send_text(
+                            sender,
+                            "I have not cancelled the pending product change. The proposal "
+                            "and the displayed choice remain unchanged.",
+                        )
+                        return True
+                    await self._orchestrator.cancel_sku_change(sender)
+                    await self._send_text(
+                        sender,
+                        "Okay — I cancelled that product change. The proposal remains "
+                        "unchanged.",
+                    )
+                    return True
                 elif intent.action != "clarify":
                     await self._orchestrator.cancel_sku_change(sender)
                     await self._execute_agent_intent(
@@ -3028,16 +6997,39 @@ class WhatsAppWebhookService:
                 await self._orchestrator.cancel_sku_change(sender)
                 await self._send_non_requirement_boundary(sender)
                 return True
+            referenced_candidate = any(
+                normalize_product_title(candidate.sku_title) in normalized_message
+                for candidate in pending.candidates
+                if normalize_product_title(candidate.sku_title)
+            )
+            if referenced_candidate:
+                await self._repeat_or_close_pending_sku_change(
+                    sender,
+                    "I did not treat that sentence as your direct product selection, so no "
+                    "SKU was changed. Choose a displayed option directly, or send the complete "
+                    "product name you want.",
+                )
+                return True
+            if pending.candidate_narrowing_required:
+                await self._repeat_or_close_pending_sku_change(
+                    sender,
+                    candidate_narrowing_question(
+                        pending.product_query,
+                        len(pending.candidates),
+                    )
+                    + " Nothing has been changed. Restate the change with a more specific "
+                    "product name when ready.",
+                )
+                return True
             # Never turn a plan number into an option number, and never trap the seller by
             # replaying the same candidates. No proposal mutation has occurred yet, so the
             # unconfirmed edit is safe to cancel.
-            await self._orchestrator.cancel_sku_change(sender)
-            await self._send_text(
+            await self._repeat_or_close_pending_sku_change(
                 sender,
                 "I did not apply the pending product change because the reply did not "
-                "identify one of the displayed SKUs. The proposal is unchanged and the "
-                "repeated choice has been closed. Restate the change with the product and "
-                "quantity, or ask me to help choose a suitable SKU.",
+                "identify one of the displayed SKUs. The proposal is unchanged. Choose one "
+                "of the displayed options, send the complete product name, or ask me to help "
+                "choose a suitable SKU.",
             )
             return True
         result = await self._orchestrator.confirm_sku_change(sender, number)
@@ -3048,24 +7040,58 @@ class WhatsAppWebhookService:
     def _single_candidate_number(message: str) -> int | None:
         reply = " ".join(message.casefold().strip(" ?!.,").split())
         match = re.fullmatch(
-            r"(?:(?:choose|select|use)\s+)?(?:option\s+|number\s+)?(\d+)",
+            r"(?:(?:(?:i|we)\s+)?(?:choose|select|use|pick|want|prefer|take)\s+"
+            r"(?:the\s+)?|go\s+with\s+(?:the\s+)?)?"
+            r"(?:option\s+|number\s+)?(\d+)",
             reply,
         )
-        return int(match.group(1)) if match else None
+        if match:
+            return int(match.group(1))
+        ordinal_match = re.fullmatch(
+            r"(?:(?:(?:i|we)\s+)?(?:choose|select|use|pick|want|prefer|take)\s+"
+            r"(?:the\s+)?|go\s+with\s+(?:the\s+)?)?"
+            r"(?:option\s+)?(?:the\s+)?"
+            r"(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)"
+            r"(?:\s+(?:one|option))?",
+            reply,
+        )
+        if ordinal_match is None:
+            return None
+        return {
+            "first": 1,
+            "second": 2,
+            "third": 3,
+            "fourth": 4,
+            "fifth": 5,
+            "sixth": 6,
+            "seventh": 7,
+            "eighth": 8,
+            "ninth": 9,
+            "tenth": 10,
+        }[ordinal_match.group(1)]
 
     def _candidate_selection_from_reply(
         self,
         message: str,
         pending_lines: list,
     ) -> tuple[str | None, int | None]:
+        if "?" in message:
+            return None, None
         reply = " ".join(message.casefold().strip(" ?!.,").split())
-        line_match = re.search(r"\b(l\d+)\b", reply)
-        line_id = line_match.group(1).upper() if line_match else None
-        number_match = re.search(
-            r"(?:option|number|choose|select|use)\s*(\d+)\b",
+        selection = re.fullmatch(
+            r"(?:(?:(?:i|we)\s+)?(?:choose|select|use|pick|want|prefer|take)\s+"
+            r"(?:the\s+)?|go\s+with\s+(?:the\s+)?)?"
+            r"(?:(l\d+)\s+)?(?:option\s+|number\s+)?(\d+)"
+            r"(?:\s+(?:for\s+)?(l\d+))?",
             reply,
         )
-        number = int(number_match.group(1)) if number_match else None
+        line_id = None
+        number = None
+        line_match = None
+        if selection is not None:
+            line_value = selection.group(1) or selection.group(3)
+            line_id = line_value.upper() if line_value else None
+            number = int(selection.group(2))
         if number is None:
             bare = self._single_candidate_number(message)
             if (
@@ -3074,25 +7100,87 @@ class WhatsAppWebhookService:
                 and bare <= len(pending_lines[0].candidates)
             ):
                 number = bare
+        if (
+            number is None
+            and len(pending_lines) == 1
+            and re.fullmatch(
+                r"(?:(?:choose|select|use|pick)\s+)?(?:the\s+)?last"
+                r"(?:\s+(?:one|option))?",
+                reply,
+            )
+        ):
+            number = len(pending_lines[0].candidates)
         if line_id is None and len(pending_lines) == 1:
             line_id = pending_lines[0].line_id
-        if line_id is not None and number is None and line_match is not None:
-            remainder = reply[line_match.end() :]
-            trailing = re.search(r"\b(\d+)\b", remainder)
-            if trailing:
-                number = int(trailing.group(1))
         return line_id, number
+
+    @classmethod
+    def _candidate_selection_is_seller_grounded(
+        cls,
+        message: str,
+        *,
+        line_id: str,
+        candidate_number: int,
+        single_pending_line: bool,
+    ) -> bool:
+        """Verify that a structured candidate choice is present in the seller's words."""
+
+        if candidate_number <= 0 or "?" in message:
+            return False
+        normalized = " ".join(
+            message.casefold().replace("\u2019", "'").strip(" ?!.,").split()
+        )
+        if not normalized:
+            return False
+        if cls._is_negated_action(
+            normalized,
+            r"(?:choose|select|use|pick|confirm)",
+        ) or re.search(
+            r"\b(?:customer|client|seller|user|manager|analyst)\b.{0,48}"
+            r"\b(?:said|says|asked|asks|selected|chose|requested|requests?)\b",
+            normalized,
+        ):
+            return False
+        if re.search(
+            r"\b(?:not|except|other\s+than)\s+(?:the\s+)?(?:option\s+|number\s+)?"
+            r"\d+\b|\b(?:was|is|has\s+been)\s+(?:selected|chosen|picked)\s+by\s+"
+            r"(?:the\s+)?(?:customer|client|seller|user|manager|analyst)\b",
+            normalized,
+        ):
+            return False
+        if single_pending_line and cls._single_candidate_number(message) == candidate_number:
+            return True
+        line = re.escape(line_id.casefold())
+        number = re.escape(str(candidate_number))
+        return bool(
+            re.search(
+                rf"\b{line}\b.{{0,24}}\b(?:option\s+|number\s+)?{number}\b",
+                normalized,
+            )
+            or re.search(
+                rf"\b(?:option\s+|number\s+)?{number}\b.{{0,24}}"
+                rf"\b(?:for\s+)?{line}\b",
+                normalized,
+            )
+        )
 
     async def _confirm_requirement_candidate(
         self,
         sender: str,
         *,
+        capture_token: str,
         line_id: str,
         candidate_number: int,
+        allow_hidden_exact_title: bool = False,
     ) -> LicenseEstate:
         session = await self._orchestrator.get_session(sender)
         if session is None or session.estate is None:
             raise ValueError("There is no requirement awaiting product confirmation.")
+        if capture_token != session.estate.capture_token[:16]:
+            raise ValueError(
+                "That product-selection menu belongs to an earlier requirement and is no "
+                "longer active. Review the latest requirement and use its current choices."
+            )
         line = next(
             (
                 item
@@ -3103,6 +7191,11 @@ class WhatsAppWebhookService:
         )
         if line is None:
             raise ValueError(f"{line_id.upper()} is not awaiting product confirmation.")
+        if line.candidate_narrowing_required and not allow_hidden_exact_title:
+            raise ValueError(
+                "That product request is still too broad for numbered selection. Add a "
+                "product family, workload, edition, plan, or exact catalogue ID first."
+            )
         index = candidate_number - 1
         if index < 0 or index >= len(line.candidates):
             raise ValueError(
@@ -3111,7 +7204,13 @@ class WhatsAppWebhookService:
         candidate = line.candidates[index]
         return await self._orchestrator.confirm_matches(
             sender,
-            {line.line_id: (candidate.product_id, candidate.sku_id)},
+            {
+                line.line_id: (
+                    candidate.product_id,
+                    candidate.sku_id,
+                    candidate.sku_title,
+                )
+            },
         )
 
     async def _after_requirement_match_confirmation(
@@ -3143,21 +7242,30 @@ class WhatsAppWebhookService:
     ) -> None:
         await self._orchestrator.set_pending_match_prompt_suspended(sender, False)
         await self._send_text_chunks(sender, format_pending_matches(estate))
-        await self._send_pending_match_lists(sender, estate.pending_lines)
+        await self._send_pending_match_lists(
+            sender,
+            estate.pending_lines,
+            capture_token=estate.capture_token,
+        )
 
     async def _send_pending_match_lists(
         self,
         sender: str,
         pending_lines: list,
+        *,
+        capture_token: str | None = None,
     ) -> None:
+        token = (capture_token or "legacy")[:16]
         for line in pending_lines:
+            if line.candidate_narrowing_required:
+                continue
             total = len(line.candidates)
             for offset in range(0, total, 10):
                 page = line.candidates[offset : offset + 10]
                 rows = [
                     InteractiveRow(
                         id=(
-                            f"licensing|match_confirm|{line.line_id}|"
+                            f"licensing|match_confirm|{token}|{line.line_id}|"
                             f"{offset + page_index}"
                         ),
                         title=f"{line.line_id} · Option {offset + page_index}",
@@ -3236,6 +7344,12 @@ class WhatsAppWebhookService:
         )
         if not removal_requested:
             return False
+        direct_bulk_removal = normalized == "both" or self._is_assertive_action_request(
+            message,
+            r"(?:remove|delete|drop)(?:\s+.+)",
+        )
+        if not direct_bulk_removal:
+            return False
         ids = re.findall(r"\bl\d+\b", normalized)
         if len(set(ids)) < 2 and session.pending_dialogue is not None:
             pending_text = (
@@ -3247,7 +7361,18 @@ class WhatsAppWebhookService:
         normalized_ids = list(dict.fromkeys(value.upper() for value in ids))
         if len(normalized_ids) < 2:
             return False
-        if len(normalized_ids) >= len(session.estate.lines):
+        current_ids = {line.line_id for line in session.estate.lines}
+        unknown_ids = [line_id for line_id in normalized_ids if line_id not in current_ids]
+        if unknown_ids:
+            await self._send_text(
+                sender,
+                "I did not remove anything because "
+                + ", ".join(unknown_ids)
+                + " is not in the current requirement. Name the products to remove or use "
+                "the current line labels shown in the latest table.",
+            )
+            return True
+        if set(normalized_ids) == current_ids:
             await self._orchestrator.reset_session(sender)
             await self._send_text(
                 sender,
@@ -3255,7 +7380,11 @@ class WhatsAppWebhookService:
                 "licence and quantity when you are ready.",
             )
             return True
-        estate = await self._orchestrator.remove_requirement_lines(sender, normalized_ids)
+        estate = await self._orchestrator.remove_requirement_lines(
+            sender,
+            normalized_ids,
+            expected_pending_dialogue=session.pending_dialogue,
+        )
         await self._send_text(
             sender,
             "Removed " + ", ".join(normalized_ids) + " from the requirement.",
@@ -3334,7 +7463,9 @@ class WhatsAppWebhookService:
                 )
             return
         except Exception:
-            logger.exception("Unable to render or send estate table image; using text fallback")
+            if "images" in locals():
+                raise
+            logger.exception("Unable to render estate table image; using text fallback")
         await self._send_text_chunks(
             sender,
             format_estate(
@@ -3360,6 +7491,9 @@ class WhatsAppWebhookService:
             "hey",
             "help",
             "start",
+            "starting",
+            "begin",
+            "confusing",
             "good morning",
             "good afternoon",
             "good evening",
@@ -3374,6 +7508,34 @@ class WhatsAppWebhookService:
             "how does this work",
         }
         if is_intro_request:
+            # A greeting or capability question is still a complete conversational turn.
+            # Route it through an active structured dialogue first so the answer is given
+            # without losing (or silently replacing) the commercial question in progress.
+            if (
+                session is not None
+                and session.pending_dialogue is not None
+                and await self._resolve_pending_dialogue(sender, command, session)
+            ):
+                return
+            saved_session_reentry = lowered == "/start" or intro_request in {
+                "hi",
+                "hello",
+                "hey",
+                "start",
+                "good morning",
+                "good afternoon",
+                "good evening",
+            }
+            if (
+                saved_session_reentry
+                and self._configuration.workflow_mode == "simple_pricing"
+                and session is not None
+                and session.estate is not None
+            ):
+                # This explicit re-entry path both installs and visibly renders the choice.
+                # Capability/help answers remain read-only and never create hidden state.
+                await self._show_saved_session_choice(sender, session)
+                return
             if self._intent_interpreter is not None:
                 try:
                     intent = await self._intent_interpreter.interpret(command, session)
@@ -3386,18 +7548,11 @@ class WhatsAppWebhookService:
                         original_message=command,
                     )
                     return
-            if (
-                self._configuration.workflow_mode == "simple_pricing"
-                and session is not None
-                and session.estate is not None
-            ):
-                await self._show_saved_session_choice(sender, session)
-            else:
-                # Emergency fallback for environments where the language service is disabled
-                # or temporarily unavailable. The normal production path above is model-driven.
-                await self._send_text(sender, HELP_TEXT)
+            # Emergency fallback for environments where the language service is disabled
+            # or temporarily unavailable. The normal production path above is model-driven.
+            await self._send_text(sender, HELP_TEXT)
             return
-        if self._requests_fresh_start(intro_request):
+        if self._requests_fresh_start(command):
             await self._orchestrator.reset_session(sender)
             await self._send_text(
                 sender,
@@ -3414,7 +7569,7 @@ class WhatsAppWebhookService:
             return
         if (
             self._configuration.workflow_mode == "simple_pricing"
-            and any(term in lowered for term in SIMPLE_PRICING_RESTRICTED_TERMS)
+            and self._requests_restricted_pricing(command)
         ):
             await self._send_text(
                 sender,
@@ -3430,7 +7585,59 @@ class WhatsAppWebhookService:
                 "remains unchanged.",
             )
             return
+        if (
+            self._configuration.workflow_mode == "simple_pricing"
+            and session is not None
+            and session.pending_sku_change is not None
+            and session.pending_dialogue is None
+            and self._requests_pending_change_cancel(command)
+            and await self._try_handle_pending_sku_change_reply(
+                sender,
+                command,
+                session,
+            )
+        ):
+            # A combined correction such as "don't replace it; compare instead" first
+            # cancels the uncommitted choice. The global multi-action guard below must not
+            # leave that stale replacement armed.
+            return
+        if not lowered.startswith("/") and self._contains_multiple_mutation_clauses(command):
+            unconfirmed = session is None or session.confirmed_as_is is None
+            initial_multi_add = unconfirmed and bool(
+                re.match(r"^(?:please\s+)?(?:add|include)\b", intro_request)
+            )
+            draft_bulk_removal = bool(
+                unconfirmed
+                and session is not None
+                and session.estate is not None
+                and re.search(r"\b(?:remove|delete|drop)\b", intro_request)
+                and len(set(re.findall(r"\bl\d+\b", intro_request))) >= 2
+            )
+            if initial_multi_add or draft_bulk_removal:
+                # Initial capture supports multiple extracted lines, and the draft-only
+                # multi-line removal path applies explicit line IDs atomically. The same
+                # grammar is rejected once a commercial baseline exists because proposal
+                # intents represent only one mutation.
+                pass
+            else:
+                await self._send_text(
+                    sender,
+                    "I found more than one independent licensing change in that message and "
+                    "did not apply only part of it. Send one product change at a time; I will "
+                    "show the updated requirement or proposal before you send the next change.",
+                )
+                return
         session = await self._orchestrator.get_session(sender)
+        if (
+            self._configuration.workflow_mode != "simple_pricing"
+            and session is not None
+            and session.pending_dialogue is not None
+            and await self._resolve_pending_dialogue(sender, command, session)
+        ):
+            # Structured slot completion is a conversation-state invariant, not a
+            # simple-pricing feature. A visible quantity/product question must consume the
+            # seller's answer consistently in every supported workflow profile.
+            return
         if self._configuration.workflow_mode == "simple_pricing" and session is not None:
             if (
                 session.pending_dialogue is not None
@@ -3438,10 +7645,31 @@ class WhatsAppWebhookService:
                 and await self._resolve_pending_dialogue(sender, command, session)
             ):
                 return
+            if (
+                session.pending_dialogue is not None
+                and self._requests_pending_change_cancel(command)
+                and not (
+                    session.pending_sku_change is not None
+                    and session.pending_dialogue.detail_value
+                    == "official_product_clarification"
+                )
+                and await self._resolve_pending_dialogue(sender, command, session)
+            ):
+                return
             if await self._try_handle_bulk_requirement_removal(
                 sender,
                 command,
                 session,
+            ):
+                return
+            if (
+                session.pending_sku_change is not None
+                and session.pending_dialogue is not None
+                and await self._resolve_pending_dialogue_preserving_sku(
+                    sender,
+                    command,
+                    session,
+                )
             ):
                 return
             if await self._try_handle_pending_sku_change_reply(
@@ -3458,7 +7686,7 @@ class WhatsAppWebhookService:
                 return
             if (
                 session.capture_messages
-                and intro_request in CANCEL_REPLIES
+                and self._requests_pending_change_cancel(command)
             ):
                 if session.estate is None:
                     await self._orchestrator.reset_session(sender)
@@ -3489,14 +7717,23 @@ class WhatsAppWebhookService:
             if (
                 not lowered.startswith("/")
                 and await self._has_open_requirement_draft(sender)
-                and self._looks_like_requirement_fragment(command)
-                and not self._is_licensing_question_message(command)
-                and not self._looks_like_existing_requirement_operation(command)
+                and self._intent_interpreter is None
+                and await self._is_catalog_backed_requirement_statement(command)
             ):
                 # The seller is still assembling the unconfirmed requirement. A new
-                # product such as "add ME3" is another requirement line, not a request
-                # to build or edit a priced scenario.
+                # catalogue-backed product such as "add ME3" is another requirement line,
+                # not a request to build or edit a priced scenario. This seller-grounded
+                # boundary deliberately outranks any model-supplied scenario/edit label.
                 await self._capture_typed_requirement(sender, command)
+                return
+            if (
+                session.pending_dialogue is not None
+                and (
+                    session.pending_dialogue.operation != "none"
+                    or session.pending_dialogue.awaiting_slot != "none"
+                )
+                and await self._resolve_pending_dialogue(sender, command, session)
+            ):
                 return
             if (
                 session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION
@@ -3526,34 +7763,45 @@ class WhatsAppWebhookService:
                 await self._send_enterprise_comparison(sender)
                 return
         if (
+            not lowered.startswith("/")
+            and session is not None
+            and session.confirmed_as_is is not None
+            and session.pending_dialogue is None
+            and session.pending_sku_change is None
+            and session.stage
+            in {WorkflowStage.AWAITING_SCENARIO, WorkflowStage.REVIEWING_SCENARIO}
+        ):
+            bare_scenario = self._scenario_from_bare_reply(command)
+            if bare_scenario is not None:
+                scenario = await self._orchestrator.build_scenario(sender, bare_scenario)
+                if self._configuration.workflow_mode == "simple_pricing":
+                    await self._send_simple_revised(sender, scenario)
+                else:
+                    await self._send_scenario(sender, scenario)
+                return
+        if (
             self._configuration.workflow_mode == "simple_pricing"
             and not lowered.startswith("/")
         ):
             if session is None or session.estate is None:
-                if (
-                    self._looks_like_requirement_fragment(command)
-                    and not self._is_licensing_question_message(command)
-                    and not re.match(
-                        r"^(?:who|what|which|where|when|why|how|did|does|is|are|"
-                        r"can|could|would)\b",
-                        intro_request,
-                    )
-                ):
-                    await self._capture_typed_requirement(sender, command)
-                    return
                 if self._intent_interpreter is not None:
                     try:
                         intent = await self._intent_interpreter.interpret(command, session)
                     except IntentInterpretationError:
                         logger.warning("Pre-upload intent interpretation failed")
-                        await self._send_text(
-                            sender,
-                            "I could not determine whether that is a licensing requirement "
-                            "or a question. Are you providing SKUs and quantities, or asking "
-                            "about the process?",
-                        )
-                        return
+                        if not await self._is_catalog_backed_requirement_statement(command):
+                            await self._send_text(
+                                sender,
+                                "I could not determine whether that is a licensing requirement "
+                                "or a question. Are you providing SKUs and quantities, or asking "
+                                "about the process?",
+                            )
+                            return
+                        intent = AgentIntent.model_construct(action="capture_requirement")
                     if intent.action != "capture_requirement":
+                        if await self._is_catalog_backed_requirement_statement(command):
+                            await self._capture_typed_requirement(sender, command)
+                            return
                         await self._execute_agent_intent(
                             sender,
                             intent,
@@ -3563,6 +7811,21 @@ class WhatsAppWebhookService:
                     if self._is_clear_non_requirement_turn(command):
                         await self._send_non_requirement_boundary(sender)
                         return
+                elif not (
+                    self._looks_like_requirement_fragment(command)
+                    and not self._is_licensing_question_message(command)
+                    and not re.match(
+                        r"^(?:who|what|which|where|when|why|how|did|does|is|are|"
+                        r"can|could|would)\b",
+                        intro_request,
+                    )
+                ):
+                    await self._send_text(
+                        sender,
+                        "Tell me the Microsoft product and quantity you want to review, "
+                        "or ask a licensing question.",
+                    )
+                    return
                 await self._capture_typed_requirement(sender, command)
                 return
         if lowered in {"/validate", "/confirm-details"}:
@@ -3812,7 +8075,7 @@ class WhatsAppWebhookService:
             await self._send_scenario(sender, scenario)
             return
         if lowered == "/finalize":
-            await self._request_finalization(sender)
+            await self._request_finalization(sender, seller_message=command)
             return
         if lowered in {
             "/compare enterprise",
@@ -3831,12 +8094,40 @@ class WhatsAppWebhookService:
                 intent = await self._intent_interpreter.interpret(command, session)
             except IntentInterpretationError:
                 logger.warning("Natural-language intent interpretation failed")
+                if (
+                    self._configuration.workflow_mode == "simple_pricing"
+                    and session is not None
+                    and session.stage
+                    in {
+                        WorkflowStage.AWAITING_MATCH_CONFIRMATION,
+                        WorkflowStage.AWAITING_INITIAL_VALIDATION,
+                    }
+                    and await self._is_catalog_backed_requirement_statement(command)
+                ):
+                    await self._capture_typed_requirement(sender, command)
+                    return
                 await self._send_text(
                     sender,
                     "I could not interpret that request safely. Please rephrase the "
                     "licensing change and include the product or line and quantity where "
                     "relevant.",
                 )
+                return
+            if (
+                self._configuration.workflow_mode == "simple_pricing"
+                and session is not None
+                and session.stage
+                in {
+                    WorkflowStage.AWAITING_MATCH_CONFIRMATION,
+                    WorkflowStage.AWAITING_INITIAL_VALIDATION,
+                }
+                and await self._is_catalog_backed_requirement_statement(command)
+            ):
+                # While the requirement is unconfirmed, an explicit catalogue-backed
+                # seller statement owns the turn even if the model called it a scenario,
+                # edit, recommendation, or clarification. Questions, negation, reported
+                # speech, and existing-line operations fail the predicate above.
+                await self._capture_typed_requirement(sender, command)
                 return
             await self._execute_agent_intent(
                 sender,
@@ -3861,23 +8152,54 @@ class WhatsAppWebhookService:
         intent: AgentIntent,
         *,
         original_message: str | None = None,
+        pending_slot_completion: bool = False,
     ) -> None:
+        if (
+            original_message
+            and intent.action == "set_requirement_detail"
+            and not str(getattr(intent, "detail_value", "") or "").strip()
+        ):
+            # A model can mistake a bare catalogue title for proposal metadata.  Resolve the
+            # seller's own text against the catalogue before the generic mutation guard so
+            # the response explains the ambiguity instead of asking for an invented field
+            # value.  This branch is read-only and never captures or prices the SKU.
+            matches = await self._orchestrator.catalog_candidates(original_message.strip())
+            if matches and matches[0].confidence >= 90:
+                await self._send_text(
+                    sender,
+                    "I recognized that as a Microsoft product rather than proposal "
+                    "metadata, so I have not added or changed anything. Are you asking "
+                    "about its features, or do you want to add that exact SKU?",
+                )
+                return
+        if original_message and intent.action in ASSERTIVE_COMMERCIAL_ACTIONS:
+            semantic_session = await self._orchestrator.get_session(sender)
+            intent = self._intent_with_seller_supported_targets(
+                intent,
+                original_message,
+                semantic_session,
+                pending_slot_completion=pending_slot_completion,
+            )
+            if not self._is_assertive_commercial_instruction(
+                original_message,
+                intent,
+                semantic_session,
+                pending_slot_completion=pending_slot_completion,
+            ):
+                await self._send_text(
+                    sender,
+                    "I treated that as a question or example and did not change the "
+                    "requirement or proposal. State the licensing change directly, including "
+                    "the product and quantity or target proposal where relevant.",
+                )
+                return
         if intent.action == "help":
             response = self._professional_agent_text(
                 str(getattr(intent, "response_text", ""))
             )
-            session = await self._orchestrator.get_session(sender)
-            if session is not None and session.estate is not None:
-                await self._orchestrator.set_pending_dialogue(
-                    sender,
-                    PendingDialogue(
-                        kind="resume_session",
-                        question=(
-                            "Would you like to resume this saved draft, or start a fresh "
-                            "requirement?"
-                        ),
-                    ),
-                )
+            # Help/capability answers are read-only. The explicit greeting/start re-entry
+            # branch in ``_handle_text`` is the only place that may create a resume gate,
+            # and it renders the choice in the same turn.
             await self._send_text(sender, response[:1200] if response else HELP_TEXT)
             return
         if intent.action == "acknowledge":
@@ -3902,6 +8224,16 @@ class WhatsAppWebhookService:
             await self._send_text(sender, response[:500])
             return
         if intent.action == "reset_requirement":
+            if original_message and not self._requests_fresh_start(
+                original_message
+            ):
+                await self._send_text(
+                    sender,
+                    "I have not cleared the saved requirement. Ask what starting fresh does "
+                    "if you want an explanation, or explicitly ask me to start a new "
+                    "requirement when you are ready.",
+                )
+                return
             await self._orchestrator.reset_session(sender)
             await self._send_text(
                 sender,
@@ -3921,6 +8253,30 @@ class WhatsAppWebhookService:
                     original_message=original_message,
                 )
                 return
+            if original_message:
+                normalized_question = " ".join(
+                    original_message.casefold().strip(" ?!.,").split()
+                )
+                fact_session = await self._orchestrator.get_session(sender)
+                grounded_fact = self._deterministic_session_fact_answer(
+                    fact_session,
+                    original_message,
+                )
+                if grounded_fact:
+                    await self._send_text(sender, grounded_fact[:1200])
+                    return
+                capability_question = bool(
+                    re.fullmatch(
+                        r"(?:(?:who|what)\s+are\s+you|what\s+do\s+you\s+do|"
+                        r"how\s+can\s+you\s+help(?:\s+me)?|what\s+can\s+you\s+do)",
+                        normalized_question,
+                    )
+                )
+                if not capability_question and not await self._message_has_licensing_context(
+                    original_message
+                ):
+                    await self._send_non_requirement_boundary(sender)
+                    return
             answer = self._professional_agent_text(intent.response_text)
             await self._send_text(
                 sender,
@@ -3940,19 +8296,41 @@ class WhatsAppWebhookService:
                 )
             return
         if intent.action == "out_of_scope":
-            response = self._professional_agent_text(intent.response_text)
+            # The model may classify the turn but cannot turn this company endpoint into
+            # a general-purpose assistant or relay an unrelated generated answer.
+            await self._send_non_requirement_boundary(sender)
+            return
+        if (
+            original_message
+            and intent.action in FINALIZATION_CORRECTION_ACTIONS
+            and self._contains_multiple_mutation_clauses(original_message)
+        ):
             await self._send_text(
                 sender,
-                response[:700]
-                if response
-                else (
-                    "That request is outside this licensing advisor’s scope. I can help "
-                    "capture, validate, price, revise, and compare Microsoft licensing "
-                    "requirements."
-                ),
+                "I found more than one independent proposal change in that message. I have "
+                "not applied only part of it. Send the first change you want applied; after "
+                "I show the revised proposal, send the next one.",
             )
             return
+        if intent.action in FINALIZATION_CORRECTION_ACTIONS:
+            current = await self._orchestrator.get_session(sender)
+            if (
+                current is not None
+                and current.stage == WorkflowStage.AWAITING_FINAL_VALIDATION
+            ):
+                # The final-validation prompt explicitly invites corrections. Reopen the
+                # proposal first, apply the same parsed correction in this turn, and require
+                # a fresh final confirmation afterward.
+                await self._orchestrator.cancel_finalization(sender)
         if intent.action == "compare_enterprise_options":
+            if original_message and not self._is_comparison_request(original_message):
+                await self._send_text(
+                    sender,
+                    "I have not generated or changed a comparison from that message. "
+                    "Explicitly ask me to compare the required options when you want the "
+                    "commercial comparison prepared.",
+                )
+                return
             await self._ensure_operation_allowed(
                 sender,
                 agent_action=intent.action,
@@ -3960,6 +8338,14 @@ class WhatsAppWebhookService:
             await self._send_enterprise_comparison(sender)
             return
         if intent.action == "capture_requirement":
+            if original_message and self._is_licensing_question_message(original_message):
+                await self._send_text(
+                    sender,
+                    "I treated that as a licensing question and did not add it to the "
+                    "requirement. Ask the product question directly, or state the product "
+                    "and quantity when you want it added.",
+                )
+                return
             if original_message and await self._has_open_requirement_draft(sender):
                 await self._capture_typed_requirement(sender, original_message)
                 return
@@ -3989,18 +8375,6 @@ class WhatsAppWebhookService:
         if intent.action == "clarify":
             question = self._professional_agent_text(intent.clarification)
             clarification_session = await self._orchestrator.get_session(sender)
-            capture_is_open = bool(
-                clarification_session is None
-                or clarification_session.estate is None
-                or clarification_session.confirmed_as_is is None
-            )
-            if (
-                capture_is_open
-                and original_message
-                and self._looks_like_requirement_fragment(original_message)
-            ):
-                await self._capture_typed_requirement(sender, original_message)
-                return
             resolved_question = (
                 question[:500]
                 if question
@@ -4051,9 +8425,29 @@ class WhatsAppWebhookService:
             )
             return
         if intent.action == "confirm_validation":
+            if original_message and not self._is_requirement_confirmation_reply(
+                original_message
+            ):
+                await self._send_text(
+                    sender,
+                    "I have not confirmed, priced, or finalized anything from that message. "
+                    "When the displayed requirement is complete and correct, state explicitly "
+                    "that you confirm it for pricing; otherwise describe the correction.",
+                )
+                return
             await self._confirm_validation(sender)
             return
         if intent.action == "reject_validation":
+            if original_message and not self._is_explicit_validation_rejection(
+                original_message
+            ):
+                await self._send_text(
+                    sender,
+                    "I have not rejected or cancelled the validation from that message. "
+                    "State directly that the displayed requirement or proposal is not "
+                    "correct if you want to reject it, or describe the correction.",
+                )
+                return
             await self._reject_validation(sender)
             return
         if intent.action == "request_recommendation":
@@ -4147,6 +8541,10 @@ class WhatsAppWebhookService:
                     )
                     await self._send_text(sender, question)
                     return
+            await self._ensure_operation_allowed(
+                sender,
+                agent_action=intent.action,
+            )
             result = await self._orchestrator.recommend_higher_tier(
                 sender,
                 line_id=requested_line or None,
@@ -4163,6 +8561,13 @@ class WhatsAppWebhookService:
         if intent.action == "set_requirement_detail":
             label = intent.detail_label.strip()
             value = intent.detail_value.strip()
+            if not label or not value:
+                await self._send_text(
+                    sender,
+                    "Which proposal detail should I record, and what is its exact value? "
+                    "For example: Customer name is Contoso.",
+                )
+                return
             possible_product = " ".join(part for part in (label, value) if part).strip()
             if possible_product:
                 matches = await self._orchestrator.catalog_candidates(possible_product)
@@ -4286,13 +8691,19 @@ class WhatsAppWebhookService:
                 )
                 await self._send_updated_requirement(sender, estate)
                 return
+        if intent.action == "finalize":
+            # Finalize is also the explicit approval when the proposal is already at
+            # the final-validation gate. Route it before the general operation guard,
+            # which intentionally blocks ordinary edits while approval is pending.
+            await self._request_finalization(sender, seller_message=original_message)
+            return
+        await self._ensure_operation_allowed(sender, agent_action=intent.action)
         if await self._select_or_request_scenario_target(
             sender,
             intent,
             original_message,
         ):
             return
-        await self._ensure_operation_allowed(sender, agent_action=intent.action)
         if intent.action == "build_scenario":
             if intent.scenario == "none":
                 raise ValueError("Specify Renew As-Is, ME3, ME5, or ME7.")
@@ -4536,10 +8947,27 @@ class WhatsAppWebhookService:
             if session is None or session.estate is None:
                 raise ValueError("Upload a licence file before confirming SKU matches.")
             pending = {line.line_id: line for line in session.estate.pending_lines}
+            seller_grounded = bool(intent.match_selections) and all(
+                self._candidate_selection_is_seller_grounded(
+                    original_message or "",
+                    line_id=item.line_id,
+                    candidate_number=item.candidate_number,
+                    single_pending_line=len(pending) == 1,
+                )
+                for item in intent.match_selections
+            )
+            if original_message and not seller_grounded:
+                await self._send_text(
+                    sender,
+                    "I did not treat that message as a direct product selection, so no SKU "
+                    "was confirmed. Reply with a displayed option number (and the line when "
+                    "more than one line is unresolved), or send the complete product name.",
+                )
+                return
             selected_ids = {item.line_id.upper() for item in intent.match_selections}
             if not selected_ids or not selected_ids.issubset(set(pending)):
                 raise ValueError("Choose one of the displayed options for a pending line.")
-            selections: dict[str, tuple[str, str]] = {}
+            selections: dict[str, tuple[str, str, str]] = {}
             for item in intent.match_selections:
                 line_id = item.line_id.upper()
                 candidates = pending[line_id].candidates
@@ -4549,12 +8977,24 @@ class WhatsAppWebhookService:
                         f"Candidate {item.candidate_number} is invalid for {line_id}."
                     )
                 candidate = candidates[index]
-                selections[line_id] = (candidate.product_id, candidate.sku_id)
+                selections[line_id] = (
+                    candidate.product_id,
+                    candidate.sku_id,
+                    candidate.sku_title,
+                )
             estate = await self._orchestrator.confirm_matches(sender, selections)
             await self._after_requirement_match_confirmation(sender, estate)
             return
         if intent.action == "confirm_sku":
-            if intent.candidate_number <= 0:
+            explicit_candidate = (
+                self._single_candidate_number(original_message)
+                if original_message and "?" not in original_message
+                else None
+            )
+            if (
+                intent.candidate_number <= 0
+                or explicit_candidate != intent.candidate_number
+            ):
                 raise ValueError("Choose one of the numbered SKU candidates.")
             result = await self._orchestrator.confirm_sku_change(
                 sender,
@@ -4563,6 +9003,15 @@ class WhatsAppWebhookService:
             await self._send_sku_change_result(sender, result)
             return
         if intent.action == "cancel_sku":
+            if original_message and not self._requests_pending_change_cancel(
+                " ".join(original_message.casefold().strip(" ?!.,").split())
+            ):
+                await self._send_text(
+                    sender,
+                    "I have not cancelled the pending product change. The proposal remains "
+                    "unchanged.",
+                )
+                return
             cancelled = await self._orchestrator.cancel_sku_change(sender)
             await self._send_text(
                 sender,
@@ -4577,9 +9026,16 @@ class WhatsAppWebhookService:
             await self._send_scenario(sender, scenario)
             return
         if intent.action == "finalize":
-            await self._request_finalization(sender)
+            await self._request_finalization(sender, seller_message=original_message)
             return
         if intent.action == "compare":
+            if original_message and not self._is_comparison_request(original_message):
+                await self._send_text(
+                    sender,
+                    "I have not generated a comparison from that message. Explicitly ask me "
+                    "to compare the proposals when you want the commercial comparison.",
+                )
+                return
             await self._send_comparison(sender)
             return
         raise ValueError("The interpreted action is not supported.")
@@ -4589,48 +9045,42 @@ class WhatsAppWebhookService:
         if len(parts) < 3 or parts[0] != "licensing":
             raise ValueError("That menu selection is no longer recognized.")
         action, value = parts[1], parts[2]
-        if action == "validate_initial":
-            if value == "confirm":
-                await self._confirm_validation(sender)
-            elif value == "add_more":
-                await self._send_text(
-                    sender,
-                    "Which additional licence or licences should I add to this renewal "
-                    "requirement? Include the product name and quantity; you may also send "
-                    "another file, image, or voice note.",
-                )
-            else:
-                await self._reject_validation(sender)
+        if action in {"validate_initial", "validate_final"}:
+            # These tokenless IDs were emitted by an older WhatsApp UI. They carry no
+            # requirement/proposal identity, so an old button can arrive after a fresh
+            # session and would otherwise approve unrelated commercial state. Current
+            # validation is deliberately performed by a natural-language confirmation;
+            # no active message generator emits these legacy IDs.
+            await self._send_text(
+                sender,
+                "That approval selection belongs to an earlier proposal and is no longer "
+                "active. Nothing was confirmed or finalized. Review the latest requirement "
+                "or proposal and confirm it in a new message.",
+            )
             return
-        if action == "validate_final":
-            if value == "confirm":
-                await self._confirm_finalization_and_send(sender)
-            else:
-                await self._reject_validation(sender)
-            return
-        if action == "recommend":
-            if value == "yes":
-                await self._send_text(
-                    sender,
-                    "Which change would you like me to evaluate? You can update a quantity, "
-                    "add or remove a licence, replace a selected SKU, or request a "
-                    "higher-tier option for a specific line. I will confirm any uncertain "
-                    "SKU before recalculating the annual value.",
-                )
-            else:
-                await self._send_text(
-                    sender,
-                    "No recommendation changes were applied. You can finalize the as-is "
-                    "configuration whenever you are ready.",
-                )
+        if action in {"recommend", "scenario", "compare", "finalize", "scenarios"}:
+            # Legacy buttons did not carry a proposal/version token. A delayed click could
+            # otherwise mutate a newer session, so these IDs are read as stale regardless of
+            # their label. Current commercial actions are confirmed in natural language or
+            # use token-bound SKU/requirement selection IDs above.
+            await self._send_text(
+                sender,
+                "That menu selection belongs to an earlier proposal and is no longer "
+                "active. Nothing was changed. State the requested proposal action in a new "
+                "message.",
+            )
             return
         if action == "match_confirm":
-            if len(parts) != 4 or not parts[3].isdigit():
-                raise ValueError("That product selection is no longer valid.")
+            if len(parts) != 5 or not parts[4].isdigit():
+                raise ValueError(
+                    "That product-selection menu is no longer active. Review the latest "
+                    "requirement and use its current choices."
+                )
             estate = await self._confirm_requirement_candidate(
                 sender,
-                line_id=value,
-                candidate_number=int(parts[3]),
+                capture_token=value,
+                line_id=parts[3],
+                candidate_number=int(parts[4]),
             )
             await self._after_requirement_match_confirmation(sender, estate)
             return
@@ -4645,23 +9095,6 @@ class WhatsAppWebhookService:
             await self._send_sku_change_result(sender, result)
             return
         await self._ensure_operation_allowed(sender)
-        if action == "scenario":
-            try:
-                scenario_type = ScenarioType(value)
-            except ValueError as error:
-                raise ValueError("Unknown commercial scenario.") from error
-            scenario = await self._orchestrator.build_scenario(sender, scenario_type)
-            await self._send_scenario(sender, scenario)
-            return
-        if action == "compare":
-            await self._send_comparison(sender)
-            return
-        if action == "finalize":
-            await self._request_finalization(sender)
-            return
-        if action == "scenarios":
-            await self._send_scenario_menu(sender)
-            return
         raise ValueError("Unknown commercial workflow action.")
 
     async def _continue_after_estate(self, sender: str) -> None:
@@ -4877,8 +9310,10 @@ class WhatsAppWebhookService:
                 )
             return
         except Exception:
+            if "images" in locals():
+                raise
             logger.exception(
-                "Unable to render or send scenario table image; using text fallback"
+                "Unable to render scenario table image; using text fallback"
             )
         await self._send_text_chunks(
             sender,
@@ -4903,6 +9338,19 @@ class WhatsAppWebhookService:
         pending = result.confirmation
         if pending is None:
             raise RuntimeError("SKU confirmation state did not contain candidates.")
+        if pending.candidate_narrowing_required:
+            await self._send_text(
+                sender,
+                "*I need a more specific product description*\n\n"
+                + candidate_narrowing_question(
+                    pending.product_query,
+                    len(pending.candidates),
+                )
+                + "\n\n"
+                "I retained the requested action, quantity, and source product. Reply "
+                "with the missing qualifier; no proposal change has been applied.",
+            )
+            return
         lines = [
             "*I need to confirm the intended SKU*",
             "No change was made.",
@@ -5128,8 +9576,10 @@ class WhatsAppWebhookService:
                 )
             return
         except Exception:
+            if "images" in locals():
+                raise
             logger.exception(
-                "Unable to render or send comparison table image; using text fallback"
+                "Unable to render comparison table image; using text fallback"
             )
         await self._send_text_chunks(
             sender,
@@ -5168,15 +9618,12 @@ class WhatsAppWebhookService:
             raise ValueError("Upload a licence file before confirming validation.")
         if session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION:
             if self._configuration.workflow_mode == "simple_pricing":
-                await self._orchestrator.confirm_requirement(sender)
-                scenario = await self._orchestrator.build_scenario(
+                scenario = await self._orchestrator.confirm_requirement_and_price_as_is(
                     sender,
-                    ScenarioType.RENEW_AS_IS,
                     promo_eligible=False,
                 )
                 unavailable = [line for line in scenario.lines if line.price_unavailable]
                 if unavailable:
-                    await self._orchestrator.reopen_requirement_validation(sender)
                     names = ", ".join(
                         f"{line.line_id} ({line.sku_title})" for line in unavailable[:5]
                     )
@@ -5244,7 +9691,57 @@ class WhatsAppWebhookService:
             return
         raise ValueError("There is no seller validation currently awaiting a response.")
 
-    async def _request_finalization(self, sender: str) -> None:
+    async def _request_finalization(
+        self,
+        sender: str,
+        *,
+        seller_message: str | None = None,
+    ) -> None:
+        current = await self._orchestrator.get_session(sender)
+        if seller_message is not None:
+            allowed = (
+                self._is_explicit_finalization_approval(seller_message)
+                if current is not None
+                and current.stage == WorkflowStage.AWAITING_FINAL_VALIDATION
+                else self._is_assertive_finalization_request(seller_message)
+            )
+            if not allowed:
+                await self._send_text(
+                    sender,
+                    "I have not opened, approved, or finalized the proposal from that "
+                    "message. Ask about finalization if you need guidance, or directly ask "
+                    "me to finalize when the displayed proposal is correct.",
+                )
+                return
+        if current is not None and current.stage == WorkflowStage.AWAITING_FINAL_VALIDATION:
+            # Only an explicit approval of the visible final-validation gate may complete
+            # it. The semantic check above rejects questions, hypotheticals, reported
+            # speech, and negation before reaching this transition.
+            await self._confirm_finalization_and_send(sender)
+            return
+        if (
+            current is not None
+            and current.stage == WorkflowStage.FINALIZED
+            and current.active_scenario is not None
+            and current.active_scenario in current.scenarios
+        ):
+            finalized = current.scenarios[current.active_scenario]
+            await self._send_text(
+                sender,
+                "This proposal is already finalized. I am sending the finalized output "
+                "again; no commercial value or configuration has been changed.",
+            )
+            if self._configuration.workflow_mode == "simple_pricing":
+                await self._send_simple_revised(sender, finalized)
+                await self._send_simple_commercial_pdf(sender)
+            else:
+                await self._send_scenario(sender, finalized)
+                if self._configuration.workflow_mode in {
+                    "renewal_only",
+                    "upgrade_comparison",
+                }:
+                    await self._send_active_proposal_pdf(sender)
+            return
         scenario = await self._orchestrator.request_finalization(sender)
         if self._configuration.workflow_mode == "simple_pricing":
             session = await self._orchestrator.get_session(sender)
@@ -5319,6 +9816,12 @@ class WhatsAppWebhookService:
         session = await self._orchestrator.get_session(sender)
         if session is None:
             return
+        if session.stage == WorkflowStage.AWAITING_MATCH_CONFIRMATION:
+            raise ValueError(
+                "The exact Microsoft SKU is still unresolved for one or more licences. No "
+                "pricing or comparison was prepared. Confirm a displayed catalogue option, "
+                "provide the complete product name, or explicitly remove that licence first."
+            )
         if session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION:
             promo_resolution = (
                 bool(direct_command and direct_command.startswith("/promo "))
@@ -5331,6 +9834,28 @@ class WhatsAppWebhookService:
                     "then confirm naturally that the analysis and pricing are correct."
                 )
         if session.stage == WorkflowStage.AWAITING_FINAL_VALIDATION:
+            direct_correction = bool(
+                direct_command
+                and direct_command.startswith(
+                    (
+                        "/set ",
+                        "/copilot ",
+                        "/add ",
+                        "/replace ",
+                        "/retain ",
+                        "/remove ",
+                        "/migrate ",
+                        "/included ",
+                        "/term ",
+                        "/billing ",
+                        "/segment ",
+                        "/comment ",
+                    )
+                )
+            )
+            if direct_correction or agent_action in FINALIZATION_CORRECTION_ACTIONS:
+                await self._orchestrator.cancel_finalization(sender)
+                return
             raise ValueError(
                 "Final seller validation is pending. Confirm finalization naturally, or "
                 "describe the correction you want before sending another operation."
@@ -5355,24 +9880,43 @@ class WhatsAppWebhookService:
                 "This workflow is fixed to annual billing for every option."
             )
 
-    @staticmethod
-    def _requests_monthly_billing(message: str) -> bool:
-        monthly_terms = ("monthly", "month-to-month", "per month", "p1m")
-        return any(value in message for value in monthly_terms)
-
-    @staticmethod
-    def _requests_restricted_pricing(message: str) -> bool:
-        restricted_terms = (
-            "promo",
-            "promotion",
-            "promotional",
-            "partner best",
-            "partner-best",
-            "best offer",
-            "best price",
-            "distributor margin",
+    @classmethod
+    def _requests_monthly_billing(cls, message: str) -> bool:
+        normalized = " ".join(message.casefold().strip(" ?!.,").split())
+        monthly = r"(?:monthly|month-to-month|per\s+month|p1m)"
+        if re.fullmatch(rf"{monthly}(?:\s+billing)?", normalized):
+            return True
+        return cls._is_assertive_action_request(
+            message,
+            rf"(?:(?:set|change|switch|use|apply|make)"
+            rf"(?:\s+(?:the\s+)?billing(?:\s+plan)?)?(?:\s+to)?\s+{monthly}|"
+            rf"bill(?:\s+it)?\s+{monthly})",
         )
-        return any(value in message for value in restricted_terms)
+
+    @classmethod
+    def _requests_restricted_pricing(cls, message: str) -> bool:
+        normalized = " ".join(message.casefold().strip(" ?!.,").split())
+        restricted_atom = (
+            r"(?:promos?|promotions?|promotional(?:\s+pricing)?|discounts?|"
+            r"adjustments?|margins?|partner(?:'s)?[ -]best(?:\s+price)?|"
+            r"best\s+(?:offer|price)|distributor\s+margins?)"
+        )
+        restricted = (
+            rf"{restricted_atom}(?:\s*(?:,|and|or)\s*"
+            rf"(?:any\s+|an?\s+|the\s+)?{restricted_atom})*"
+        )
+        if re.fullmatch(
+            rf"(?:-?\d+(?:\.\d+)?\s*%\s+discount|"
+            rf"(?:commercial\s+)?adjustment\s+(?:of\s+)?-?\d+(?:\.\d+)?)",
+            normalized,
+        ):
+            return True
+        return cls._is_assertive_action_request(
+            message,
+            rf"(?:(?:apply|add|set|change|remove|use|enable|disable|give(?:\s+me)?)"
+            rf"(?:\s+(?:a|the))?\s+{restricted}(?:\s+of\s+-?\d+(?:\.\d+)?)?|"
+            rf"(?:find|show)\s+(?:me\s+)?(?:the\s+)?best\s+(?:offer|price))",
+        )
 
     async def _send_active_proposal_pdf(self, sender: str) -> None:
         session = await self._orchestrator.get_session(sender)

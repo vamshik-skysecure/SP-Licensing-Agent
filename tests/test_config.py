@@ -122,6 +122,34 @@ class StorageModeSettingsTests(unittest.TestCase):
                 whatsapp_seller_allowlist="Vamshik: 918197235267",
             )
 
+    def test_validation_errors_redact_all_configured_secrets(self) -> None:
+        sentinels = {
+            "OPENAI_SENTINEL_SECRET_71f0",
+            "WHATSAPP_ACCESS_SENTINEL_82a1",
+            "WHATSAPP_VERIFY_SENTINEL_93b2",
+            "WHATSAPP_APP_SENTINEL_a4c3",
+            "STORAGE_CONNECTION_SENTINEL_b5d4",
+        }
+
+        with self.assertRaises(ValidationError) as caught:
+            Settings(
+                _env_file=None,
+                whatsapp_seller_allowlist="not a phone number",
+                openai_api_key="OPENAI_SENTINEL_SECRET_71f0",
+                whatsapp_access_token="WHATSAPP_ACCESS_SENTINEL_82a1",
+                whatsapp_webhook_verify_token="WHATSAPP_VERIFY_SENTINEL_93b2",
+                whatsapp_app_secret="WHATSAPP_APP_SENTINEL_a4c3",
+                rate_card_storage_connection_string=(
+                    "STORAGE_CONNECTION_SENTINEL_b5d4"
+                ),
+            )
+
+        rendered = f"{caught.exception!s}\n{caught.exception!r}"
+        for sentinel in sentinels:
+            self.assertNotIn(sentinel, rendered)
+            self.assertNotIn(sentinel[-12:], rendered)
+        self.assertNotIn("input_value", rendered)
+
     def test_production_rejects_empty_allowlist_without_public_access(self) -> None:
         with self.assertRaisesRegex(
             ValidationError,

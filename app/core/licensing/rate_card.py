@@ -287,6 +287,57 @@ def _base_suite_penalty(title: str) -> int:
     return int(bool(set(title.split()) - permitted))
 
 
+def _token_match_quality(
+    query_tokens: set[str],
+    title_tokens: set[str],
+) -> tuple[int, int, float]:
+    """Return exact count, typo-tolerant count, and total fuzzy similarity.
+
+    A one-to-one token assignment prevents one catalogue word from satisfying
+    several misspelled seller words. Short unmatched tokens are deliberately not
+    fuzzed: similarities between identifiers such as E3/E5/F1/P2 are unsafe, and
+    those identifiers already have their own exact tier/plan guards.
+    """
+
+    exact_tokens = query_tokens & title_tokens
+    unmatched_query = {
+        token
+        for token in query_tokens - exact_tokens
+        if len(token) >= 4 and not token.isdigit()
+    }
+    unmatched_title = {
+        token
+        for token in title_tokens - exact_tokens
+        if len(token) >= 4 and not token.isdigit()
+    }
+    possible_matches: list[tuple[float, str, str]] = []
+    for query_token in unmatched_query:
+        for title_token in unmatched_title:
+            similarity = float(fuzz.ratio(query_token, title_token))
+            shorter, longer = sorted((query_token, title_token), key=len)
+            if (
+                longer.startswith(shorter)
+                and len(shorter) >= 4
+                and len(shorter) / len(longer) >= 0.55
+            ):
+                # Common seller abbreviations such as "prod" for "product"
+                # should remain advisory matches, never exact matches.
+                similarity = max(similarity, 90.0)
+            if similarity >= 82:
+                possible_matches.append((similarity, query_token, title_token))
+    possible_matches.sort(reverse=True)
+    used_query: set[str] = set()
+    used_title: set[str] = set()
+    fuzzy_scores: list[float] = []
+    for similarity, query_token, title_token in possible_matches:
+        if query_token in used_query or title_token in used_title:
+            continue
+        used_query.add(query_token)
+        used_title.add(title_token)
+        fuzzy_scores.append(similarity)
+    return len(exact_tokens), len(fuzzy_scores), sum(fuzzy_scores)
+
+
 @dataclass(frozen=True)
 class SkuIdentity:
     product_id: str
@@ -379,7 +430,11 @@ class RateCardCatalog:
             return matches[:1]
 
         query_tokens = set(normalized.split())
-        informative_query = query_tokens - _GENERIC_SKU_TOKENS
+        informative_query = {
+            token
+            for token in query_tokens - _GENERIC_SKU_TOKENS
+            if not token.isdigit()
+        }
         if not informative_query:
             # A phrase such as "Microsoft licence" or "Microsoft 365" is not a
             # usable product choice. Returning hundreds of weak options is both
@@ -424,12 +479,27 @@ class RateCardCatalog:
                 continue
             if required_qualifiers and not required_qualifiers.issubset(title_tokens):
                 continue
-            overlap = len(informative_query & title_tokens)
-            if informative_query and overlap == 0:
+            exact_overlap, fuzzy_overlap, fuzzy_similarity = _token_match_quality(
+                informative_query,
+                title_tokens,
+            )
+            overlap = exact_overlap + fuzzy_overlap
+            minimum_coverage = max(
+                1,
+                (len(informative_query) * 3 + 3) // 4,
+            )
+            if overlap < minimum_coverage:
                 continue
+            token_quality = (
+                (exact_overlap * 100.0 + fuzzy_similarity)
+                / len(informative_query)
+            )
+            # Preserve the catalogue's established confidence scale while making
+            # the token bonus typo-aware. Candidate admission and ordering use the
+            # full token-quality signal; confidence remains advisory unless an
+            # exact title/identifier branch above returned 100.
             score = float(fuzz.WRatio(normalized, title))
-            if informative_query:
-                score += 8.0 * overlap / len(informative_query)
+            score += 8.0 * token_quality / 100.0
             score -= 6.0 * _unrequested_variant_count(normalized, title)
             score = max(0.0, min(99.0, score))
             if score < 55.0:
@@ -441,6 +511,7 @@ class RateCardCatalog:
                         normalized_query=normalized,
                         query_family=query_family,
                         has_tier=bool(tiers),
+                        token_quality=token_quality,
                         score=score,
                     ),
                     identity,
@@ -515,6 +586,7 @@ class RateCardCatalog:
         normalized_query: str,
         query_family: str | None,
         has_tier: bool,
+        token_quality: float,
         score: float,
     ) -> tuple[object, ...]:
         title = normalize_product_title(identity.sku_title)
@@ -526,6 +598,7 @@ class RateCardCatalog:
         )
         return (
             family_priority,
+            -token_quality,
             _unrequested_variant_count(normalized_query, title),
             _base_suite_penalty(title),
             *self._identity_preference(identity),
@@ -544,6 +617,13 @@ class RateCardCatalog:
         billing_plan: str | None = None,
         segment: str | None = None,
     ) -> list[RateCardItem]:
+        # V6 deliberately retains catalogue rows whose Microsoft ProductId and
+        # SkuId are both blank. For those rows the maintained title is part of
+        # the identity; a blank pair alone would otherwise select every name-only
+        # product. The same strict title check also prevents a stale confirmed
+        # title from silently resolving to another row that happens to share IDs.
+        if (not product_id or not sku_id) and not sku_title:
+            return []
         rows = [
             item
             for item in self.items
@@ -557,8 +637,7 @@ class RateCardCatalog:
                 for item in rows
                 if normalize_product_title(item.sku_title) == normalized
             ]
-            if title_rows:
-                rows = title_rows
+            rows = title_rows
         if term_duration:
             rows = [
                 item

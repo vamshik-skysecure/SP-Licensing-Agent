@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Callable, Literal
 from uuid import uuid4
 
-from .analysis import LicenseAnalyzer
+from .analysis import LicenseAnalyzer, SkuMatchSelection
+from .candidate_policy import requires_candidate_narrowing
 from .models import (
     CommercialComparison,
     CommercialScenario,
@@ -28,6 +31,16 @@ from .models import (
 from .rate_card import RateCardCatalog, RateCardProvider, normalize_product_title
 from .scenarios import ScenarioEngine, ScenarioError, SkuSelector
 from .store import WorkflowConflictError, WorkflowStore
+
+
+# A claimed webhook turn may legitimately spend longer than the conversational TTL in
+# media parsing, model inference, rendering, or outbound delivery.  Keep that ownership
+# local to the current async context: unrelated turns must still observe the normal TTL.
+# The tuple also includes the opaque message digest so nested claims cannot deactivate one
+# another accidentally.
+_ACTIVE_TURN_CLAIMS: ContextVar[
+    frozenset[tuple[str, str, str]]
+] = ContextVar("licensing_active_turn_claims", default=frozenset())
 
 
 @dataclass(frozen=True)
@@ -59,6 +72,7 @@ class LicensingOrchestrator:
         self._default_term_duration = default_term_duration
         self._default_billing_plan = default_billing_plan
         self._default_segment = default_segment
+        self._turn_context_owner = uuid4().hex
 
     @staticmethod
     def thread_id(sender: str) -> str:
@@ -69,9 +83,163 @@ class LicensingOrchestrator:
     def processed_message_id(message_id: str) -> str:
         return hashlib.sha256(message_id.encode("utf-8")).hexdigest()
 
+    def _activate_turn_claim(self, thread_id: str, message_digest: str) -> None:
+        claims = _ACTIVE_TURN_CLAIMS.get()
+        _ACTIVE_TURN_CLAIMS.set(
+            claims | {(self._turn_context_owner, thread_id, message_digest)}
+        )
+
+    def _deactivate_turn_claim(self, thread_id: str, message_digest: str) -> None:
+        claim = (self._turn_context_owner, thread_id, message_digest)
+        claims = _ACTIVE_TURN_CLAIMS.get()
+        if claim in claims:
+            _ACTIVE_TURN_CLAIMS.set(claims - {claim})
+
+    def _has_active_turn_claim(self, thread_id: str) -> bool:
+        orchestrator_id = self._turn_context_owner
+        return any(
+            owner == orchestrator_id and claimed_thread == thread_id
+            for owner, claimed_thread, _message_digest in _ACTIVE_TURN_CLAIMS.get()
+        )
+
+    def end_message_processing_context(self, sender: str, message_id: str) -> None:
+        """Drop task-local turn ownership without changing persisted replay state.
+
+        The webhook service calls this in ``finally`` so cancellation, outbound delivery
+        failures, and receipt-write failures cannot leak an active-turn read into the next
+        message handled by the same worker task.
+        """
+
+        self._deactivate_turn_claim(
+            self.thread_id(sender),
+            self.processed_message_id(message_id),
+        )
+
+    @staticmethod
+    def _same_catalogue_line_identity(
+        first: NormalizedLicenseLine,
+        second: NormalizedLicenseLine,
+    ) -> bool:
+        first_product_id = (first.product_id or "").casefold()
+        first_sku_id = (first.sku_id or "").casefold()
+        second_product_id = (second.product_id or "").casefold()
+        second_sku_id = (second.sku_id or "").casefold()
+        if (first_product_id, first_sku_id) != (
+            second_product_id,
+            second_sku_id,
+        ):
+            return False
+        if first_product_id and first_sku_id:
+            return True
+        return normalize_product_title(first.display_title) == normalize_product_title(
+            second.display_title
+        )
+
+    @staticmethod
+    def _ensure_proposal_mutation_allowed(session: WorkflowSession) -> None:
+        """Protect validation gates and finalized proposals at the domain boundary.
+
+        Service-layer checks improve the seller experience, but every state-changing
+        orchestration path must enforce the same invariant inside its optimistic-
+        concurrency mutation. Otherwise a direct caller, stale interactive reply, or
+        retry can reopen a proposal after validation has started or completed.
+        """
+
+        if session.stage == WorkflowStage.AWAITING_FINAL_VALIDATION:
+            raise ScenarioError(
+                "Final seller validation is pending. Cancel finalization before changing "
+                "the proposal."
+            )
+        if session.stage == WorkflowStage.FINALIZED:
+            raise ScenarioError(
+                "This proposal is finalized. Start a fresh requirement before changing it."
+            )
+
+    @staticmethod
+    def _requirement_fingerprint(estate: LicenseEstate) -> str:
+        """Return a stable commercial snapshot for a pending requirement choice."""
+
+        payload = {
+            "rate_card_version": estate.rate_card_version,
+            "lines": [line.model_dump(mode="json") for line in estate.lines],
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _ensure_no_unfinished_work(
+        session: WorkflowSession,
+        *,
+        action: str,
+        allow_pending_matches: bool = False,
+        allow_capture_messages: bool = False,
+    ) -> None:
+        blockers: list[str] = []
+        if session.capture_messages and not allow_capture_messages:
+            blockers.append("unfinished product or quantity details")
+        if session.pending_dialogue is not None:
+            blockers.append("an unanswered clarification")
+        if session.pending_sku_change is not None:
+            blockers.append("an unconfirmed SKU choice")
+        if (
+            not allow_pending_matches
+            and session.estate is not None
+            and session.estate.pending_lines
+        ):
+            blockers.append("an unresolved catalogue match")
+        if blockers:
+            raise ScenarioError(
+                f"Resolve or explicitly cancel {', '.join(blockers)} before {action}."
+            )
+
+    @classmethod
+    def _ensure_new_analysis_allowed(
+        cls,
+        session: WorkflowSession,
+        *,
+        allow_capture_messages: bool = False,
+    ) -> None:
+        """Require an explicit reset before replacing any active workflow state."""
+
+        if (
+            session.stage != WorkflowStage.AWAITING_UPLOAD
+            or session.estate is not None
+            or session.scenarios
+            or session.active_scenario is not None
+            or session.confirmed_as_is is not None
+            or (session.capture_messages and not allow_capture_messages)
+            or session.pending_dialogue is not None
+            or session.pending_sku_change is not None
+        ):
+            raise ScenarioError(
+                "A licensing requirement is already active. Resolve it, or explicitly "
+                "start fresh before replacing it with another file or requirement."
+            )
+
     async def get_session(self, sender: str) -> WorkflowSession | None:
-        session, _ = await self._store.get(self.thread_id(sender))
+        thread_id = self.thread_id(sender)
+        if self._has_active_turn_claim(thread_id):
+            session, _ = await self._get_raw_session(sender)
+        else:
+            session, _ = await self._store.get(thread_id)
         return session
+
+    async def _get_raw_session(
+        self, sender: str
+    ) -> tuple[WorkflowSession | None, str | None]:
+        """Read message history even after the five-minute conversation TTL."""
+
+        raw_reader = getattr(self._store, "get_raw", None)
+        if raw_reader is None:
+            # Compatibility for small test doubles and third-party stores. Production
+            # stores implement get_raw so inbox de-duplication survives session expiry.
+            return await self._store.get(self.thread_id(sender))
+        return await raw_reader(self.thread_id(sender))
 
     async def affordable_catalog_offers(
         self,
@@ -167,12 +335,24 @@ class LicensingOrchestrator:
             session, version = await self._store.get(thread_id)
             if session is not None or version is None:
                 return False
+            expired, raw_version = await self._get_raw_session(sender)
+            if raw_version != version:
+                continue
             fresh = WorkflowSession(
                 id=thread_id,
                 thread_id=thread_id,
                 # Keep the persisted compatibility field opaque. The raw WhatsApp
                 # number is needed only while handling the current request.
                 sender=thread_id,
+                processed_message_ids=(
+                    list(expired.processed_message_ids[-1000:]) if expired else []
+                ),
+                inflight_message_ids=(
+                    list(expired.inflight_message_ids[-1000:]) if expired else []
+                ),
+                failure_notified_message_ids=(
+                    list(expired.failure_notified_message_ids[-1000:]) if expired else []
+                ),
             )
             try:
                 await self._store.save(fresh, version)
@@ -193,11 +373,21 @@ class LicensingOrchestrator:
 
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
+            self._ensure_proposal_mutation_allowed(session)
+            if session.pending_sku_change is not None:
+                raise ScenarioError(
+                    "Confirm or cancel the pending SKU choice before starting another "
+                    "licence entry."
+                )
+            if session.pending_dialogue is not None:
+                raise ScenarioError(
+                    "Answer or cancel the pending clarification before starting another "
+                    "licence entry."
+                )
             result = [*session.capture_messages, cleaned][-8:]
             return session.model_copy(
                 update={
                     "capture_messages": result,
-                    "pending_dialogue": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -218,11 +408,11 @@ class LicensingOrchestrator:
                     "scenarios": {},
                     "active_scenario": None,
                     "confirmed_as_is": None,
+                    "requirement_confirmed": False,
                     "pending_sku_change": None,
                     "pending_dialogue": None,
                     "pending_match_prompt_suspended": False,
                     "capture_messages": [],
-                    "failure_notified_message_ids": [],
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -237,7 +427,6 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "capture_messages": [],
-                    "pending_dialogue": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -295,6 +484,29 @@ class LicensingOrchestrator:
         await self._mutate(sender, update)
         return attempts
 
+    async def record_pending_sku_change_failure(self, sender: str) -> int:
+        """Atomically count one unanswered pending SKU-choice attempt."""
+
+        attempts = 0
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal attempts
+            pending = session.pending_sku_change
+            if pending is None:
+                return session
+            attempts = min(pending.failed_attempts + 1, 2)
+            return session.model_copy(
+                update={
+                    "pending_sku_change": pending.model_copy(
+                        update={"failed_attempts": attempts}
+                    ),
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        return attempts
+
     async def set_pending_match_prompt_suspended(
         self,
         sender: str,
@@ -313,13 +525,90 @@ class LicensingOrchestrator:
         )
 
     async def has_processed(self, sender: str, message_id: str) -> bool:
-        session = await self.get_session(sender)
+        session, _ = await self._get_raw_session(sender)
         if session is None:
             return False
         digest = self.processed_message_id(message_id)
         # Accept legacy raw entries during a rolling deployment; the next mutation
         # replaces the retained history with opaque digests.
         return message_id in session.processed_message_ids or digest in session.processed_message_ids
+
+    async def claim_message_processing(
+        self,
+        sender: str,
+        message_id: str,
+    ) -> Literal["claimed", "inflight", "processed"]:
+        """Atomically claim an inbound message before any commercial mutation.
+
+        A surviving in-flight digest is intentionally conservative: a restarted worker
+        cannot know whether the prior process terminated before or after committing a
+        mutation, so it must not execute the same instruction automatically again.
+        """
+
+        thread_id = self.thread_id(sender)
+        digest = self.processed_message_id(message_id)
+        for _ in range(3):
+            session, version = await self._get_raw_session(sender)
+            if session is None:
+                session = WorkflowSession(
+                    id=thread_id,
+                    thread_id=thread_id,
+                    sender=thread_id,
+                )
+            processed = {
+                value
+                if re.fullmatch(r"[0-9a-f]{64}", value)
+                else self.processed_message_id(value)
+                for value in session.processed_message_ids
+            }
+            if digest in processed:
+                return "processed"
+            if digest in session.inflight_message_ids:
+                return "inflight"
+            updated = session.model_copy(
+                update={
+                    "sender": thread_id,
+                    "inflight_message_ids": [
+                        *session.inflight_message_ids[-999:],
+                        digest,
+                    ],
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            try:
+                await self._store.save(updated, version)
+                self._activate_turn_claim(thread_id, digest)
+                return "claimed"
+            except WorkflowConflictError:
+                continue
+        raise WorkflowConflictError(
+            "The inbound message claim changed concurrently; retry delivery."
+        )
+
+    async def has_inflight_message(self, sender: str, message_id: str) -> bool:
+        session, _ = await self._get_raw_session(sender)
+        if session is None:
+            return False
+        return self.processed_message_id(message_id) in session.inflight_message_ids
+
+    async def release_message_processing(self, sender: str, message_id: str) -> None:
+        """Release a claim when a known pre-commit concurrency conflict is retryable."""
+
+        digest = self.processed_message_id(message_id)
+        await self._mutate(
+            sender,
+            lambda session: session.model_copy(
+                update={
+                    "inflight_message_ids": [
+                        value
+                        for value in session.inflight_message_ids[-1000:]
+                        if value != digest
+                    ],
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
+        )
+        self._deactivate_turn_claim(self.thread_id(sender), digest)
 
     async def mark_processed(self, sender: str, message_id: str) -> None:
         digest = self.processed_message_id(message_id)
@@ -337,6 +626,11 @@ class LicensingOrchestrator:
                         ],
                         digest,
                     ],
+                    "inflight_message_ids": [
+                        value
+                        for value in session.inflight_message_ids[-999:]
+                        if value != digest
+                    ],
                     "failure_notified_message_ids": [
                         value
                         for value in session.failure_notified_message_ids[-999:]
@@ -346,9 +640,10 @@ class LicensingOrchestrator:
                 }
             ),
         )
+        self._deactivate_turn_claim(self.thread_id(sender), digest)
 
     async def has_failure_notification(self, sender: str, message_id: str) -> bool:
-        session = await self.get_session(sender)
+        session, _ = await self._get_raw_session(sender)
         if session is None:
             return False
         digest = self.processed_message_id(message_id)
@@ -384,12 +679,14 @@ class LicensingOrchestrator:
         )
 
         def update(session: WorkflowSession) -> WorkflowSession:
+            self._ensure_new_analysis_allowed(session)
             return session.model_copy(
                 update={
                     "estate": estate,
                     "scenarios": {},
                     "active_scenario": None,
                     "confirmed_as_is": None,
+                    "requirement_confirmed": False,
                     "pending_sku_change": None,
                     "pending_dialogue": None,
                     "pending_match_prompt_suspended": False,
@@ -413,6 +710,7 @@ class LicensingOrchestrator:
         source_file: str,
         rows: list[ParsedLicenseRow],
         seller_details: list[SellerProvidedDetail] | None = None,
+        consume_capture_messages: bool = False,
     ) -> LicenseEstate:
         thread_id = self.thread_id(sender)
         estate = await self._analyzer.analyze_parsed(
@@ -423,12 +721,17 @@ class LicensingOrchestrator:
         )
 
         def update(session: WorkflowSession) -> WorkflowSession:
+            self._ensure_new_analysis_allowed(
+                session,
+                allow_capture_messages=consume_capture_messages,
+            )
             return session.model_copy(
                 update={
                     "estate": estate,
                     "scenarios": {},
                     "active_scenario": None,
                     "confirmed_as_is": None,
+                    "requirement_confirmed": False,
                     "pending_sku_change": None,
                     "pending_dialogue": None,
                     "pending_match_prompt_suspended": False,
@@ -468,6 +771,7 @@ class LicensingOrchestrator:
         source_file: str,
         rows: list[ParsedLicenseRow],
         seller_details: list[SellerProvidedDetail] | None = None,
+        consume_capture_messages: bool = False,
     ) -> LicenseEstate:
         """Add multimodal/text-extracted lines to the unconfirmed draft."""
 
@@ -477,12 +781,18 @@ class LicensingOrchestrator:
             parsed=rows,
             seller_details=seller_details,
         )
-        return await self._append_estate(sender, incoming)
+        return await self._append_estate(
+            sender,
+            incoming,
+            consume_capture_messages=consume_capture_messages,
+        )
 
     async def _append_estate(
         self,
         sender: str,
         incoming: LicenseEstate,
+        *,
+        consume_capture_messages: bool = False,
     ) -> LicenseEstate:
         result: LicenseEstate | None = None
 
@@ -494,6 +804,12 @@ class LicensingOrchestrator:
                     "The full requirement is already confirmed. Should this licence be "
                     "added to the revised configuration instead?"
                 )
+            self._ensure_no_unfinished_work(
+                session,
+                action="adding another attachment",
+                allow_pending_matches=True,
+                allow_capture_messages=consume_capture_messages,
+            )
 
             lines = list(current.lines)
             numeric_ids = [
@@ -509,8 +825,10 @@ class LicensingOrchestrator:
                         for index, existing in enumerate(lines)
                         if existing.match_method != "unresolved"
                         and incoming_line.match_method != "unresolved"
-                        and existing.product_id == incoming_line.product_id
-                        and existing.sku_id == incoming_line.sku_id
+                        and self._same_catalogue_line_identity(
+                            existing,
+                            incoming_line,
+                        )
                         and existing.term_duration == incoming_line.term_duration
                         and existing.billing_plan == incoming_line.billing_plan
                         and existing.expiration_date == incoming_line.expiration_date
@@ -580,13 +898,14 @@ class LicensingOrchestrator:
                     "scenarios": {},
                     "active_scenario": None,
                     "confirmed_as_is": None,
-                    "pending_sku_change": None,
-                    "pending_dialogue": None,
-                    "capture_messages": [],
+                    "requirement_confirmed": False,
+                    "capture_messages": (
+                        [] if consume_capture_messages else session.capture_messages
+                    ),
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
                         if pending
-                        else WorkflowStage.AWAITING_SCENARIO
+                        else WorkflowStage.AWAITING_INITIAL_VALIDATION
                     ),
                     "updated_at": now,
                 }
@@ -615,10 +934,12 @@ class LicensingOrchestrator:
             nonlocal result
             if session.estate is None:
                 raise ScenarioError("Provide a licensing requirement before adding details.")
-            if session.stage == WorkflowStage.FINALIZED:
-                raise ScenarioError(
-                    "This proposal is finalized. Start a fresh requirement before changing it."
-                )
+            self._ensure_proposal_mutation_allowed(session)
+            self._ensure_no_unfinished_work(
+                session,
+                action="changing proposal details",
+                allow_pending_matches=True,
+            )
             details = [
                 item
                 for item in session.estate.seller_details
@@ -632,15 +953,9 @@ class LicensingOrchestrator:
                     "updated_at": datetime.now(UTC),
                 }
             )
-            next_stage = (
-                WorkflowStage.REVIEWING_SCENARIO
-                if session.stage == WorkflowStage.AWAITING_FINAL_VALIDATION
-                else session.stage
-            )
             return session.model_copy(
                 update={
                     "estate": result,
-                    "stage": next_stage,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -652,7 +967,7 @@ class LicensingOrchestrator:
     async def confirm_matches(
         self,
         sender: str,
-        selections: dict[str, tuple[str, str]],
+        selections: dict[str, SkuMatchSelection],
     ) -> LicenseEstate:
         result: LicenseEstate | None = None
 
@@ -660,11 +975,13 @@ class LicensingOrchestrator:
             nonlocal result
             if session.estate is None:
                 raise ValueError("Upload a licence file before confirming SKU matches.")
+            self._ensure_proposal_mutation_allowed(session)
             result = self._analyzer.confirm_matches(session.estate, selections)
             return session.model_copy(
                 update={
                     "estate": result,
                     "pending_match_prompt_suspended": False,
+                    "requirement_confirmed": False,
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
                         if result.pending_lines
@@ -685,8 +1002,16 @@ class LicensingOrchestrator:
             nonlocal result
             if session.estate is None:
                 raise ScenarioError("Provide a licensing requirement before validation.")
-            if session.estate.pending_lines:
-                raise ScenarioError("Confirm all pending SKU matches before validation.")
+            self._ensure_proposal_mutation_allowed(session)
+            if session.confirmed_as_is is not None:
+                raise ScenarioError(
+                    "The Renew As-Is baseline is already confirmed. Start fresh for a new "
+                    "requirement, or edit the revised proposal."
+                )
+            self._ensure_no_unfinished_work(
+                session,
+                action="requesting seller validation",
+            )
             result = session.estate
             return session.model_copy(
                 update={
@@ -708,7 +1033,11 @@ class LicensingOrchestrator:
                 raise ScenarioError("There is no requirement awaiting seller confirmation.")
             if session.estate is None or session.estate.pending_lines:
                 raise ScenarioError("Resolve all SKU matches before confirming the requirement.")
-            if session.capture_messages or session.pending_dialogue is not None:
+            if (
+                session.capture_messages
+                or session.pending_dialogue is not None
+                or session.pending_sku_change is not None
+            ):
                 raise ScenarioError(
                     "Resolve the pending requirement question before confirming the requirement."
                 )
@@ -716,6 +1045,68 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "stage": WorkflowStage.AWAITING_SCENARIO,
+                    "requirement_confirmed": True,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        await self._mutate(sender, update)
+        assert result is not None
+        return result
+
+    async def confirm_requirement_and_price_as_is(
+        self,
+        sender: str,
+        *,
+        promo_eligible: bool = False,
+    ) -> CommercialScenario:
+        """Atomically confirm a clean requirement and persist its Renew As-Is baseline.
+
+        The seller confirmation, generated baseline, active scenario, and confirmed baseline
+        are one optimistic-concurrency write. A missing price leaves the requirement at its
+        validation gate, avoiding the partially confirmed state that three separate writes
+        could previously create after an interruption.
+        """
+
+        catalog = await self._rate_cards.get()
+        result: CommercialScenario | None = None
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            nonlocal result
+            if session.stage != WorkflowStage.AWAITING_INITIAL_VALIDATION:
+                raise ScenarioError("There is no requirement awaiting seller confirmation.")
+            if session.estate is None or session.estate.pending_lines:
+                raise ScenarioError("Resolve all SKU matches before confirming the requirement.")
+            if (
+                session.capture_messages
+                or session.pending_dialogue is not None
+                or session.pending_sku_change is not None
+            ):
+                raise ScenarioError(
+                    "Resolve the pending requirement question before confirming the requirement."
+                )
+            result = self._scenarios.build(
+                estate=session.estate,
+                scenario_type=ScenarioType.RENEW_AS_IS,
+                catalog=catalog,
+                term_duration=self._default_term_duration,
+                billing_plan=self._default_billing_plan,
+                segment=self._default_segment,
+                promo_eligible=promo_eligible,
+            )
+            if any(line.price_unavailable for line in result.lines):
+                return session
+            scenarios = dict(session.scenarios)
+            scenarios[ScenarioType.RENEW_AS_IS] = result
+            return session.model_copy(
+                update={
+                    "scenarios": scenarios,
+                    "active_scenario": ScenarioType.RENEW_AS_IS,
+                    "confirmed_as_is": result.model_copy(deep=True),
+                    "requirement_confirmed": True,
+                    "pending_sku_change": None,
+                    "pending_dialogue": None,
+                    "stage": WorkflowStage.REVIEWING_SCENARIO,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -731,7 +1122,29 @@ class LicensingOrchestrator:
     ) -> CommercialScenario:
         def update(session: WorkflowSession) -> WorkflowSession:
             current = session.scenarios.get(ScenarioType.RENEW_AS_IS)
-            if current is None or current.id != scenario.id:
+            self._ensure_proposal_mutation_allowed(session)
+            self._ensure_no_unfinished_work(
+                session,
+                action="saving the confirmed Renew As-Is baseline",
+            )
+            if not session.requirement_confirmed:
+                raise ScenarioError(
+                    "Confirm the complete captured requirement before saving its "
+                    "Renew As-Is baseline."
+                )
+            if session.confirmed_as_is is not None:
+                if session.confirmed_as_is == scenario:
+                    return session
+                raise ScenarioError(
+                    "The confirmed Renew As-Is baseline is already saved and cannot be "
+                    "silently replaced by an edited proposal."
+                )
+            if (
+                current is None
+                or current.id != scenario.id
+                or current.revision != scenario.revision
+                or current != scenario
+            ):
                 raise ScenarioError("The confirmed as-is price is no longer current.")
             return session.model_copy(
                 update={
@@ -753,13 +1166,18 @@ class LicensingOrchestrator:
             nonlocal result
             if session.estate is None:
                 raise ScenarioError("Provide a licensing requirement before reviewing it.")
+            self._ensure_proposal_mutation_allowed(session)
+            self._ensure_no_unfinished_work(
+                session,
+                action="reopening requirement validation",
+            )
             result = session.estate
             return session.model_copy(
                 update={
                     "scenarios": {},
                     "active_scenario": None,
                     "confirmed_as_is": None,
-                    "pending_sku_change": None,
+                    "requirement_confirmed": False,
                     "stage": WorkflowStage.AWAITING_INITIAL_VALIDATION,
                     "updated_at": datetime.now(UTC),
                 }
@@ -785,6 +1203,18 @@ class LicensingOrchestrator:
             nonlocal result
             if session.estate is None:
                 raise ScenarioError("Upload a licence file before building a scenario.")
+            self._ensure_proposal_mutation_allowed(session)
+            self._ensure_no_unfinished_work(
+                session,
+                action="reviewing pricing",
+            )
+            if session.stage not in {
+                WorkflowStage.AWAITING_SCENARIO,
+                WorkflowStage.REVIEWING_SCENARIO,
+            }:
+                raise ScenarioError(
+                    "Confirm the complete licensing requirement before reviewing pricing."
+                )
             scenarios = dict(session.scenarios)
             existing = scenarios.get(scenario_type)
             if existing is not None:
@@ -806,7 +1236,6 @@ class LicensingOrchestrator:
                     update={
                         "scenarios": scenarios,
                         "active_scenario": scenario_type,
-                        "pending_sku_change": None,
                         "stage": WorkflowStage.REVIEWING_SCENARIO,
                         "updated_at": datetime.now(UTC),
                     }
@@ -836,7 +1265,6 @@ class LicensingOrchestrator:
                 update={
                     "scenarios": scenarios,
                     "active_scenario": scenario_type,
-                    "pending_sku_change": None,
                     "stage": WorkflowStage.REVIEWING_SCENARIO,
                     "updated_at": datetime.now(UTC),
                 }
@@ -855,6 +1283,16 @@ class LicensingOrchestrator:
                 raise ScenarioError(
                     "Upload a licence file and prepare Renew As-Is before validation."
                 )
+            self._ensure_proposal_mutation_allowed(session)
+            if session.confirmed_as_is is not None:
+                raise ScenarioError(
+                    "The Renew As-Is baseline is already confirmed; initial validation "
+                    "cannot be restarted implicitly."
+                )
+            self._ensure_no_unfinished_work(
+                session,
+                action="requesting initial seller validation",
+            )
             result = session.scenarios.get(session.active_scenario)
             if result is None:
                 raise ScenarioError("The initial proposal could not be found.")
@@ -876,6 +1314,10 @@ class LicensingOrchestrator:
             nonlocal result
             if session.stage != WorkflowStage.AWAITING_INITIAL_VALIDATION:
                 raise ScenarioError("There is no initial seller validation awaiting approval.")
+            self._ensure_no_unfinished_work(
+                session,
+                action="confirming initial seller validation",
+            )
             if session.active_scenario is None:
                 raise ScenarioError("The initial proposal could not be found.")
             result = session.scenarios.get(session.active_scenario)
@@ -891,6 +1333,7 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "stage": WorkflowStage.REVIEWING_SCENARIO,
+                    "requirement_confirmed": True,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -904,9 +1347,31 @@ class LicensingOrchestrator:
 
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
-            if session.stage == WorkflowStage.AWAITING_INITIAL_VALIDATION:
+            if session.stage == WorkflowStage.FINALIZED:
+                raise ScenarioError(
+                    "This proposal is finalized. Start a fresh requirement before changing it."
+                )
+            if session.stage == WorkflowStage.AWAITING_FINAL_VALIDATION:
+                raise ScenarioError(
+                    "Final seller validation is already awaiting approval."
+                )
+            if session.stage != WorkflowStage.REVIEWING_SCENARIO:
                 raise ScenarioError(
                     "Validate the initial estate and pricing before finalization."
+                )
+            if not session.requirement_confirmed:
+                raise ScenarioError(
+                    "Confirm the complete captured requirement before finalization."
+                )
+            if (
+                session.pending_sku_change is not None
+                or session.pending_dialogue is not None
+                or session.capture_messages
+                or (session.estate is not None and session.estate.pending_lines)
+            ):
+                raise ScenarioError(
+                    "Resolve the pending licensing question or SKU selection before "
+                    "finalization."
                 )
             if session.active_scenario is None:
                 raise ScenarioError("Select a scenario before finalizing it.")
@@ -933,6 +1398,10 @@ class LicensingOrchestrator:
             nonlocal result
             if session.stage != WorkflowStage.AWAITING_FINAL_VALIDATION:
                 raise ScenarioError("There is no final seller validation awaiting approval.")
+            self._ensure_no_unfinished_work(
+                session,
+                action="confirming final seller validation",
+            )
             if session.active_scenario is None:
                 raise ScenarioError("Select a scenario before finalizing it.")
             current = session.scenarios.get(session.active_scenario)
@@ -944,7 +1413,6 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "scenarios": scenarios,
-                    "pending_sku_change": None,
                     "stage": WorkflowStage.FINALIZED,
                     "updated_at": datetime.now(UTC),
                 }
@@ -1082,12 +1550,19 @@ class LicensingOrchestrator:
 
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
+            self._ensure_proposal_mutation_allowed(session)
             pending = session.pending_sku_change
             if pending is None:
                 raise ScenarioError("There is no pending SKU change to confirm.")
             if confirmation_id is not None and pending.id != confirmation_id:
                 raise ScenarioError(
                     "That SKU confirmation is stale; submit the add/replace request again."
+                )
+            if pending.candidate_narrowing_required:
+                raise ScenarioError(
+                    "That product request is still too broad for numbered selection. "
+                    "Add a product family, workload, edition, plan, or exact catalogue "
+                    "ID first."
                 )
             if candidate_number < 1 or candidate_number > len(pending.candidates):
                 raise ScenarioError(
@@ -1102,6 +1577,15 @@ class LicensingOrchestrator:
             if pending.scope == "requirement":
                 if session.estate is None:
                     raise ScenarioError("The captured requirement is no longer available.")
+                if (
+                    pending.requirement_fingerprint is None
+                    or pending.requirement_fingerprint
+                    != self._requirement_fingerprint(session.estate)
+                ):
+                    raise ScenarioError(
+                        "The captured requirement changed after this SKU choice was shown. "
+                        "Review the current requirement and submit the product change again."
+                    )
                 changed_estate = self._apply_requirement_sku_change(
                     session.estate,
                     pending,
@@ -1111,6 +1595,7 @@ class LicensingOrchestrator:
                 return session.model_copy(
                     update={
                         "estate": changed_estate,
+                        "requirement_confirmed": False,
                         "pending_sku_change": None,
                         "stage": (
                             WorkflowStage.AWAITING_MATCH_CONFIRMATION
@@ -1159,6 +1644,61 @@ class LicensingOrchestrator:
         await self._mutate(sender, update)
         return cancelled
 
+    async def restore_pending_sku_change(
+        self,
+        sender: str,
+        pending: PendingSkuChange,
+        *,
+        preserve_pending_dialogue: bool = False,
+    ) -> WorkflowSession:
+        """Restore an unchanged SKU choice after a read-only conversational turn.
+
+        Help and information answers may create their own transient follow-up dialogue.
+        They must not silently discard the seller's unconfirmed catalogue choice. A newer
+        SKU choice always wins, and a stale choice is not restored after its requirement or
+        proposal revision has changed.
+        """
+
+        def update(session: WorkflowSession) -> WorkflowSession:
+            current = session.pending_sku_change
+            if current is not None and current.id != pending.id:
+                return session
+            if session.stage in {
+                WorkflowStage.AWAITING_FINAL_VALIDATION,
+                WorkflowStage.FINALIZED,
+            }:
+                return session
+            if pending.scope == "requirement":
+                if (
+                    session.estate is None
+                    or pending.requirement_fingerprint is None
+                    or pending.requirement_fingerprint
+                    != self._requirement_fingerprint(session.estate)
+                ):
+                    return session
+            else:
+                if (
+                    pending.scenario_type is None
+                    or session.active_scenario != pending.scenario_type
+                    or pending.scenario_type not in session.scenarios
+                    or session.scenarios[pending.scenario_type].revision
+                    != pending.scenario_revision
+                ):
+                    return session
+            return session.model_copy(
+                update={
+                    "pending_sku_change": pending,
+                    "pending_dialogue": (
+                        session.pending_dialogue
+                        if preserve_pending_dialogue
+                        else None
+                    ),
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+
+        return await self._mutate(sender, update)
+
     async def edit_requirement_quantity(
         self,
         sender: str,
@@ -1173,6 +1713,11 @@ class LicensingOrchestrator:
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
             estate = self._editable_requirement(session)
+            self._ensure_no_unfinished_work(
+                session,
+                action="changing a requirement quantity",
+                allow_pending_matches=True,
+            )
             found = False
             lines: list[NormalizedLicenseLine] = []
             for line in estate.lines:
@@ -1197,7 +1742,12 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "estate": result,
-                    "pending_sku_change": None,
+                    "requirement_confirmed": False,
+                    "stage": (
+                        WorkflowStage.AWAITING_MATCH_CONFIRMATION
+                        if result.pending_lines
+                        else WorkflowStage.AWAITING_INITIAL_VALIDATION
+                    ),
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -1217,6 +1767,8 @@ class LicensingOrchestrator:
         self,
         sender: str,
         line_ids: list[str],
+        *,
+        expected_pending_dialogue: PendingDialogue | None = None,
     ) -> LicenseEstate:
         """Remove several original line IDs atomically without shifting the selection."""
 
@@ -1229,7 +1781,22 @@ class LicensingOrchestrator:
 
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
-            estate = self._editable_requirement(session)
+            working_session = session
+            if expected_pending_dialogue is not None:
+                if session.pending_dialogue != expected_pending_dialogue:
+                    raise ScenarioError(
+                        "The pending clarification changed before the selected lines could "
+                        "be removed. Review the latest requirement and retry the removal."
+                    )
+                working_session = session.model_copy(
+                    update={"pending_dialogue": None}
+                )
+            estate = self._editable_requirement(working_session)
+            self._ensure_no_unfinished_work(
+                working_session,
+                action="removing requirement lines",
+                allow_pending_matches=True,
+            )
             available_ids = {line.line_id for line in estate.lines}
             missing = sorted(normalized_ids - available_ids)
             if missing:
@@ -1251,15 +1818,14 @@ class LicensingOrchestrator:
                     "updated_at": datetime.now(UTC),
                 }
             )
-            return session.model_copy(
+            return working_session.model_copy(
                 update={
                     "estate": result,
-                    "pending_sku_change": None,
-                    "pending_dialogue": None,
+                    "requirement_confirmed": False,
                     "stage": (
                         WorkflowStage.AWAITING_MATCH_CONFIRMATION
                         if pending
-                        else WorkflowStage.AWAITING_SCENARIO
+                        else WorkflowStage.AWAITING_INITIAL_VALIDATION
                     ),
                     "updated_at": datetime.now(UTC),
                 }
@@ -1283,6 +1849,11 @@ class LicensingOrchestrator:
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
             estate = self._editable_requirement(session)
+            self._ensure_no_unfinished_work(
+                session,
+                action="changing requirement contract details",
+                allow_pending_matches=True,
+            )
             lines = [
                 line.model_copy(
                     update={
@@ -1298,7 +1869,12 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "estate": result,
-                    "pending_sku_change": None,
+                    "requirement_confirmed": False,
+                    "stage": (
+                        WorkflowStage.AWAITING_MATCH_CONFIRMATION
+                        if result.pending_lines
+                        else WorkflowStage.AWAITING_INITIAL_VALIDATION
+                    ),
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -1361,6 +1937,22 @@ class LicensingOrchestrator:
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
             estate = self._editable_requirement(session)
+            if session.capture_messages or session.pending_dialogue is not None:
+                self._ensure_no_unfinished_work(
+                    session,
+                    action="starting a product add or replacement",
+                    allow_pending_matches=True,
+                )
+            current_pending = session.pending_sku_change
+            if current_pending is not None and not (
+                current_pending.scope == "requirement"
+                and current_pending.action == action
+                and current_pending.source_line_id == source_line_id
+            ):
+                raise ScenarioError(
+                    "Confirm or cancel the pending SKU choice before starting another "
+                    "product change."
+                )
             if action == "replace" and not any(
                 line.line_id == source_line_id for line in estate.lines
             ):
@@ -1373,6 +1965,8 @@ class LicensingOrchestrator:
                 product_query=cleaned_query,
                 quantity=quantity,
                 candidates=candidates,
+                candidate_narrowing_required=requires_candidate_narrowing(candidates),
+                requirement_fingerprint=self._requirement_fingerprint(estate),
             )
             exact = len(candidates) == 1 and candidates[0].confidence == 100
             if exact:
@@ -1390,7 +1984,9 @@ class LicensingOrchestrator:
                 return session.model_copy(
                     update={
                         "estate": changed,
+                        "requirement_confirmed": False,
                         "pending_sku_change": None,
+                        "pending_dialogue": None,
                         "stage": (
                             WorkflowStage.AWAITING_MATCH_CONFIRMATION
                             if changed.pending_lines
@@ -1406,6 +2002,7 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "pending_sku_change": pending,
+                    "pending_dialogue": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -1427,6 +2024,11 @@ class LicensingOrchestrator:
                 "Requirement capture is already confirmed. Apply changes to the revised "
                 "configuration instead."
             )
+        if session.confirmed_as_is is not None:
+            raise ScenarioError(
+                "The requirement already has a confirmed Renew As-Is baseline. Apply the "
+                "change to the revised configuration, or explicitly start fresh."
+            )
         return session.estate
 
     @staticmethod
@@ -1435,8 +2037,16 @@ class LicensingOrchestrator:
         pending: PendingSkuChange,
         selector: SkuSelector,
     ) -> LicenseEstate:
-        if not selector.product_id or not selector.sku_id:
-            raise ScenarioError("The selected SKU does not have a complete catalogue identity.")
+        product_id = (selector.product_id or "").strip()
+        sku_id = (selector.sku_id or "").strip()
+        sku_title = selector.sku_title.strip()
+        if not sku_title:
+            raise ScenarioError("The selected SKU does not have a catalogue product name.")
+        if bool(product_id) != bool(sku_id):
+            raise ScenarioError(
+                "The selected SKU has only part of its ProductId/SkuId identity. "
+                "Choose another maintained catalogue option."
+            )
         now = datetime.now(UTC)
         if pending.action == "add":
             numeric_ids = [
@@ -1449,10 +2059,10 @@ class LicensingOrchestrator:
             line = NormalizedLicenseLine(
                 line_id=f"L{next_id}",
                 row_number=next_row,
-                source_product_title=selector.sku_title,
-                product_id=selector.product_id,
-                sku_id=selector.sku_id,
-                sku_title=selector.sku_title,
+                source_product_title=sku_title,
+                product_id=product_id or None,
+                sku_id=sku_id or None,
+                sku_title=sku_title,
                 total_licenses=pending.quantity,
                 expired_licenses=0,
                 assigned_licenses=0,
@@ -1475,16 +2085,17 @@ class LicensingOrchestrator:
             lines.append(
                 line.model_copy(
                     update={
-                        "source_product_title": selector.sku_title,
-                        "product_id": selector.product_id,
-                        "sku_id": selector.sku_id,
-                        "sku_title": selector.sku_title,
+                        "source_product_title": sku_title,
+                        "product_id": product_id or None,
+                        "sku_id": sku_id or None,
+                        "sku_title": sku_title,
                         "total_licenses": pending.quantity,
                         "expired_licenses": 0,
                         "renewal_quantity": pending.quantity,
                         "match_confidence": 100,
                         "match_method": "seller_confirmed",
                         "candidates": [],
+                        "candidate_narrowing_required": False,
                     }
                 )
             )
@@ -1517,6 +2128,23 @@ class LicensingOrchestrator:
 
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
+            self._ensure_proposal_mutation_allowed(session)
+            if session.capture_messages or session.pending_dialogue is not None:
+                self._ensure_no_unfinished_work(
+                    session,
+                    action="starting a product add or replacement",
+                )
+            current_pending = session.pending_sku_change
+            if current_pending is not None and not (
+                current_pending.scope == "scenario"
+                and current_pending.action == action
+                and current_pending.source_line_id == source_line_id
+                and current_pending.scenario_type == session.active_scenario
+            ):
+                raise ScenarioError(
+                    "Confirm or cancel the pending SKU choice before starting another "
+                    "product change."
+                )
             if session.active_scenario is None:
                 raise ScenarioError("Select a scenario before editing it.")
             current = session.scenarios.get(session.active_scenario)
@@ -1540,6 +2168,7 @@ class LicensingOrchestrator:
                     product_query=cleaned_query,
                     quantity=quantity,
                     candidates=candidates,
+                    candidate_narrowing_required=requires_candidate_narrowing(candidates),
                 )
                 selector = SkuSelector(
                     sku_title=candidate.sku_title,
@@ -1554,6 +2183,7 @@ class LicensingOrchestrator:
                     update={
                         "scenarios": scenarios,
                         "pending_sku_change": None,
+                        "pending_dialogue": None,
                         "updated_at": datetime.now(UTC),
                     }
                 )
@@ -1567,6 +2197,7 @@ class LicensingOrchestrator:
                 product_query=cleaned_query,
                 quantity=quantity,
                 candidates=candidates,
+                candidate_narrowing_required=requires_candidate_narrowing(candidates),
             )
             result = SkuChangeResult(
                 state="confirmation_required",
@@ -1575,6 +2206,7 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "pending_sku_change": pending,
+                    "pending_dialogue": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -1598,6 +2230,11 @@ class LicensingOrchestrator:
 
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
+            self._ensure_proposal_mutation_allowed(session)
+            self._ensure_no_unfinished_work(
+                session,
+                action="starting another recommendation",
+            )
             if session.confirmed_as_is is None:
                 raise ScenarioError(
                     "Confirm the current requirement and Renew As-Is cost before requesting "
@@ -1657,6 +2294,7 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "pending_sku_change": pending,
+                    "pending_dialogue": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -1698,7 +2336,10 @@ class LicensingOrchestrator:
         )
 
     async def finalize(self, sender: str) -> CommercialScenario:
-        return await self._edit_active(sender, self._scenarios.finalize)
+        raise ScenarioError(
+            "Finalization requires seller validation. Request finalization first, then "
+            "confirm the displayed final validation summary."
+        )
 
     async def simple_review(
         self,
@@ -1731,6 +2372,30 @@ class LicensingOrchestrator:
             nonlocal result
             if session.estate is None:
                 raise ScenarioError("Upload a licence file before requesting a comparison.")
+            self._ensure_proposal_mutation_allowed(session)
+            if session.stage != WorkflowStage.REVIEWING_SCENARIO:
+                raise ScenarioError(
+                    "Confirm the complete licensing requirement and Renew As-Is price before "
+                    "requesting a comparison."
+                )
+            if session.confirmed_as_is is None:
+                raise ScenarioError(
+                    "Confirm the Renew As-Is proposal before requesting a comparison."
+                )
+            if not session.requirement_confirmed:
+                raise ScenarioError(
+                    "Confirm the complete captured requirement before requesting a comparison."
+                )
+            if (
+                session.estate.pending_lines
+                or session.capture_messages
+                or session.pending_sku_change is not None
+                or session.pending_dialogue is not None
+            ):
+                raise ScenarioError(
+                    "Resolve the unfinished product, quantity, or SKU selection before "
+                    "requesting a comparison."
+                )
             scenarios = dict(session.scenarios)
             for scenario_type in ScenarioType:
                 if scenario_type not in scenarios:
@@ -1753,7 +2418,6 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "scenarios": scenarios,
-                    "pending_sku_change": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -1771,6 +2435,11 @@ class LicensingOrchestrator:
 
         def update(session: WorkflowSession) -> WorkflowSession:
             nonlocal result
+            self._ensure_proposal_mutation_allowed(session)
+            self._ensure_no_unfinished_work(
+                session,
+                action="editing the active proposal",
+            )
             if session.active_scenario is None:
                 raise ScenarioError("Select a scenario before editing it.")
             current = session.scenarios.get(session.active_scenario)
@@ -1782,7 +2451,6 @@ class LicensingOrchestrator:
             return session.model_copy(
                 update={
                     "scenarios": scenarios,
-                    "pending_sku_change": None,
                     "updated_at": datetime.now(UTC),
                 }
             )
@@ -1798,7 +2466,10 @@ class LicensingOrchestrator:
     ) -> WorkflowSession:
         thread_id = self.thread_id(sender)
         for _ in range(3):
-            session, version = await self._store.get(thread_id)
+            if self._has_active_turn_claim(thread_id):
+                session, version = await self._get_raw_session(sender)
+            else:
+                session, version = await self._store.get(thread_id)
             if session is None:
                 session = WorkflowSession(
                     id=thread_id,

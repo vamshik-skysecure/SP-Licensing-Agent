@@ -718,11 +718,17 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self.orchestrator.analyze_document(
             sender="911234567890", filename="customer.csv", content=CUSTOMER
         )
+        await self.orchestrator.request_requirement_validation("911234567890")
+        await self.orchestrator.confirm_requirement("911234567890")
         await self.orchestrator.build_scenario(
             "911234567890", ScenarioType.RENEW_AS_IS
         )
         await self.orchestrator.set_discount("911234567890", Decimal("10"))
-        await self.orchestrator.set_adjustment("911234567890", Decimal("5"))
+        confirmed = await self.orchestrator.set_adjustment(
+            "911234567890",
+            Decimal("5"),
+        )
+        await self.orchestrator.save_confirmed_as_is("911234567890", confirmed)
         estate, scenarios, comparison = await self.orchestrator.comparison(
             "911234567890"
         )
@@ -770,6 +776,13 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self.orchestrator.analyze_document(
             sender="911234567890", filename="customer.csv", content=CUSTOMER
         )
+        await self.orchestrator.request_requirement_validation("911234567890")
+        await self.orchestrator.confirm_requirement("911234567890")
+        renewal = await self.orchestrator.build_scenario(
+            "911234567890",
+            ScenarioType.RENEW_AS_IS,
+        )
+        await self.orchestrator.save_confirmed_as_is("911234567890", renewal)
 
         _, scenarios, comparison = await self.orchestrator.comparison(
             "911234567890"
@@ -797,6 +810,13 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self.orchestrator.analyze_document(
             sender="911234567890", filename="customer.csv", content=CUSTOMER
         )
+        await self.orchestrator.request_requirement_validation("911234567890")
+        await self.orchestrator.confirm_requirement("911234567890")
+        renewal = await self.orchestrator.build_scenario(
+            "911234567890",
+            ScenarioType.RENEW_AS_IS,
+        )
+        await self.orchestrator.save_confirmed_as_is("911234567890", renewal)
         scenario = await self.orchestrator.build_scenario(
             "911234567890", ScenarioType.ME7
         )
@@ -1430,7 +1450,7 @@ class WhatsAppFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scenario.term_duration, "P1Y")
         self.assertEqual(scenario.billing_plan, "Annual")
         self.assertEqual(scenario.segment, "Commercial")
-        self.assertIn("Customer approval pending", scenario.comments)
+        self.assertIn("customer approval is pending", scenario.comments)
         self.assertEqual(next(line for line in scenario.lines if line.line_id == "L1").proposed_quantity, 0)
         replaced_source = next(line for line in scenario.lines if line.line_id == "L2")
         self.assertEqual(replaced_source.proposed_quantity, 0)

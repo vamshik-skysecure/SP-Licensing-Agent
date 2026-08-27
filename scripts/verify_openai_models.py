@@ -10,7 +10,7 @@ def main() -> int:
     if not settings.openai_api_key:
         raise SystemExit("OPENAI_API_KEY is not configured.")
 
-    client = OpenAI(api_key=settings.openai_api_key)
+    client = OpenAI(api_key=settings.openai_api_key.get_secret_value())
     for model_name in (settings.openai_model, settings.openai_transcription_model):
         model = client.models.retrieve(model_name)
         print(f"verified model access: {model.id}")

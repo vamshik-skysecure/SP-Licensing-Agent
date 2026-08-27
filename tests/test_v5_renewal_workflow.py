@@ -398,6 +398,8 @@ class AnnualUpgradeComparisonTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("BASE: confirm promotion eligibility before pricing.", me5.unresolved_decisions)
 
     async def test_comparison_preserves_independent_proposal_edits_without_bundle_inference(self) -> None:
+        await self.orchestrator.request_requirement_validation(self.sender)
+        await self.orchestrator.confirm_requirement(self.sender)
         await self.orchestrator.build_scenario(
             self.sender,
             ScenarioType.RENEW_AS_IS,
@@ -406,7 +408,8 @@ class AnnualUpgradeComparisonTests(unittest.IsolatedAsyncioTestCase):
             self.sender,
             promo_eligible=True,
         )
-        await self.orchestrator.edit_quantity(self.sender, "L1", 121)
+        renewal = await self.orchestrator.edit_quantity(self.sender, "L1", 121)
+        await self.orchestrator.save_confirmed_as_is(self.sender, renewal)
 
         _estate, scenarios, comparison = await self.orchestrator.comparison(
             self.sender
